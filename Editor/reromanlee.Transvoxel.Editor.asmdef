@@ -1,0 +1,20 @@
+{
+    "name": "reromanlee.Transvoxel.Editor",
+    "rootNamespace": "reromanlee.Transvoxel.Editor",
+    "references": [
+        "reromanlee.Transvoxel"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "UNITY_EDITOR"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
