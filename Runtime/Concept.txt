@@ -1,0 +1,17 @@
+1. We need to make a clear separation of concerns: Transvoxel does the drawing part, Octree serves Transvoxel current state (commands what and how to draw) that needs to be drawn (which chunks to draw, where to put transition cells, and other relevant commands that actually make Transvoxel draw visuals). Another isolated logic is density calculations, essentially they should implement a simple method that takes (x, y, z) coordinates and returns density value (from 0.0f to 1.0f) that Octree requests if it has no cached chunk information already in runtime.
+
+2. Terraforming should be based off of two layers: we lookup custom density at (x, y, z) from layer A, and if there are no changes made by player, then we go to layer B (original density calculation) and draw landscape from that. This way what player changed is prioritized over what player didn't change.
+
+3. In Runtime/TransvoxelDataTables.cs there are data tables that I took and translated into C# version from official Transvoxel developer, these lookup tables should be used to actually draw the landscape.
+
+4. There has to be preferences in MonoBehaviour or ScriptableObject where I can set drawing distance from player, set player transform so algorithm would know from where to start drawing current landscape and at what point to draw transitions and next LODs. These settings should also include ability to increase or decrease maximum LOD level, i.e. how many LOD levels are allowed to be drawn, so I could set 4 which means there will be 4 LOD levels on top of original level of details.
+
+5. For optimization, when we take density value from Octree, we should only take specific point to draw the LOD, so for example if LOD level is too high, we don't unnecessarily read all the density values inbetween. This will drastically improve performance in case if player wants to see far away but will go there later, i.e. no need for extra calculations.
+
+6. There has to be an option to toggle smooth on or off, so we can draw either low-poly sharp triangles style terrain, or make it completely smooth and seamless between chunks.
+
+7. UVs should be calculated so we could add a material with a texture and it will draw it correctly. Not sure how we can handle multiple textures on the landscape (grass, rocks, snow, etc.), and how we can handle storage of these too, but author got it handled in their documentation.
+
+8. All the original source files are located in Sources folder, just in case if we need them to clarity something. There are plenty of information written by the original author of Transvoxel.
+
+9. Most importantly, this project is made for clarity. I need a highly efficient solution to draw Transvoxel landscape in realtime for massive game landscapes, while also having that code modular, clean, and readable. I want to understand how that works from reading the code.
