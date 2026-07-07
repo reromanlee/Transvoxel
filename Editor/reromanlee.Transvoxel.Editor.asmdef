@@ -2,15 +2,19 @@
     "name": "reromanlee.Transvoxel.Editor",
     "rootNamespace": "reromanlee.Transvoxel.Editor",
     "references": [
-        "reromanlee.Transvoxel"
+        "reromanlee.Transvoxel",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
     ],
     "includePlatforms": [
         "Editor"
     ],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
-    "overrideReferences": false,
-    "precompiledReferences": [],
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
     "autoReferenced": true,
     "defineConstraints": [
         "UNITY_EDITOR"
