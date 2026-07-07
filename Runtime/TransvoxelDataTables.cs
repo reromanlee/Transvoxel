@@ -24,7 +24,9 @@ namespace reromanlee.Transvoxel
             public RegularCellData(int geometryCounts, params int[] vertexIndex)
             {
                 this.geometryCounts = geometryCounts;
-                for (int x = 0; x < 15; x++)
+                // Only the used entries are passed in; the rest of the fixed-size
+                // array stays zero, matching the zero-padded C++ initializers.
+                for (int x = 0; x < vertexIndex.Length; x++)
                 {
                     this.vertexIndex[x] = vertexIndex[x];
                 }
@@ -54,7 +56,9 @@ namespace reromanlee.Transvoxel
             public TransitionCellData(int geometryCounts, params int[] vertexIndex)
             {
                 this.geometryCounts = geometryCounts;
-                for (int x = 0; x < 15; x++)
+                // Only the used entries are passed in; the rest of the fixed-size
+                // array stays zero, matching the zero-padded C++ initializers.
+                for (int x = 0; x < vertexIndex.Length; x++)
                 {
                     this.vertexIndex[x] = vertexIndex[x];
                 }
