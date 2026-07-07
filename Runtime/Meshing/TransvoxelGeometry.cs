@@ -18,11 +18,16 @@ namespace reromanlee.Transvoxel.Meshing
         public const float TransitionWidthCells = 0.25f;
 
         /// <summary>
-        /// Lengyel's tables wind triangles counter-clockwise for the front face (OpenGL
-        /// convention); Unity treats clockwise as front, so every triangle is emitted with
-        /// two indices swapped. Verified by the headless watertightness tests.
+        /// Whether to swap two indices of every emitted triangle.
+        ///
+        /// The Transvoxel tables, fed our sign convention (negative = inside solid), already
+        /// wind triangles so that Cross(v1-v0, v2-v0) points along the outward density
+        /// gradient — which is exactly Unity's front-face convention (a clockwise-in-screen
+        /// front face has its cross product pointing toward the viewer). So no flip is
+        /// needed. Verified by the headless signed-volume test: a solid sphere comes out
+        /// with positive enclosed volume and face normals agreeing with the smooth normals.
         /// </summary>
-        public const bool FlipWinding = true;
+        public const bool FlipWinding = false;
 
         /// <summary>
         /// Moves a chunk-boundary vertex to its "secondary position" to make room for

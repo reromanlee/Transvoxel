@@ -86,7 +86,7 @@ namespace reromanlee.Transvoxel
             meshCollider.sharedMesh = mesh;
         }
 
-        public int MeshInstanceId => mesh != null ? mesh.GetInstanceID() : 0;
+        public EntityId MeshEntityId => mesh != null ? mesh.GetEntityId() : EntityId.None;
 
         public void SetLodTintVisible(bool visible)
         {

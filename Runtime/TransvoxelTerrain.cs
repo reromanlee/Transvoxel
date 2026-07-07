@@ -85,10 +85,11 @@ namespace reromanlee.Transvoxel
 
         // Collider bakes run on worker threads; a mesh must not be edited or destroyed
         // while its bake is in flight, so those meshes are parked and cleaned up after.
-        readonly ConcurrentQueue<(TerrainChunk chunk, int meshId)> bakedColliders =
-            new ConcurrentQueue<(TerrainChunk, int)>();
-        readonly HashSet<int> bakingMeshIds = new HashSet<int>();
-        readonly Dictionary<int, Mesh> parkedMeshes = new Dictionary<int, Mesh>();
+        // Meshes are tracked by EntityId (Unity 6.2+ replacement for instance IDs).
+        readonly ConcurrentQueue<(TerrainChunk chunk, EntityId meshId)> bakedColliders =
+            new ConcurrentQueue<(TerrainChunk, EntityId)>();
+        readonly HashSet<EntityId> bakingMeshIds = new HashSet<EntityId>();
+        readonly Dictionary<EntityId, Mesh> parkedMeshes = new Dictionary<EntityId, Mesh>();
 
         Vector3 lastSelectPosition;
         bool needsSelect;
@@ -312,7 +313,7 @@ namespace reromanlee.Transvoxel
                 return budget;
             }
 
-            if (live.TryGetValue(result.Key, out var existing) && bakingMeshIds.Contains(existing.MeshInstanceId))
+            if (live.TryGetValue(result.Key, out var existing) && bakingMeshIds.Contains(existing.MeshEntityId))
             {
                 // The physics bake still reads this mesh; try again next frame.
                 deferredApplies.Add(result);
@@ -345,8 +346,8 @@ namespace reromanlee.Transvoxel
 
         void StartColliderBake(TerrainChunk chunk)
         {
-            int meshId = chunk.MeshInstanceId;
-            if (meshId == 0 || !bakingMeshIds.Add(meshId))
+            EntityId meshId = chunk.MeshEntityId;
+            if (meshId == EntityId.None || !bakingMeshIds.Add(meshId))
                 return;
 
             var queue = bakedColliders;
@@ -445,11 +446,14 @@ namespace reromanlee.Transvoxel
 
         void DestroyChunkView(TerrainChunk chunk)
         {
-            if (bakingMeshIds.Contains(chunk.MeshInstanceId))
+            // Read the id before DestroyKeepMesh() clears the mesh reference, or we would
+            // park the mesh under EntityId.None and never reclaim it in DrainBakedColliders.
+            EntityId meshId = chunk.MeshEntityId;
+            if (bakingMeshIds.Contains(meshId))
             {
                 var mesh = chunk.DestroyKeepMesh();
                 if (mesh != null)
-                    parkedMeshes[chunk.MeshInstanceId] = mesh;
+                    parkedMeshes[meshId] = mesh;
             }
             else
             {
