@@ -76,10 +76,14 @@ namespace reromanlee.Transvoxel.Meshing
             axisU = axisN == 0 ? 1 : 0;
             axisV = axisN == 2 ? 1 : 2;
             planeLocal = face.IsPositive() ? n * samples.LodStep : 0;
-            // Parity of (unit-u × unit-v) against the outward normal; faces where the fixed
-            // ascending-axis basis winds the "wrong" way get their triangles flipped so all
-            // six faces end up consistent with the regular mesh.
-            basisFlipsWinding = face == CubeFace.NegX || face == CubeFace.PosY || face == CubeFace.NegZ;
+            // Lengyel's transition tables list each full-res-face triangle so that, taken in
+            // (u, v) order, its cross product points AGAINST the face's outward normal. So we
+            // must flip on exactly the faces where the fixed ascending-axis basis
+            // (axisU x axisV) already points ALONG the outward normal, leaving every face
+            // wound outward and consistent with the regular mesh. These are the three faces:
+            //   PosX: (Y x Z)=+X = +normal   NegY: (X x Z)=-Y = -normal   PosZ: (X x Y)=+Z = +normal
+            // Verified face-by-face by the headless LOD-seam watertightness test.
+            basisFlipsWinding = face == CubeFace.PosX || face == CubeFace.NegY || face == CubeFace.PosZ;
 
             if (rowCells != n)
             {

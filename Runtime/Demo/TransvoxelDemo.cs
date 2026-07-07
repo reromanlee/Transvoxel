@@ -20,8 +20,10 @@ namespace reromanlee.Transvoxel.Demo
 
         TransvoxelTerrain terrain;
         Camera demoCamera;
-        float nextBrushTime;
         float fps;
+#if ENABLE_LEGACY_INPUT_MANAGER
+        float nextBrushTime;
+#endif
 
         void OnEnable()
         {
@@ -47,12 +49,23 @@ namespace reromanlee.Transvoxel.Demo
             }
 
             if (settings == null)
+            {
                 settings = CreateDemoSettings();
+                Debug.Log("[TransvoxelDemo] No settings asset assigned — using built-in demo " +
+                          "defaults. To tweak LOD count, view distance, noise, etc. (and see it " +
+                          "update live), create Assets ▸ Create ▸ Transvoxel ▸ Terrain Settings and " +
+                          "drop it on this component's 'Settings' field.");
+            }
 
+            // Assign settings/viewer while the object is inactive so they are in place before
+            // TransvoxelTerrain.OnEnable runs (AddComponent would otherwise run it immediately,
+            // before these fields are set).
             var terrainObject = new GameObject("Transvoxel Terrain");
+            terrainObject.SetActive(false);
             terrain = terrainObject.AddComponent<TransvoxelTerrain>();
             terrain.settings = settings;
             terrain.viewer = demoCamera.transform;
+            terrainObject.SetActive(true);
 
             // Start well above the ground looking out over the landscape.
             demoCamera.transform.position = new Vector3(0f, settings.noise.groundLevel + settings.noise.heightAmplitude + 30f, 0f);

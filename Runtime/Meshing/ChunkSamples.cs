@@ -106,6 +106,46 @@ namespace reromanlee.Transvoxel.Meshing
         }
 
         /// <summary>
+        /// A view of this grid carrying <em>exactly</em> the given transition mask. The base
+        /// grid (<see cref="Main"/>) is mask-independent and shared as-is; only the per-face
+        /// sheets differ, so we reuse any this grid already sampled and fetch the rest.
+        ///
+        /// This is what keeps LOD seams closed as the viewer moves: the secondary-position
+        /// shift and the transition cells are both driven by <see cref="TransitionMask"/>, so
+        /// that value must match the faces actually being generated for this build — never a
+        /// stale superset left in the cache from when the chunk had different neighbours.
+        /// </summary>
+        public ChunkSamples WithMask(IDensitySource source, byte mask)
+        {
+            if (mask == TransitionMask)
+                return this;
+
+            var view = new ChunkSamples
+            {
+                Key = Key,
+                ChunkCells = ChunkCells,
+                TransitionMask = mask,
+                IsoLevel = IsoLevel,
+                PointsPerAxis = PointsPerAxis,
+                LodStep = LodStep,
+                MinVoxel = MinVoxel,
+                Main = Main, // shared, read-only during meshing
+            };
+
+            if (mask != 0 && Key.Lod > 0)
+            {
+                for (int f = 0; f < 6; f++)
+                {
+                    if ((mask & (1 << f)) == 0)
+                        continue;
+                    view.FaceSheets[f] = FaceSheets[f] ?? SampleFaceSheet(source, view, (CubeFace)f);
+                }
+            }
+
+            return view;
+        }
+
+        /// <summary>
         /// Samples the fine (half-stride) lattice covering one chunk face — the lattice the
         /// finer neighbour meshes with, so transition cells line up with it bit-exactly.
         /// </summary>

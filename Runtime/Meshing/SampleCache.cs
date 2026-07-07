@@ -34,18 +34,22 @@ namespace reromanlee.Transvoxel.Meshing
             if (capacity <= 0)
                 return ChunkSamples.Sample(source, key, chunkCells, isoLevel, transitionMask);
 
+            ChunkSamples cached;
             lock (gate)
             {
-                if (map.TryGetValue(key, out var cached)
-                    && (cached.TransitionMask & transitionMask) == transitionMask)
-                {
+                map.TryGetValue(key, out cached);
+                if (cached != null)
                     Touch(key);
-                    return cached;
-                }
             }
 
-            // Miss, or the cached grid lacks a face sheet this build needs: sample outside
-            // the lock (this is the expensive part) and publish the fresh grid.
+            if (cached != null)
+                // The base grid is mask-independent, so any cached grid for this key is
+                // reusable. Hand back a view with the *exact* mask this build needs (sampling
+                // any extra face sheets outside the lock) — never the cached grid's own mask,
+                // or the secondary shift would target the wrong faces and crack the seam.
+                return cached.WithMask(source, transitionMask);
+
+            // Miss: sample outside the lock (this is the expensive part) and publish the grid.
             var samples = ChunkSamples.Sample(source, key, chunkCells, isoLevel, transitionMask);
 
             lock (gate)

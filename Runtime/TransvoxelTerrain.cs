@@ -72,12 +72,16 @@ namespace reromanlee.Transvoxel
         SampleCache cache;
         SemaphoreSlim buildSemaphore;
         Material runtimeMaterial;
+        Material generatedMaterial;
+        TransvoxelSettings subscribedSettings;
+        bool settingsDirty;
 
         readonly Dictionary<NodeKey, TerrainChunk> live = new Dictionary<NodeKey, TerrainChunk>();
         readonly Dictionary<NodeKey, PendingBuild> pending = new Dictionary<NodeKey, PendingBuild>();
         readonly Dictionary<NodeKey, byte> desired = new Dictionary<NodeKey, byte>();
         readonly List<ChunkDrawCommand> selectScratch = new List<ChunkDrawCommand>(1024);
         readonly HashSet<NodeKey> obsolete = new HashSet<NodeKey>();
+        readonly Dictionary<NodeKey, float> obsoleteSince = new Dictionary<NodeKey, float>();
         readonly List<NodeKey> keyScratch = new List<NodeKey>();
 
         ConcurrentQueue<BuildResult> completedBuilds = new ConcurrentQueue<BuildResult>();
@@ -97,9 +101,48 @@ namespace reromanlee.Transvoxel
 
         void OnEnable()
         {
+            BindSettings();
+            BuildPipeline();
+        }
+
+        void OnDisable()
+        {
+            if (subscribedSettings != null)
+                subscribedSettings.Changed -= OnSettingsChanged;
+            subscribedSettings = null;
+            ClearScene();
+        }
+
+        // Editing the settings asset (even during Play) fires TransvoxelSettings.Changed.
+        // We only flag it here: OnValidate runs on Unity's validation pass, where destroying
+        // or creating GameObjects is illegal, so the actual rebuild is deferred to Update.
+        void OnSettingsChanged() => settingsDirty = true;
+
+        /// <summary>
+        /// Makes sure we hold a settings asset and are subscribed to the one currently in the
+        /// <see cref="settings"/> field. Callers commonly assign <c>settings</c> *after*
+        /// AddComponent has already run OnEnable (Unity runs it synchronously), so we detect
+        /// that swap in Update and rebind — otherwise the assigned asset would be ignored.
+        /// </summary>
+        void BindSettings()
+        {
             if (settings == null)
                 settings = ScriptableObject.CreateInstance<TransvoxelSettings>();
+            if (ReferenceEquals(settings, subscribedSettings))
+                return;
+            if (subscribedSettings != null)
+                subscribedSettings.Changed -= OnSettingsChanged;
+            settings.Changed += OnSettingsChanged;
+            subscribedSettings = settings;
+        }
 
+        /// <summary>
+        /// (Re)builds the octree, density stack, sample cache and material from the current
+        /// <see cref="settings"/>. Player edits (density layer A) and the generated default
+        /// material are carried across so a settings tweak doesn't wipe terraforming.
+        /// </summary>
+        void BuildPipeline()
+        {
             if (DensityOverride != null)
             {
                 density = DensityOverride;
@@ -107,9 +150,11 @@ namespace reromanlee.Transvoxel
             }
             else
             {
+                // Rebuild only the procedural landscape (layer B) from the new noise; keep
+                // the existing player-edit layer (A) so terraforming survives a settings change.
+                var edits = Layers != null ? Layers.Edits : new VoxelEditLayer();
                 Layers = new LayeredDensitySource(
-                    new ProceduralDensitySource(settings.noise, settings.voxelSize),
-                    new VoxelEditLayer());
+                    new ProceduralDensitySource(settings.noise, settings.voxelSize), edits);
                 density = Layers;
             }
 
@@ -117,11 +162,14 @@ namespace reromanlee.Transvoxel
                 settings.viewDistance, settings.lodSplitFactor);
             cache = new SampleCache(settings.densityCacheChunks);
             buildSemaphore = new SemaphoreSlim(settings.EffectiveMaxConcurrentBuilds);
-            runtimeMaterial = settings.material != null ? settings.material : CreateDefaultMaterial();
+            runtimeMaterial = settings.material != null
+                ? settings.material
+                : generatedMaterial ??= CreateDefaultMaterial();
             needsSelect = true;
         }
 
-        void OnDisable()
+        /// <summary>Tears down every live and pending chunk, leaving the pipeline fields intact.</summary>
+        void ClearScene()
         {
             foreach (var entry in pending.Values)
                 entry.Superseded = true;
@@ -137,7 +185,19 @@ namespace reromanlee.Transvoxel
             live.Clear();
             desired.Clear();
             obsolete.Clear();
+            obsoleteSince.Clear();
             TotalVertices = 0;
+        }
+
+        /// <summary>
+        /// Rebuilds the whole world from the current <see cref="settings"/>. Runs
+        /// automatically the frame after the settings asset changes, so Inspector tweaks to
+        /// LOD levels, view distance, noise, iso level and the rest take effect live.
+        /// </summary>
+        public void ApplySettings()
+        {
+            ClearScene();
+            BuildPipeline();
         }
 
         void Update()
@@ -148,6 +208,20 @@ namespace reromanlee.Transvoxel
                 if (mainCamera == null)
                     return;
                 viewer = mainCamera.transform;
+            }
+
+            // The settings field may have been assigned or swapped after OnEnable ran; rebind
+            // to the new asset and rebuild from it.
+            if (!ReferenceEquals(settings, subscribedSettings))
+            {
+                BindSettings();
+                settingsDirty = true;
+            }
+
+            if (settingsDirty)
+            {
+                settingsDirty = false;
+                ApplySettings();
             }
 
             DrainBakedColliders();
@@ -201,11 +275,12 @@ namespace reromanlee.Transvoxel
                 pending.Remove(key);
 
             // Live chunks that fell out of the desired set wait in `obsolete` until their
-            // replacements are on screen.
+            // replacements are on screen. Stamp the time a chunk first becomes obsolete so the
+            // linger timeout in CleanupObsoleteChunks can measure from it.
             foreach (var key in live.Keys)
             {
-                if (!desired.ContainsKey(key))
-                    obsolete.Add(key);
+                if (!desired.ContainsKey(key) && obsolete.Add(key))
+                    obsoleteSince[key] = Time.time;
             }
         }
 
@@ -391,6 +466,14 @@ namespace reromanlee.Transvoxel
             if (obsolete.Count == 0)
                 return;
 
+            // An obsolete chunk is retired once (a) its own footprint is covered by
+            // replacements AND (b) the rest of the newly-selected set has settled — nothing
+            // pending — so a neighbour still rebuilding its transition mask can't briefly crack
+            // the seam as the old geometry disappears. When the viewer keeps moving and builds
+            // never fully drain, a per-chunk linger timeout releases it anyway (lodSwapLinger).
+            bool settled = pending.Count == 0;
+            float now = Time.time;
+
             keyScratch.Clear();
             foreach (var key in obsolete)
             {
@@ -399,18 +482,26 @@ namespace reromanlee.Transvoxel
                     keyScratch.Add(key); // wanted again; no longer obsolete
                     continue;
                 }
-                if (ReplacementsReady(key))
+                if (!ReplacementsReady(key))
+                    continue;
+
+                bool lingered = !obsoleteSince.TryGetValue(key, out float since)
+                                || now - since >= settings.lodSwapLinger;
+                if (!settled && !lingered)
+                    continue;
+
+                if (live.TryGetValue(key, out var chunk))
                 {
-                    if (live.TryGetValue(key, out var chunk))
-                    {
-                        DestroyChunkView(chunk);
-                        live.Remove(key);
-                    }
-                    keyScratch.Add(key);
+                    DestroyChunkView(chunk);
+                    live.Remove(key);
                 }
+                keyScratch.Add(key);
             }
             foreach (var key in keyScratch)
+            {
                 obsolete.Remove(key);
+                obsoleteSince.Remove(key);
+            }
         }
 
         /// <summary>
