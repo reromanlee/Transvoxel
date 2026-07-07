@@ -72,6 +72,9 @@ Notable knobs (Concept.txt #4, #6):
 - **lodSplitFactor** — higher = more detail further away (more chunks).
 - **smoothShading** — smooth shared-vertex normals vs. flat low-poly triangles.
 - **colliderMaxLod** — which LODs get a `MeshCollider` (baked off the main thread).
+- **lodSwapLinger** — how long a replaced chunk lingers after its replacement is ready, so
+  LOD swaps never flash a crack while a neighbour finishes rebuilding. Raise it if you see a
+  brief hole when moving fast; lower it toward 0 for minimal overdraw.
 
 ---
 
@@ -96,7 +99,16 @@ no shared data between neighbours. Correctness is proven by a headless watertigh
   main thread, under `meshApplyBudgetPerFrame`, so movement stays smooth (Concept.txt: async).
 - Coarse LODs sample the density field **only at the lattice points they actually use**, so
   looking far into the distance costs far less than full-resolution detail (Concept.txt #5).
-- Old chunks stay on screen until their replacements are ready, so LOD swaps never flash holes.
+- Old chunks stay on screen until their replacements are ready *and* the rest of the newly
+  selected set has settled (plus a small `lodSwapLinger`), so LOD swaps never flash holes or
+  cracks even while a neighbour is still rebuilding its transition faces.
+
+## Tests
+
+EditMode tests live in `Editor/` (Window ▸ General ▸ Test Runner ▸ EditMode). They prove the
+core invariant — the union of all chunk meshes is a closed, consistently wound 2-manifold —
+for single chunks, same-LOD borders, every LOD-transition face, and after a transition-mask
+change (the stale-cache regression). Requires the `com.unity.test-framework` package.
 
 ---
 
