@@ -1,3 +1,4 @@
+using System;
 using reromanlee.Transvoxel.Density;
 using UnityEngine;
 
@@ -69,5 +70,18 @@ namespace reromanlee.Transvoxel
 
         public int EffectiveMaxConcurrentBuilds =>
             maxConcurrentBuilds > 0 ? maxConcurrentBuilds : Mathf.Max(1, System.Environment.ProcessorCount - 1);
+
+        /// <summary>
+        /// Raised whenever a value changes, so a running <see cref="TransvoxelTerrain"/> can
+        /// rebuild and apply the tweak live (Concept.txt #4). Unity fires this through
+        /// <see cref="OnValidate"/> when you edit the asset in the Inspector — including
+        /// during Play. If you change a field from code, call <see cref="NotifyChanged"/>
+        /// yourself afterwards.
+        /// </summary>
+        public event Action Changed;
+
+        public void NotifyChanged() => Changed?.Invoke();
+
+        void OnValidate() => Changed?.Invoke();
     }
 }
