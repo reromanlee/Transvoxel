@@ -81,6 +81,7 @@ namespace reromanlee.Transvoxel
         readonly Dictionary<NodeKey, byte> desired = new Dictionary<NodeKey, byte>();
         readonly List<ChunkDrawCommand> selectScratch = new List<ChunkDrawCommand>(1024);
         readonly HashSet<NodeKey> obsolete = new HashSet<NodeKey>();
+        readonly Dictionary<NodeKey, float> obsoleteSince = new Dictionary<NodeKey, float>();
         readonly List<NodeKey> keyScratch = new List<NodeKey>();
 
         ConcurrentQueue<BuildResult> completedBuilds = new ConcurrentQueue<BuildResult>();
@@ -184,6 +185,7 @@ namespace reromanlee.Transvoxel
             live.Clear();
             desired.Clear();
             obsolete.Clear();
+            obsoleteSince.Clear();
             TotalVertices = 0;
         }
 
@@ -273,11 +275,12 @@ namespace reromanlee.Transvoxel
                 pending.Remove(key);
 
             // Live chunks that fell out of the desired set wait in `obsolete` until their
-            // replacements are on screen.
+            // replacements are on screen. Stamp the time a chunk first becomes obsolete so the
+            // linger timeout in CleanupObsoleteChunks can measure from it.
             foreach (var key in live.Keys)
             {
-                if (!desired.ContainsKey(key))
-                    obsolete.Add(key);
+                if (!desired.ContainsKey(key) && obsolete.Add(key))
+                    obsoleteSince[key] = Time.time;
             }
         }
 
@@ -463,6 +466,14 @@ namespace reromanlee.Transvoxel
             if (obsolete.Count == 0)
                 return;
 
+            // An obsolete chunk is retired once (a) its own footprint is covered by
+            // replacements AND (b) the rest of the newly-selected set has settled — nothing
+            // pending — so a neighbour still rebuilding its transition mask can't briefly crack
+            // the seam as the old geometry disappears. When the viewer keeps moving and builds
+            // never fully drain, a per-chunk linger timeout releases it anyway (lodSwapLinger).
+            bool settled = pending.Count == 0;
+            float now = Time.time;
+
             keyScratch.Clear();
             foreach (var key in obsolete)
             {
@@ -471,18 +482,26 @@ namespace reromanlee.Transvoxel
                     keyScratch.Add(key); // wanted again; no longer obsolete
                     continue;
                 }
-                if (ReplacementsReady(key))
+                if (!ReplacementsReady(key))
+                    continue;
+
+                bool lingered = !obsoleteSince.TryGetValue(key, out float since)
+                                || now - since >= settings.lodSwapLinger;
+                if (!settled && !lingered)
+                    continue;
+
+                if (live.TryGetValue(key, out var chunk))
                 {
-                    if (live.TryGetValue(key, out var chunk))
-                    {
-                        DestroyChunkView(chunk);
-                        live.Remove(key);
-                    }
-                    keyScratch.Add(key);
+                    DestroyChunkView(chunk);
+                    live.Remove(key);
                 }
+                keyScratch.Add(key);
             }
             foreach (var key in keyScratch)
+            {
                 obsolete.Remove(key);
+                obsoleteSince.Remove(key);
+            }
         }
 
         /// <summary>

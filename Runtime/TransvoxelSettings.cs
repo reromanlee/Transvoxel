@@ -65,6 +65,12 @@ namespace reromanlee.Transvoxel
         [Tooltip("The chunk set is recomputed after the viewer moves this fraction of a LOD0 chunk.")]
         [Range(0.05f, 2f)] public float viewerMoveThreshold = 0.5f;
 
+        [Tooltip("Extra seconds a replaced chunk is kept on screen after its replacements are " +
+                 "ready, so neighbours finishing their own transition rebuilds never expose a " +
+                 "momentary crack during an LOD swap. 0 = retire as soon as replacements exist " +
+                 "(may flicker while moving fast); larger = smoother swaps, slightly more overdraw.")]
+        [Range(0f, 3f)] public float lodSwapLinger = 0.5f;
+
         [Tooltip("Density grids kept in memory for fast re-meshing (terraforming, LOD changes).")]
         [Range(0, 4096)] public int densityCacheChunks = 512;
 
