@@ -1,4 +1,4 @@
-# Transvoxel Terrain for Unity 6
+# Transvoxel
 
 A clean, modular implementation of Eric Lengyel's **Transvoxel** algorithm — seamless
 level-of-detail (LOD) triangulation of a voxel density field — driven by an octree and
@@ -8,7 +8,9 @@ The guiding goal is **clarity** (Concept.txt #9): every stage is a small, self-c
 piece you can read top to bottom. Sampling, meshing, LOD selection and scene management
 never leak into each other.
 
----
+![Transvoxel LODs](.github/transvoxel-lods.gif)
+
+![Transvoxel terraforming](.github/transvoxel-terraforming.gif)
 
 ## Separation of concerns
 
@@ -25,8 +27,6 @@ through a tiny interface, so you can replace any of them on its own.
 The raw lookup tables translated from Lengyel's C++ live in
 `Runtime/TransvoxelDataTables.cs` (Concept.txt #3).
 
----
-
 ## Quick start — the demo
 
 1. Create an empty scene.
@@ -42,8 +42,6 @@ It spawns a camera, a light and the terrain, then lets you:
 > Camera and terraforming controls use the legacy Input Manager. If your project is set to
 > the new Input System only, open **Project Settings ▸ Player ▸ Active Input Handling** and
 > choose **Both**.
-
----
 
 ## Using it in your own scene
 
@@ -75,8 +73,6 @@ Notable knobs (Concept.txt #4, #6):
 - **lodSwapLinger** — how long a replaced chunk lingers after its replacement is ready, so
   LOD swaps never flash a crack while a neighbour finishes rebuilding. Raise it if you see a
   brief hole when moving fast; lower it toward 0 for minimal overdraw.
-
----
 
 ## How the seamless LOD works (the interesting part)
 
@@ -110,16 +106,12 @@ core invariant — the union of all chunk meshes is a closed, consistently wound
 for single chunks, same-LOD borders, every LOD-transition face, and after a transition-mask
 change (the stale-cache regression). Requires the `com.unity.test-framework` package.
 
----
-
 ## Requirements
 
 - Unity **6000.0+** (developed and verified on **6000.5**). Uses `EntityId` (the Unity 6.2+
   replacement for instance IDs) in the collider-baking path.
 - No external packages. A default lit material is created at runtime if none is assigned; a
   triplanar shader is recommended for cliffs and multi-texture terrain (Concept.txt #7).
-
----
 
 ## Reference
 
