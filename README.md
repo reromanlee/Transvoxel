@@ -4,13 +4,16 @@ A clean, modular implementation of Eric Lengyel's **Transvoxel** algorithm — s
 level-of-detail (LOD) triangulation of a voxel density field — driven by an octree and
 built for large, editable, real-time landscapes.
 
-The guiding goal is **clarity** (Concept.txt #9): every stage is a small, self-contained
-piece you can read top to bottom. Sampling, meshing, LOD selection and scene management
-never leak into each other.
-
-![Transvoxel LODs](.github/transvoxel-lods.gif)
-
-![Transvoxel terraforming](.github/transvoxel-terraforming.gif)
+<table>
+  <tr>
+    <td>
+      <img src=".github/transvoxel-lods.gif" alt="Transvoxel LODs" width="100%">
+    </td>
+    <td>
+      <img src=".github/transvoxel-terraforming.gif" alt="Transvoxel terraforming" width="100%">
+    </td>
+  </tr>
+</table>
 
 ## Separation of concerns
 
