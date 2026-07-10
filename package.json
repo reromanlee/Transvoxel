@@ -1,8 +1,7 @@
 {
   "name": "com.reromanlee.transvoxel",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "displayName": "Transvoxel",
-  "description": "",
   "unity": "6000.0",
   "license": "MIT",
   "documentationUrl": "https://github.com/reromanlee/Transvoxel#readme",
@@ -13,5 +12,6 @@
     "name": "Roman Likhadievski",
     "url": "https://github.com/reromanlee",
     "email": "contact@reromanlee.com"
-  }
+  },
+  "description": "Clean, modular implementation of Eric Lengyel's Transvoxel algorithm for Unity with seamless LOD triangulation of a density field managed by an octree for large, editable, real-time landscapes."
 }
