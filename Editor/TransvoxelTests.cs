@@ -482,6 +482,35 @@ namespace reromanlee.Transvoxel.Editor.Tests
         }
 
         [Test]
+        public void GpuMeshWelder_MergesBitIdenticalVerticesOnly()
+        {
+            // Two triangles sharing an edge (bit-identical pos/normal/uv on the shared
+            // vertices) plus one triangle with a different normal on a coincident position.
+            float[] V(float px, float py, float pz, float ny) =>
+                new[] { px, py, pz, 0f, ny, 0f, px, pz };
+
+            var soup = new List<float>();
+            soup.AddRange(V(0, 0, 0, 1)); soup.AddRange(V(1, 0, 0, 1)); soup.AddRange(V(0, 0, 1, 1));
+            soup.AddRange(V(1, 0, 0, 1)); soup.AddRange(V(1, 0, 1, 1)); soup.AddRange(V(0, 0, 1, 1));
+            soup.AddRange(V(0, 0, 0, -1)); soup.AddRange(V(0, 0, 1, -1)); soup.AddRange(V(1, 0, 0, -1));
+
+            var buffers = new MeshBuffers();
+            var welder = Gpu.GpuMeshWelder.Rent();
+            welder.Weld(soup.ToArray(), 3, buffers);
+            Gpu.GpuMeshWelder.Return(welder);
+
+            Assert.AreEqual(9, buffers.Indices.Count, "triangle count changed");
+            // 4 unique up-facing vertices + 3 down-facing (same positions, different normal).
+            Assert.AreEqual(7, buffers.Vertices.Count, "weld should merge only bit-identical vertices");
+            // The two up-facing triangles share exactly two welded indices.
+            var first = new HashSet<int> { buffers.Indices[0], buffers.Indices[1], buffers.Indices[2] };
+            int shared = 0;
+            for (int i = 3; i < 6; i++)
+                if (first.Contains(buffers.Indices[i])) shared++;
+            Assert.AreEqual(2, shared, "shared edge vertices were not merged");
+        }
+
+        [Test]
         public void EditLayer_CollectsBricksForGpuUpload()
         {
             var edits = new VoxelEditLayer();
