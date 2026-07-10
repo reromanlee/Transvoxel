@@ -80,9 +80,10 @@ Notable knobs (Concept.txt #4, #6):
   meshes. Bursts of hundreds of chunks (teleport, high-speed flight) spread over frames
   instead of spiking one.
 - **gpuJobsInFlight** — GPU mode: chunks allowed on the GPU at once (throughput vs. VRAM).
-- **lodSwapLinger** — how long a replaced chunk lingers after its replacement is ready, so
-  LOD swaps never flash a crack while a neighbour finishes rebuilding. Raise it if you see a
-  brief hole when moving fast; lower it toward 0 for minimal overdraw.
+- **lodSwapLinger** — smoothness window for LOD swaps: how long a replaced chunk may linger
+  after its replacement is ready, and how long a re-meshed chunk may wait for the neighbours
+  that changed its transition mask before swapping anyway. Raise it if you see brief holes
+  or seams when moving fast; 0 disables both protections for minimal latency/overdraw.
 
 ## CPU and GPU meshing backends
 
@@ -143,9 +144,13 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
 - **Coarse LODs sample only their own lattice points**, so looking far into the distance
   costs far less than full-resolution detail (Concept.txt #5).
 - **Hole-free swaps.** Old chunks stay on screen until their replacements are ready *and*
-  the newly selected set has settled (plus `lodSwapLinger`). All chunks touched by one
-  terraform stroke swap **in the same frame** (an "edit group"), so brushing never flashes
-  a one-frame hole along a chunk border.
+  the newly selected set has settled (plus `lodSwapLinger`). A chunk whose transition mask
+  changed waits (bounded by `lodSwapLinger`) for the neighbours that caused the change to be
+  on screen before swapping, so LOD-ring shifts don't flash seams in the distance. All
+  chunks touched by one terraform stroke swap **in the same frame** (an "edit group"), so
+  brushing never flashes a one-frame hole along a chunk border.
+- **Bounded retirement.** Obsolete chunks are destroyed under a per-frame cap, so even a
+  far teleport (thousands of chunks replaced at once) never spends a whole frame cleaning up.
 - Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
 ## Tests
