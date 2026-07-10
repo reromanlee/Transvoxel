@@ -88,30 +88,38 @@ Notable knobs (Concept.txt #4, #6):
   that changed its transition mask before swapping anyway. Raise it if you see brief holes
   or seams when moving fast; 0 disables both protections for minimal latency/overdraw.
 
-## CPU and GPU meshing backends
+## CPU, GPU and Hybrid meshing backends
 
-Both backends produce the same landscape (the GPU noise runs the same permutation table as
+All backends produce the same landscape (the GPU noise runs the same permutation table as
 the CPU's `FractalNoise` — same seed, same terrain) and share the octree, the priority
 queue, colliders and terraforming. Set `meshingBackend` on the settings asset:
 
 - **CpuThreads** — chunks are sampled and meshed on a pool of worker tasks, one per core.
-- **GpuCompute** — three kernels in `TransvoxelCompute.compute` do all the heavy lifting:
+- **GpuCompute** — three kernels in `TransvoxelCompute.compute` do the heavy lifting:
   1. `CSVolume` builds the chunk's density grid: procedural noise overridden by the
-     player-edit bricks, which are streamed in as `StructuredBuffer`s (the saveable edit
-     layer stays on the C# side — it's the only data the CPU still owns);
+     player-edit bricks;
   2. `CSRegular` runs one thread per cell over Lengyel's tables (uploaded once as buffers —
      they are far too large for HLSL initializers);
   3. `CSTransition` stitches the LOD seams with transition cells, one thread per face cell.
   Finished triangles return via `AsyncGPUReadback` (two-stage: count, then exactly that many
-  triangles), so the CPU never blocks on the GPU; the readback lands straight in the mesh's
-  vertex buffer through the advanced Mesh API with zero per-vertex managed work.
+  triangles), so the CPU never blocks on the GPU. Because GPU cells cannot share the paper's
+  serial reuse decks, they emit triangle soup — which a light worker task then **welds back
+  into an indexed mesh** (coincident vertices are bit-identical, so welding is an exact hash,
+  no epsilon). GPU chunks therefore render exactly like CPU chunks: ~3× fewer vertices than
+  the raw soup, vertex-cache-friendly, small uploads.
+- **Hybrid** — CPU workers *and* the GPU pipeline pull from the same nearest-first queue at
+  once: whichever processor is free builds the next chunk. Highest build throughput — ideal
+  for teleports and very large view distances.
 
-GPU cells emit their own vertices (the paper's reuse decks are inherently serial), so a GPU
-mesh carries ~2–3× the vertices of a CPU mesh with identical geometry and shading — the
-classic memory-for-parallelism trade. Positions are bit-identical across neighbouring
-chunks, so the surface stays watertight. If the platform lacks compute shaders or async
-readback (or a custom `DensityOverride` is active — arbitrary C# can't run on the GPU),
-the terrain falls back to `CpuThreads` with a console warning.
+**The edit layer never round-trips.** Player-edit bricks (16³ voxels) live in one resident
+GPU buffer pool: uploaded once, then only the bricks touched by a terraform stroke are
+re-uploaded — and each chunk build sends just the few pool slot indices it overlaps. Editing
+half the map costs GPU builds nothing extra per chunk. The saveable copy stays in C#
+(`VoxelEditLayer`), exactly as before.
+
+If the platform lacks compute shaders or async readback (or a custom `DensityOverride` is
+active — arbitrary C# can't run on the GPU), GPU and Hybrid fall back to `CpuThreads` with a
+console warning.
 
 ## Dithered fading (stipple cross-fade)
 
@@ -199,6 +207,9 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
   brushing never flashes a one-frame hole along a chunk border.
 - **Bounded retirement.** Obsolete chunks are destroyed under a per-frame cap, so even a
   far teleport (thousands of chunks replaced at once) never spends a whole frame cleaning up.
+- **SRP-Batcher friendly.** A chunk carries a MaterialPropertyBlock only while it is
+  actively fading or LOD-tinted; steady chunks drop the block and batch normally — at
+  thousands of live chunks that is a large render-thread saving.
 - Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
 ## Tests
