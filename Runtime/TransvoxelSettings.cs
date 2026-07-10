@@ -88,7 +88,9 @@ namespace reromanlee.Transvoxel
         [Tooltip("Hard cap on mesh uploads per frame, on top of the millisecond budget.")]
         [Range(1, 64)] public int meshApplyBudgetPerFrame = 16;
 
-        [Tooltip("Maximum parallel chunk builds (CPU mode). 0 = processor count - 1.")]
+        [Tooltip("Maximum parallel chunk builds (CPU mode). 0 = processor count - 2, " +
+                 "leaving headroom for the main and render threads so building never " +
+                 "competes with the frame itself.")]
         [Range(0, 32)] public int maxConcurrentBuilds = 0;
 
         [Tooltip("Chunks up to this LOD level receive a MeshCollider (baked off the main thread). " +
@@ -108,7 +110,7 @@ namespace reromanlee.Transvoxel
         [Range(0, 4096)] public int densityCacheChunks = 512;
 
         public int EffectiveMaxConcurrentBuilds =>
-            maxConcurrentBuilds > 0 ? maxConcurrentBuilds : Mathf.Max(1, System.Environment.ProcessorCount - 1);
+            maxConcurrentBuilds > 0 ? maxConcurrentBuilds : Mathf.Max(1, System.Environment.ProcessorCount - 2);
 
         /// <summary>
         /// Raised whenever a value changes, so a running <see cref="TransvoxelTerrain"/> can
