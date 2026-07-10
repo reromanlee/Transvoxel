@@ -62,6 +62,18 @@ namespace reromanlee.Transvoxel
         [Tooltip("Tint chunks by LOD level to visualize the octree (debug).")]
         public bool colorizeLods;
 
+        [Tooltip("Seconds a freshly built chunk takes to dither in — a screen-space stipple " +
+                 "fade like Unity's LOD Group cross-fade. 0 = chunks appear instantly. Needs " +
+                 "a fade-aware shader: the built-in default material (Transvoxel/Lit Dithered) " +
+                 "supports it; see the README to add it to a custom shader.")]
+        [Range(0f, 2f)] public float chunkFadeInSeconds = 0.4f;
+
+        [Tooltip("Fraction of the view distance over which terrain dithers out toward the " +
+                 "draw-distance edge — per pixel, so even huge far chunks dissolve smoothly " +
+                 "like fog instead of popping. 0 disables edge fading. Needs a fade-aware " +
+                 "shader (see above).")]
+        [Range(0f, 0.5f)] public float edgeFadeFraction = 0.1f;
+
         [Header("Landscape (density layer B)")]
         public NoiseSettings noise = new NoiseSettings();
 

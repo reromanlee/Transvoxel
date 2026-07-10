@@ -29,6 +29,7 @@ namespace reromanlee.Transvoxel
 
         static readonly int BaseColorId = Shader.PropertyToID("_BaseColor"); // URP/HDRP Lit
         static readonly int ColorId = Shader.PropertyToID("_Color");         // Built-in Standard
+        static readonly int FadeId = Shader.PropertyToID("_TransvoxelFade"); // stipple fade-in
 
         // GPU results arrive as one interleaved vertex stream (position, normal, uv — the
         // exact struct the compute kernel appends) with implicit sequential indices.
@@ -49,11 +50,24 @@ namespace reromanlee.Transvoxel
         public byte TransitionMask { get; set; }
         public int VertexCount { get; private set; }
 
+        /// <summary>When this view was (re)targeted at its chunk — the fade-in ramp start.</summary>
+        public float SpawnTime { get; private set; }
+
+        /// <summary>
+        /// True once the chunk is fully dithered in (or fading is off). Replaced chunks are
+        /// only retired against fully-visible replacements, or LOD swaps would show the
+        /// stipple holes of a half-faded successor.
+        /// </summary>
+        public bool FadeInComplete => appliedFade < 0f || appliedFade >= 1f;
+
         readonly GameObject gameObject;
         readonly MeshFilter meshFilter;
         readonly MeshRenderer meshRenderer;
+        readonly MaterialPropertyBlock propertyBlock = new MaterialPropertyBlock();
         MeshCollider meshCollider;
         Mesh mesh;
+        bool tintVisible;
+        float appliedFade = -1f; // -1 = never driven (feature off)
 
         public TerrainChunk(NodeKey key, Transform parent, Material material, float voxelSize, int chunkCells)
         {
@@ -69,10 +83,15 @@ namespace reromanlee.Transvoxel
         {
             Key = key;
             TransitionMask = 0;
+            SpawnTime = Time.time;
+            appliedFade = -1f;
+            tintVisible = false;
+            propertyBlock.Clear();
             gameObject.name = $"Chunk {key}";
             var min = key.MinVoxel(chunkCells);
             gameObject.transform.localPosition = new Vector3(min.x, min.y, min.z) * voxelSize;
             meshRenderer.sharedMaterial = material;
+            meshRenderer.SetPropertyBlock(propertyBlock);
             gameObject.SetActive(true);
         }
 
@@ -194,14 +213,37 @@ namespace reromanlee.Transvoxel
 
         public void SetLodTintVisible(bool visible)
         {
-            var block = new MaterialPropertyBlock();
-            if (visible)
+            tintVisible = visible;
+            RebuildPropertyBlock();
+        }
+
+        /// <summary>
+        /// Drives the stipple fade-in (0 = invisible, 1 = solid). Quantized so the property
+        /// block is only touched when the value visibly changes; shaders without
+        /// _TransvoxelFade simply ignore it.
+        /// </summary>
+        public void SetFadeIn(float fade)
+        {
+            fade = Mathf.Round(Mathf.Clamp01(fade) * 64f) / 64f;
+            if (fade == appliedFade)
+                return;
+            appliedFade = fade;
+            propertyBlock.SetFloat(FadeId, fade);
+            meshRenderer.SetPropertyBlock(propertyBlock);
+        }
+
+        void RebuildPropertyBlock()
+        {
+            propertyBlock.Clear();
+            if (appliedFade >= 0f)
+                propertyBlock.SetFloat(FadeId, appliedFade);
+            if (tintVisible)
             {
                 var tint = LodTints[Mathf.Min(Key.Lod, LodTints.Length - 1)];
-                block.SetColor(BaseColorId, tint);
-                block.SetColor(ColorId, tint);
+                propertyBlock.SetColor(BaseColorId, tint);
+                propertyBlock.SetColor(ColorId, tint);
             }
-            meshRenderer.SetPropertyBlock(block);
+            meshRenderer.SetPropertyBlock(propertyBlock);
         }
 
         public void Destroy()

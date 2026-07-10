@@ -138,6 +138,11 @@ namespace reromanlee.Transvoxel
         readonly HashSet<EntityId> bakingMeshIds = new HashSet<EntityId>();
         readonly Dictionary<EntityId, Mesh> parkedMeshes = new Dictionary<EntityId, Mesh>();
 
+        // Stipple-fade globals for fade-aware shaders (see TransvoxelLitDithered.shader).
+        static readonly int ViewerPosId = Shader.PropertyToID("_TransvoxelViewerPos");
+        static readonly int ViewDistanceId = Shader.PropertyToID("_TransvoxelViewDistance");
+        static readonly int EdgeFadeBandId = Shader.PropertyToID("_TransvoxelEdgeFadeBand");
+
         int statsCountdown;
 
         void OnEnable()
@@ -429,8 +434,30 @@ namespace reromanlee.Transvoxel
             ReleaseEditGroups();
             PumpSelection();
             gpuBuilder?.Pump(buildQueue, completedBuilds);
+            UpdateChunkFades(); // before cleanup: retirement checks replacements' fade state
             CleanupObsoleteChunks();
             UpdateStats();
+        }
+
+        /// <summary>
+        /// Drives the stipple fading: pushes the per-pixel draw-distance fade uniforms for
+        /// fade-aware shaders, and ramps every chunk's fade-in value. Shaders without the
+        /// properties ignore all of it, so the feature is safe with any material.
+        /// </summary>
+        void UpdateChunkFades()
+        {
+            float band = settings.edgeFadeFraction * settings.viewDistance;
+            Shader.SetGlobalFloat(EdgeFadeBandId, band);
+            if (band > 0f)
+            {
+                Shader.SetGlobalVector(ViewerPosId, viewer.position);
+                Shader.SetGlobalFloat(ViewDistanceId, settings.viewDistance);
+            }
+
+            float duration = settings.chunkFadeInSeconds;
+            float now = Time.time;
+            foreach (var chunk in live.Values)
+                chunk.SetFadeIn(duration <= 0f ? 1f : Mathf.Clamp01((now - chunk.SpawnTime) / duration));
         }
 
         // ------------------------------------------------------------------ selection
@@ -929,7 +956,7 @@ namespace reromanlee.Transvoxel
             {
                 ancestor = ancestor.Parent;
                 if (desired.ContainsKey(ancestor))
-                    return live.ContainsKey(ancestor) && !pending.ContainsKey(ancestor);
+                    return LiveAndFadedIn(ancestor);
             }
             return SubtreeReady(key);
         }
@@ -937,7 +964,7 @@ namespace reromanlee.Transvoxel
         bool SubtreeReady(NodeKey key)
         {
             if (desired.ContainsKey(key))
-                return live.ContainsKey(key) && !pending.ContainsKey(key);
+                return LiveAndFadedIn(key);
             if (!desiredAncestors.Contains(key))
                 return true; // nothing wanted anywhere below — region is not rendered
             if (key.Lod == 0)
@@ -948,6 +975,17 @@ namespace reromanlee.Transvoxel
                     return false;
             }
             return true;
+        }
+
+        /// <summary>
+        /// A replacement counts only when applied AND fully dithered in — retiring the old
+        /// chunk against a half-faded successor would show the successor's stipple holes.
+        /// </summary>
+        bool LiveAndFadedIn(NodeKey key)
+        {
+            return live.TryGetValue(key, out var chunk)
+                   && chunk.FadeInComplete
+                   && !pending.ContainsKey(key);
         }
 
         TerrainChunk RentChunkView(NodeKey key)
@@ -1154,7 +1192,12 @@ namespace reromanlee.Transvoxel
 
         static Material CreateDefaultMaterial()
         {
-            var shader = Shader.Find("Universal Render Pipeline/Lit");
+            // Prefer the package's stipple-fading shader (URP + Built-in subshaders inside);
+            // HDRP is not covered by it, so HDRP keeps its own Lit (no fading there).
+            var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+            bool isHdrp = pipeline != null && pipeline.GetType().Name.Contains("HD");
+            Shader shader = isHdrp ? null : Shader.Find("Transvoxel/Lit Dithered");
+            if (shader == null) shader = Shader.Find("Universal Render Pipeline/Lit");
             if (shader == null) shader = Shader.Find("HDRP/Lit");
             if (shader == null) shader = Shader.Find("Standard");
             var material = new Material(shader) { name = "Transvoxel Default" };
