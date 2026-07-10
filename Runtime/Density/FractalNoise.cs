@@ -30,6 +30,17 @@ namespace reromanlee.Transvoxel.Density
             for (int i = 0; i < 512; i++) perm[i] = p[i & 255];
         }
 
+        /// <summary>
+        /// The 512-entry permutation table as ints, for upload to the GPU noise kernel so
+        /// both backends generate bit-identical landscapes from the same seed.
+        /// </summary>
+        public int[] ExportPermutationTable()
+        {
+            var table = new int[512];
+            for (int i = 0; i < 512; i++) table[i] = perm[i];
+            return table;
+        }
+
         static float Fade(float t) => t * t * t * (t * (t * 6f - 15f) + 10f);
         static float Lerp(float a, float b, float t) => a + (b - a) * t;
 

@@ -1,0 +1,564 @@
+// Transvoxel on the GPU.
+//
+// Three kernels mirror the CPU pipeline (same math, same tables, same winding):
+//
+//   CSVolume     — fills the chunk's signed-distance grid: procedural noise (a port of
+//                  FractalNoise, driven by the same permutation table) overridden by the
+//                  player-edit bricks streamed in as buffers. This is the two-layer density
+//                  stack: edits first, untouched voxels fall through to the noise.
+//   CSRegular    — one thread per cell runs Lengyel's modified Marching Cubes and appends
+//                  finished triangles. Vertices are NOT shared across cells (the paper's
+//                  reuse decks are inherently serial); duplicated vertices carry identical
+//                  positions and gradient normals, so the surface is still watertight and
+//                  shades identically — it just spends GPU memory instead of CPU time.
+//   CSTransition — one thread per transition cell of one face; closes LOD seams exactly
+//                  like TransvoxelTransitionMesher (full-res face on the boundary lattice,
+//                  half-res face vertices pushed through the same secondary shift).
+//
+// The lookup tables are far too large for HLSL initializers, so they arrive flattened in
+// StructuredBuffers (see TransvoxelGpuTables.cs).
+
+#pragma kernel CSVolume
+#pragma kernel CSRegular
+#pragma kernel CSTransition
+
+// ------------------------------------------------------------------ data
+
+struct TVertex
+{
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+struct TTriangle
+{
+    TVertex a;
+    TVertex b;
+    TVertex c;
+};
+
+RWStructuredBuffer<float> _Volume;             // (cells+3)^3 signed distances (iso - density)
+AppendStructuredBuffer<TTriangle> _Triangles;  // output of CSRegular + CSTransition
+
+StructuredBuffer<int> _Perm;                   // 512-entry noise permutation table
+
+// Lengyel's tables, flattened (strides must match TransvoxelGpuTables).
+StructuredBuffer<int> _RegularCellClass;       // 256
+StructuredBuffer<int> _RegularCellCounts;      // 16
+StructuredBuffer<int> _RegularCellIndices;     // 16 * 15
+StructuredBuffer<int> _RegularVertexData;      // 256 * 12
+StructuredBuffer<int> _TransitionCellClass;    // 512 (bit 7 = inverted winding)
+StructuredBuffer<int> _TransitionCellCounts;   // 56
+StructuredBuffer<int> _TransitionCellIndices;  // 56 * 36
+StructuredBuffer<int> _TransitionVertexData;   // 512 * 12
+
+// Player-edit overlay: 16^3 bricks, value < -0.5 marks "not edited" (NaN on the C# side).
+StructuredBuffer<int3> _EditBrickCoords;
+StructuredBuffer<float> _EditBrickData;        // 4096 floats per brick
+int _EditBrickCount;
+
+// Chunk parameters (ints kept scalar: SetInts packs arrays to 16-byte slots).
+int _MinVoxelX, _MinVoxelY, _MinVoxelZ;
+int _LodStep;                                  // 1 << lod
+int _Cells;                                    // cells per chunk axis
+int _PointsPerAxis;                            // _Cells + 3
+int _TransitionMask;                           // bit per CubeFace
+int _FlatShading;
+int _Face;                                     // CSTransition only: CubeFace index 0..5
+
+float _IsoLevel;
+float _VoxelSize;
+float _UvScale;
+
+// NoiseSettings mirror.
+float _GroundLevel, _HeightAmplitude, _Frequency, _Lacunarity, _Persistence, _SurfaceBlend;
+float _CaveStrength, _CaveFrequency, _CaveThreshold;
+int _Octaves;
+
+// ------------------------------------------------------------------ noise (FractalNoise port)
+
+float Fade(float t)
+{
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float Grad2(int hash, float x, float y)
+{
+    switch (hash & 7)
+    {
+        case 0: return x + y;
+        case 1: return x - y;
+        case 2: return -x + y;
+        case 3: return -x - y;
+        case 4: return x;
+        case 5: return -x;
+        case 6: return y;
+        default: return -y;
+    }
+}
+
+float Grad3(int hash, float x, float y, float z)
+{
+    switch (hash & 15)
+    {
+        case 0: return x + y;
+        case 1: return -x + y;
+        case 2: return x - y;
+        case 3: return -x - y;
+        case 4: return x + z;
+        case 5: return -x + z;
+        case 6: return x - z;
+        case 7: return -x - z;
+        case 8: return y + z;
+        case 9: return -y + z;
+        case 10: return y - z;
+        case 11: return -y - z;
+        case 12: return x + y;
+        case 13: return -y + z;
+        case 14: return -x + y;
+        default: return -y - z;
+    }
+}
+
+int FloorToInt(float v)
+{
+    int i = (int)v;
+    return v < i ? i - 1 : i;
+}
+
+float Sample2(float x, float y)
+{
+    int xi = FloorToInt(x), yi = FloorToInt(y);
+    float xf = x - xi, yf = y - yi;
+    xi &= 255;
+    yi &= 255;
+
+    float u = Fade(xf), v = Fade(yf);
+    int a = _Perm[xi] + yi, b = _Perm[xi + 1] + yi;
+
+    return lerp(
+        lerp(Grad2(_Perm[a], xf, yf), Grad2(_Perm[b], xf - 1.0, yf), u),
+        lerp(Grad2(_Perm[a + 1], xf, yf - 1.0), Grad2(_Perm[b + 1], xf - 1.0, yf - 1.0), u),
+        v);
+}
+
+float Sample3(float x, float y, float z)
+{
+    int xi = FloorToInt(x), yi = FloorToInt(y), zi = FloorToInt(z);
+    float xf = x - xi, yf = y - yi, zf = z - zi;
+    xi &= 255;
+    yi &= 255;
+    zi &= 255;
+
+    float u = Fade(xf), v = Fade(yf), w = Fade(zf);
+    int a = _Perm[xi] + yi, aa = _Perm[a] + zi, ab = _Perm[a + 1] + zi;
+    int b = _Perm[xi + 1] + yi, ba = _Perm[b] + zi, bb = _Perm[b + 1] + zi;
+
+    return lerp(
+        lerp(
+            lerp(Grad3(_Perm[aa], xf, yf, zf), Grad3(_Perm[ba], xf - 1.0, yf, zf), u),
+            lerp(Grad3(_Perm[ab], xf, yf - 1.0, zf), Grad3(_Perm[bb], xf - 1.0, yf - 1.0, zf), u),
+            v),
+        lerp(
+            lerp(Grad3(_Perm[aa + 1], xf, yf, zf - 1.0), Grad3(_Perm[ba + 1], xf - 1.0, yf, zf - 1.0), u),
+            lerp(Grad3(_Perm[ab + 1], xf, yf - 1.0, zf - 1.0), Grad3(_Perm[bb + 1], xf - 1.0, yf - 1.0, zf - 1.0), u),
+            v),
+        w);
+}
+
+float Fbm2(float x, float y)
+{
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    for (int i = 0; i < _Octaves; i++)
+    {
+        sum += Sample2(x, y) * amp;
+        norm += amp;
+        amp *= _Persistence;
+        x *= _Lacunarity;
+        y *= _Lacunarity;
+    }
+    return sum / norm;
+}
+
+float Fbm3(float x, float y, float z)
+{
+    float sum = 0.0, amp = 1.0, norm = 0.0;
+    for (int i = 0; i < 3; i++) // cave carving uses 3 octaves, like the CPU source
+    {
+        sum += Sample3(x, y, z) * amp;
+        norm += amp;
+        amp *= _Persistence;
+        x *= _Lacunarity;
+        y *= _Lacunarity;
+        z *= _Lacunarity;
+    }
+    return sum / norm;
+}
+
+// ------------------------------------------------------------------ density (two layers)
+
+float ProceduralDensity(int3 voxel)
+{
+    float wx = voxel.x * _VoxelSize;
+    float wy = voxel.y * _VoxelSize;
+    float wz = voxel.z * _VoxelSize;
+
+    float height = _GroundLevel + Fbm2(wx * _Frequency, wz * _Frequency) * _HeightAmplitude;
+    float density = saturate(0.5 + (height - wy) / (2.0 * _SurfaceBlend));
+
+    if (_CaveStrength > 0.0 && density > 0.0)
+    {
+        float carve = Fbm3(wx * _CaveFrequency, wy * _CaveFrequency, wz * _CaveFrequency);
+        density -= max(0.0, carve - _CaveThreshold) * _CaveStrength;
+        density = max(density, 0.0);
+    }
+
+    return density;
+}
+
+// Layer A (player edits) over layer B (procedural), exactly like LayeredDensitySource.
+float SampleDensity(int3 voxel)
+{
+    int3 brickCoord = voxel >> 4;
+    for (int i = 0; i < _EditBrickCount; i++)
+    {
+        if (all(_EditBrickCoords[i] == brickCoord))
+        {
+            int idx = (voxel.x & 15) | ((voxel.y & 15) << 4) | ((voxel.z & 15) << 8);
+            float edited = _EditBrickData[i * 4096 + idx];
+            if (edited >= -0.5)
+                return edited;
+            break; // brick exists but this voxel is untouched
+        }
+    }
+    return ProceduralDensity(voxel);
+}
+
+float SignedAt(int3 voxel)
+{
+    return _IsoLevel - SampleDensity(voxel);
+}
+
+// ------------------------------------------------------------------ shared meshing helpers
+
+int3 MinVoxel()
+{
+    return int3(_MinVoxelX, _MinVoxelY, _MinVoxelZ);
+}
+
+float VolumeAt(int3 g)
+{
+    return _Volume[g.x + _PointsPerAxis * (g.y + _PointsPerAxis * g.z)];
+}
+
+// Central-difference gradient on the chunk grid; unnormalized, like ChunkSamples.GradientAt.
+float3 VolumeGradient(int3 g)
+{
+    return float3(
+        VolumeAt(g + int3(1, 0, 0)) - VolumeAt(g - int3(1, 0, 0)),
+        VolumeAt(g + int3(0, 1, 0)) - VolumeAt(g - int3(0, 1, 0)),
+        VolumeAt(g + int3(0, 0, 1)) - VolumeAt(g - int3(0, 0, 1)));
+}
+
+float3 SafeNormalize(float3 v)
+{
+    float len = length(v);
+    return len > 1e-5 ? v / len : float3(0.0, 1.0, 0.0);
+}
+
+// TransvoxelGeometry.ApplySecondaryShift, verbatim (positions in chunk-local voxels).
+float3 ApplySecondaryShift(float3 position, float3 normal)
+{
+    if (_TransitionMask == 0)
+        return position;
+
+    float cell = (float)_LodStep;
+    float maxPos = _Cells * cell;
+    float3 delta = float3(0.0, 0.0, 0.0);
+    bool anyNear = false;
+
+    [unroll]
+    for (int axis = 0; axis < 3; axis++)
+    {
+        float p = position[axis];
+        if (p < cell)
+        {
+            anyNear = true;
+            if ((_TransitionMask & (1 << (axis * 2))) == 0)
+                return position;
+            delta[axis] = 0.25 * (cell - p);
+        }
+        else if (p > maxPos - cell)
+        {
+            anyNear = true;
+            if ((_TransitionMask & (1 << (axis * 2 + 1))) == 0)
+                return position;
+            delta[axis] = 0.25 * (maxPos - cell - p);
+        }
+    }
+
+    if (!anyNear)
+        return position;
+
+    return position + (delta - normal * dot(normal, delta));
+}
+
+// Interpolation parameter along an active edge; the explicit zero cases match the CPU's
+// "vertex exactly on a corner" handling (d1 first, like TransvoxelMesher.ResolveVertex).
+float EdgeParameter(float d0, float d1)
+{
+    if (d1 == 0.0)
+        return 1.0;
+    if (d0 == 0.0)
+        return 0.0;
+    return d0 / (d0 - d1);
+}
+
+TVertex FinishVertex(float3 positionVoxels, float3 normal)
+{
+    TVertex vtx;
+    vtx.position = positionVoxels * _VoxelSize;
+    vtx.normal = normal;
+    vtx.uv = float2(
+        (_MinVoxelX + positionVoxels.x) * _VoxelSize * _UvScale,
+        (_MinVoxelZ + positionVoxels.z) * _VoxelSize * _UvScale);
+    return vtx;
+}
+
+void EmitTriangle(TVertex a, TVertex b, TVertex c, bool flip)
+{
+    float3 crossProduct = cross(b.position - a.position, c.position - a.position);
+    if (dot(crossProduct, crossProduct) < 1e-12)
+        return; // degenerate, same tolerance as TransvoxelGeometry.IsDegenerate
+
+    TTriangle tri;
+    tri.a = a;
+    if (flip)
+    {
+        tri.b = c;
+        tri.c = b;
+    }
+    else
+    {
+        tri.b = b;
+        tri.c = c;
+    }
+
+    if (_FlatShading != 0)
+    {
+        float3 faceNormal = SafeNormalize(cross(tri.b.position - tri.a.position, tri.c.position - tri.a.position));
+        tri.a.normal = faceNormal;
+        tri.b.normal = faceNormal;
+        tri.c.normal = faceNormal;
+    }
+
+    _Triangles.Append(tri);
+}
+
+// ------------------------------------------------------------------ kernel: volume
+
+[numthreads(4, 4, 4)]
+void CSVolume(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)_PointsPerAxis))
+        return;
+    int3 g = int3(id);
+    int3 voxel = MinVoxel() + (g - 1) * _LodStep;
+    _Volume[g.x + _PointsPerAxis * (g.y + _PointsPerAxis * g.z)] = SignedAt(voxel);
+}
+
+// ------------------------------------------------------------------ kernel: regular cells
+
+TVertex MakeRegularVertex(int3 cell, int v0, int v1, float d0, float d1)
+{
+    int3 c0 = int3(v0 & 1, (v0 >> 1) & 1, (v0 >> 2) & 1);
+    int3 c1 = int3(v1 & 1, (v1 >> 1) & 1, (v1 >> 2) & 1);
+
+    float s = EdgeParameter(d0, d1);
+    float3 p0 = float3(cell + c0) * _LodStep;
+    float3 p1 = float3(cell + c1) * _LodStep;
+    float3 position = p0 + s * (p1 - p0);
+
+    float3 g0 = VolumeGradient(cell + 1 + c0);
+    float3 g1 = VolumeGradient(cell + 1 + c1);
+    float3 normal = SafeNormalize(g0 + s * (g1 - g0));
+
+    position = ApplySecondaryShift(position, normal);
+    return FinishVertex(position, normal);
+}
+
+[numthreads(4, 4, 4)]
+void CSRegular(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint)_Cells))
+        return;
+    int3 cell = int3(id);
+
+    float d[8];
+    int caseCode = 0;
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int3 corner = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        float dist = VolumeAt(cell + 1 + corner);
+        d[i] = dist;
+        if (dist < 0.0)
+            caseCode |= 1 << i;
+    }
+    if (caseCode == 0 || caseCode == 255)
+        return;
+
+    int cellClass = _RegularCellClass[caseCode];
+    int triangleCount = _RegularCellCounts[cellClass] & 0xF;
+
+    for (int t = 0; t < triangleCount; t++)
+    {
+        TVertex verts[3];
+        [unroll]
+        for (int k = 0; k < 3; k++)
+        {
+            int slot = _RegularCellIndices[cellClass * 15 + t * 3 + k];
+            int code = _RegularVertexData[caseCode * 12 + slot];
+            int v0 = (code >> 4) & 0x0F;
+            int v1 = code & 0x0F;
+            verts[k] = MakeRegularVertex(cell, v0, v1, d[v0], d[v1]);
+        }
+        EmitTriangle(verts[0], verts[1], verts[2], false);
+    }
+}
+
+// ------------------------------------------------------------------ kernel: transition cells
+
+// Case-index weight of each full-res sample location (paper Figure 4.17) and the (u, v)
+// offsets of the 13 locations inside one transition cell (Figure 4.16).
+static const int CaseWeight[9] = { 0x01, 0x02, 0x04, 0x80, 0x100, 0x08, 0x40, 0x20, 0x10 };
+static const int LocU[13] = { 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 2, 0, 2 };
+static const int LocV[13] = { 0, 0, 0, 1, 1, 1, 2, 2, 2, 0, 0, 2, 2 };
+
+int3 AxisVec(int axis)
+{
+    return int3(axis == 0 ? 1 : 0, axis == 1 ? 1 : 0, axis == 2 ? 1 : 0);
+}
+
+int FaceAxisN() { return _Face >> 1; }
+int FaceAxisU() { int n = FaceAxisN(); return n == 0 ? 1 : 0; }
+int FaceAxisV() { int n = FaceAxisN(); return n == 2 ? 1 : 2; }
+bool FaceIsPositive() { return (_Face & 1) != 0; }
+int FacePlaneLocal() { return FaceIsPositive() ? _Cells * _LodStep : 0; }
+
+// Chunk-local voxel offset of a fine-lattice face point (fu, fv).
+int3 FineLocal(int fu, int fv)
+{
+    int fineStep = _LodStep >> 1;
+    return AxisVec(FaceAxisU()) * (fu * fineStep)
+         + AxisVec(FaceAxisV()) * (fv * fineStep)
+         + AxisVec(FaceAxisN()) * FacePlaneLocal();
+}
+
+float3 TransitionLocationPosition(int fu, int fv)
+{
+    return float3(FineLocal(fu, fv));
+}
+
+float3 TransitionLocationGradient(int location, int fu, int fv)
+{
+    float3 gradient;
+    if (location >= 9)
+    {
+        // Half-res corners: the exact coarse-grid gradient the regular kernel computes for
+        // the coincident regular vertex, so shift and shading agree across both meshes.
+        int3 grid = AxisVec(FaceAxisU()) * (1 + (fu >> 1))
+                  + AxisVec(FaceAxisV()) * (1 + (fv >> 1))
+                  + AxisVec(FaceAxisN()) * (1 + (FaceIsPositive() ? _Cells : 0));
+        gradient = VolumeGradient(grid);
+    }
+    else
+    {
+        // Full-res locations: central differences on the neighbour's fine lattice — the same
+        // values the finer chunk derives from its own volume, for continuous shading.
+        int fineStep = _LodStep >> 1;
+        int3 voxel = MinVoxel() + FineLocal(fu, fv);
+        gradient = float3(
+            SignedAt(voxel + int3(fineStep, 0, 0)) - SignedAt(voxel - int3(fineStep, 0, 0)),
+            SignedAt(voxel + int3(0, fineStep, 0)) - SignedAt(voxel - int3(0, fineStep, 0)),
+            SignedAt(voxel + int3(0, 0, fineStep)) - SignedAt(voxel - int3(0, 0, fineStep)));
+    }
+    return gradient;
+}
+
+TVertex MakeTransitionVertex(int cx, int cy, int l0, int l1, float d0, float d1)
+{
+    // Both endpoints of an active edge lie on the same face of the cell, so l0 >= 9 marks
+    // a half-res-face edge whose vertex must run through the secondary shift.
+    bool halfRes = l0 >= 9;
+
+    int fu0 = 2 * cx + LocU[l0], fv0 = 2 * cy + LocV[l0];
+    int fu1 = 2 * cx + LocU[l1], fv1 = 2 * cy + LocV[l1];
+
+    float s = EdgeParameter(d0, d1);
+    float3 p0 = TransitionLocationPosition(fu0, fv0);
+    float3 p1 = TransitionLocationPosition(fu1, fv1);
+    float3 position = p0 + s * (p1 - p0);
+
+    float3 g0 = TransitionLocationGradient(l0, fu0, fv0);
+    float3 g1 = TransitionLocationGradient(l1, fu1, fv1);
+    float3 normal = SafeNormalize(g0 + s * (g1 - g0));
+
+    if (halfRes)
+        position = ApplySecondaryShift(position, normal);
+
+    return FinishVertex(position, normal);
+}
+
+[numthreads(8, 8, 1)]
+void CSTransition(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_Cells || id.y >= (uint)_Cells)
+        return;
+    int cx = int(id.x);
+    int cy = int(id.y);
+
+    float locD[13];
+    int caseCode = 0;
+    for (int loc = 0; loc < 9; loc++)
+    {
+        float dist = SignedAt(MinVoxel() + FineLocal(2 * cx + LocU[loc], 2 * cy + LocV[loc]));
+        locD[loc] = dist;
+        if (dist < 0.0)
+            caseCode |= CaseWeight[loc];
+    }
+    if (caseCode == 0 || caseCode == 511)
+        return;
+
+    // Half-res corners carry the same sample values as the full-res corners.
+    locD[9] = locD[0];
+    locD[10] = locD[2];
+    locD[11] = locD[6];
+    locD[12] = locD[8];
+
+    int classIndex = _TransitionCellClass[caseCode];
+    bool inverted = (classIndex & 0x80) != 0;
+    int cls = classIndex & 0x7F;
+    int triangleCount = _TransitionCellCounts[cls] & 0xF;
+
+    // Lengyel's transition triangles are listed wound against the outward normal in the
+    // fixed ascending-axis (u, v) basis; flip on the faces where that basis already points
+    // outward — PosX, NegY, PosZ — exactly like TransvoxelTransitionMesher.
+    bool basisFlipsWinding = _Face == 1 || _Face == 2 || _Face == 5;
+    bool flip = inverted != basisFlipsWinding;
+
+    for (int t = 0; t < triangleCount; t++)
+    {
+        TVertex verts[3];
+        for (int k = 0; k < 3; k++)
+        {
+            int slot = _TransitionCellIndices[cls * 36 + t * 3 + k];
+            int code = _TransitionVertexData[caseCode * 12 + slot];
+            int l0 = (code >> 4) & 0x0F;
+            int l1 = code & 0x0F;
+            verts[k] = MakeTransitionVertex(cx, cy, l0, l1, locD[l0], locD[l1]);
+        }
+        EmitTriangle(verts[0], verts[1], verts[2], flip);
+    }
+}

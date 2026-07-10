@@ -114,7 +114,7 @@ namespace reromanlee.Transvoxel.Demo
             if (terrain == null || !Input.GetMouseButton(0) || Time.time < nextBrushTime)
                 return;
             // Ignore clicks on the GUI overlay.
-            if (Input.mousePosition.x < 300f && Input.mousePosition.y > Screen.height - 330f)
+            if (Input.mousePosition.x < 300f && Input.mousePosition.y > Screen.height - 360f)
                 return;
 
             var ray = demoCamera.ScreenPointToRay(Input.mousePosition);
@@ -130,7 +130,7 @@ namespace reromanlee.Transvoxel.Demo
         void OnGUI()
         {
             const int width = 290;
-            GUILayout.BeginArea(new Rect(10, 10, width, 320), GUI.skin.box);
+            GUILayout.BeginArea(new Rect(10, 10, width, 350), GUI.skin.box);
             GUILayout.Label("<b>Transvoxel Demo</b>", RichLabel());
 
 #if ENABLE_LEGACY_INPUT_MANAGER
@@ -143,7 +143,7 @@ namespace reromanlee.Transvoxel.Demo
             if (terrain != null)
             {
                 GUILayout.Label(
-                    $"FPS: {fps:0}\n" +
+                    $"FPS: {fps:0}   Backend: {(terrain.ActiveBackend == MeshingBackend.GpuCompute ? "GPU" : "CPU")}\n" +
                     $"Chunks: {terrain.LiveChunkCount}   Building: {terrain.PendingBuildCount}\n" +
                     $"Vertices: {terrain.TotalVertices:n0}");
             }
@@ -165,6 +165,14 @@ namespace reromanlee.Transvoxel.Demo
             {
                 settings.colorizeLods = tint;
                 terrain.RefreshLodTint();
+            }
+
+            bool gpu = GUILayout.Toggle(settings.meshingBackend == MeshingBackend.GpuCompute,
+                " GPU compute meshing");
+            if (gpu != (settings.meshingBackend == MeshingBackend.GpuCompute))
+            {
+                settings.meshingBackend = gpu ? MeshingBackend.GpuCompute : MeshingBackend.CpuThreads;
+                settings.NotifyChanged(); // rebuilds the pipeline live, edits preserved
             }
 
             GUILayout.EndArea();

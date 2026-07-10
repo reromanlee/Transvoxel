@@ -4,6 +4,20 @@ using UnityEngine;
 
 namespace reromanlee.Transvoxel
 {
+    /// <summary>Where chunk volumes are sampled and meshed.</summary>
+    public enum MeshingBackend
+    {
+        /// <summary>Worker threads on the CPU. Works everywhere, no GPU requirements.</summary>
+        CpuThreads = 0,
+
+        /// <summary>
+        /// Compute shaders: density (noise + player edits) and the whole Transvoxel
+        /// triangulation run on the GPU; the CPU only uploads finished meshes. Falls back
+        /// to <see cref="CpuThreads"/> when the platform lacks compute or async readback.
+        /// </summary>
+        GpuCompute = 1,
+    }
+
     /// <summary>
     /// All tuning knobs of the terrain in one asset (Concept.txt #4). Create via
     /// Assets ▸ Create ▸ Transvoxel ▸ Terrain Settings, or leave the field on
@@ -48,14 +62,47 @@ namespace reromanlee.Transvoxel
         [Tooltip("Tint chunks by LOD level to visualize the octree (debug).")]
         public bool colorizeLods;
 
+        [Tooltip("Seconds a freshly built chunk takes to dither in — a screen-space stipple " +
+                 "fade like Unity's LOD Group cross-fade. 0 = chunks appear instantly. Needs " +
+                 "a fade-aware shader: the built-in default material (Transvoxel/Lit Dithered) " +
+                 "supports it; see the README to add it to a custom shader.")]
+        [Range(0f, 2f)] public float chunkFadeInSeconds = 0.4f;
+
+        [Tooltip("Fraction of the view distance over which terrain dithers out toward the " +
+                 "draw-distance edge — per pixel, so even huge far chunks dissolve smoothly " +
+                 "like fog instead of popping. 0 disables edge fading. Needs a fade-aware " +
+                 "shader (see above).")]
+        [Range(0f, 0.5f)] public float edgeFadeFraction = 0.1f;
+
         [Header("Landscape (density layer B)")]
         public NoiseSettings noise = new NoiseSettings();
 
         [Header("Performance")]
-        [Tooltip("How many finished chunk meshes may be uploaded per frame on the main thread.")]
-        [Range(1, 64)] public int meshApplyBudgetPerFrame = 8;
+        [Tooltip("Where chunks are sampled and meshed. CPU = worker threads (runs everywhere). " +
+                 "GPU = compute shaders do the noise, the player-edit overlay and the whole " +
+                 "Transvoxel triangulation, leaving the CPU nearly idle; results stream back " +
+                 "asynchronously. Falls back to CPU if the platform lacks compute shaders.")]
+        public MeshingBackend meshingBackend = MeshingBackend.CpuThreads;
 
-        [Tooltip("Maximum parallel chunk builds. 0 = processor count - 1.")]
+        [Tooltip("Optional replacement for the built-in TransvoxelCompute shader " +
+                 "(loaded from the package's Resources when empty).")]
+        public ComputeShader gpuComputeOverride;
+
+        [Tooltip("GPU mode: how many chunk builds may be in flight on the GPU at once " +
+                 "(dispatched but not yet read back). Higher = faster world fill, more VRAM.")]
+        [Range(1, 32)] public int gpuJobsInFlight = 8;
+
+        [Tooltip("Main-thread time budget per frame for uploading finished chunk meshes, in " +
+                 "milliseconds. Uploads stop as soon as the budget is spent, so a burst of " +
+                 "finished chunks (teleport, fast flight) never turns into one long frame.")]
+        [Range(0.5f, 12f)] public float meshApplyBudgetMs = 3f;
+
+        [Tooltip("Hard cap on mesh uploads per frame, on top of the millisecond budget.")]
+        [Range(1, 64)] public int meshApplyBudgetPerFrame = 16;
+
+        [Tooltip("Maximum parallel chunk builds (CPU mode). 0 = processor count - 2, " +
+                 "leaving headroom for the main and render threads so building never " +
+                 "competes with the frame itself.")]
         [Range(0, 32)] public int maxConcurrentBuilds = 0;
 
         [Tooltip("Chunks up to this LOD level receive a MeshCollider (baked off the main thread). " +
@@ -75,7 +122,7 @@ namespace reromanlee.Transvoxel
         [Range(0, 4096)] public int densityCacheChunks = 512;
 
         public int EffectiveMaxConcurrentBuilds =>
-            maxConcurrentBuilds > 0 ? maxConcurrentBuilds : Mathf.Max(1, System.Environment.ProcessorCount - 1);
+            maxConcurrentBuilds > 0 ? maxConcurrentBuilds : Mathf.Max(1, System.Environment.ProcessorCount - 2);
 
         /// <summary>
         /// Raised whenever a value changes, so a running <see cref="TransvoxelTerrain"/> can
