@@ -4,6 +4,20 @@ using UnityEngine;
 
 namespace reromanlee.Transvoxel
 {
+    /// <summary>Where chunk volumes are sampled and meshed.</summary>
+    public enum MeshingBackend
+    {
+        /// <summary>Worker threads on the CPU. Works everywhere, no GPU requirements.</summary>
+        CpuThreads = 0,
+
+        /// <summary>
+        /// Compute shaders: density (noise + player edits) and the whole Transvoxel
+        /// triangulation run on the GPU; the CPU only uploads finished meshes. Falls back
+        /// to <see cref="CpuThreads"/> when the platform lacks compute or async readback.
+        /// </summary>
+        GpuCompute = 1,
+    }
+
     /// <summary>
     /// All tuning knobs of the terrain in one asset (Concept.txt #4). Create via
     /// Assets ▸ Create ▸ Transvoxel ▸ Terrain Settings, or leave the field on
@@ -52,10 +66,29 @@ namespace reromanlee.Transvoxel
         public NoiseSettings noise = new NoiseSettings();
 
         [Header("Performance")]
-        [Tooltip("How many finished chunk meshes may be uploaded per frame on the main thread.")]
-        [Range(1, 64)] public int meshApplyBudgetPerFrame = 8;
+        [Tooltip("Where chunks are sampled and meshed. CPU = worker threads (runs everywhere). " +
+                 "GPU = compute shaders do the noise, the player-edit overlay and the whole " +
+                 "Transvoxel triangulation, leaving the CPU nearly idle; results stream back " +
+                 "asynchronously. Falls back to CPU if the platform lacks compute shaders.")]
+        public MeshingBackend meshingBackend = MeshingBackend.CpuThreads;
 
-        [Tooltip("Maximum parallel chunk builds. 0 = processor count - 1.")]
+        [Tooltip("Optional replacement for the built-in TransvoxelCompute shader " +
+                 "(loaded from the package's Resources when empty).")]
+        public ComputeShader gpuComputeOverride;
+
+        [Tooltip("GPU mode: how many chunk builds may be in flight on the GPU at once " +
+                 "(dispatched but not yet read back). Higher = faster world fill, more VRAM.")]
+        [Range(1, 32)] public int gpuJobsInFlight = 8;
+
+        [Tooltip("Main-thread time budget per frame for uploading finished chunk meshes, in " +
+                 "milliseconds. Uploads stop as soon as the budget is spent, so a burst of " +
+                 "finished chunks (teleport, fast flight) never turns into one long frame.")]
+        [Range(0.5f, 12f)] public float meshApplyBudgetMs = 3f;
+
+        [Tooltip("Hard cap on mesh uploads per frame, on top of the millisecond budget.")]
+        [Range(1, 64)] public int meshApplyBudgetPerFrame = 16;
+
+        [Tooltip("Maximum parallel chunk builds (CPU mode). 0 = processor count - 1.")]
         [Range(0, 32)] public int maxConcurrentBuilds = 0;
 
         [Tooltip("Chunks up to this LOD level receive a MeshCollider (baked off the main thread). " +

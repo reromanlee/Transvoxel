@@ -23,9 +23,10 @@ through a tiny interface, so you can replace any of them on its own.
 | Layer | Folder | Responsibility | Key type |
 |-------|--------|----------------|----------|
 | **Density** — *where* is there ground? | `Runtime/Density/` | Answers `SampleVoxel(x,y,z) → 0..1`. Two stacked layers: player edits (A) over procedural landscape (B). | `IDensitySource`, `LayeredDensitySource` |
-| **Meshing** — *how* do we triangulate a chunk? | `Runtime/Meshing/` | Turns a sampled chunk into vertices/normals/UVs using the Transvoxel tables. Regular cells + transition cells. | `TransvoxelMesher`, `TransvoxelTransitionMesher` |
+| **Meshing (CPU)** — *how* do we triangulate a chunk? | `Runtime/Meshing/` | Turns a sampled chunk into vertices/normals/UVs using the Transvoxel tables. Regular cells + transition cells. | `TransvoxelMesher`, `TransvoxelTransitionMesher` |
+| **Meshing (GPU)** — the same, in compute shaders | `Runtime/Gpu/`, `Runtime/Resources/TransvoxelCompute.compute` | Density (noise + edit overlay) and the whole triangulation run in three compute kernels; triangles stream back via async readback. | `GpuChunkBuilder`, `TransvoxelGpuTables` |
 | **Octree** — *what* should exist right now? | `Runtime/Octree/` | Pure function of viewer position → the set of chunks and which faces need transition cells. | `TerrainOctree` → `ChunkDrawCommand` |
-| **Orchestrator** — wire it together | `Runtime/TransvoxelTerrain.cs` | Diffs the octree's wishes against the live scene, runs sampling + meshing on worker `Task`s, uploads finished meshes under a per-frame budget. | `TransvoxelTerrain` |
+| **Orchestrator** — wire it together | `Runtime/TransvoxelTerrain.cs` | Diffs the octree's wishes against the live scene, feeds a distance-prioritized build queue (CPU workers or GPU dispatches), uploads finished meshes under a per-frame time budget. | `TransvoxelTerrain` |
 
 The raw lookup tables translated from Lengyel's C++ live in
 `Runtime/TransvoxelDataTables.cs` (Concept.txt #3).
@@ -68,14 +69,45 @@ the terrain rebuilds itself the next frame (player edits are preserved). This is
 
 Notable knobs (Concept.txt #4, #6):
 
+- **meshingBackend** — `CpuThreads` (worker threads, runs everywhere) or `GpuCompute`
+  (compute shaders, see below). Switchable live, edits preserved.
 - **maxLodLevels** — LOD levels above LOD0 (e.g. `4` → LOD0..LOD4).
 - **viewDistance** — meters beyond which nothing is generated.
 - **lodSplitFactor** — higher = more detail further away (more chunks).
 - **smoothShading** — smooth shared-vertex normals vs. flat low-poly triangles.
 - **colliderMaxLod** — which LODs get a `MeshCollider` (baked off the main thread).
+- **meshApplyBudgetMs** — the main-thread time slice per frame for uploading finished
+  meshes. Bursts of hundreds of chunks (teleport, high-speed flight) spread over frames
+  instead of spiking one.
+- **gpuJobsInFlight** — GPU mode: chunks allowed on the GPU at once (throughput vs. VRAM).
 - **lodSwapLinger** — how long a replaced chunk lingers after its replacement is ready, so
   LOD swaps never flash a crack while a neighbour finishes rebuilding. Raise it if you see a
   brief hole when moving fast; lower it toward 0 for minimal overdraw.
+
+## CPU and GPU meshing backends
+
+Both backends produce the same landscape (the GPU noise runs the same permutation table as
+the CPU's `FractalNoise` — same seed, same terrain) and share the octree, the priority
+queue, colliders and terraforming. Set `meshingBackend` on the settings asset:
+
+- **CpuThreads** — chunks are sampled and meshed on a pool of worker tasks, one per core.
+- **GpuCompute** — three kernels in `TransvoxelCompute.compute` do all the heavy lifting:
+  1. `CSVolume` builds the chunk's density grid: procedural noise overridden by the
+     player-edit bricks, which are streamed in as `StructuredBuffer`s (the saveable edit
+     layer stays on the C# side — it's the only data the CPU still owns);
+  2. `CSRegular` runs one thread per cell over Lengyel's tables (uploaded once as buffers —
+     they are far too large for HLSL initializers);
+  3. `CSTransition` stitches the LOD seams with transition cells, one thread per face cell.
+  Finished triangles return via `AsyncGPUReadback` (two-stage: count, then exactly that many
+  triangles), so the CPU never blocks on the GPU; the readback lands straight in the mesh's
+  vertex buffer through the advanced Mesh API with zero per-vertex managed work.
+
+GPU cells emit their own vertices (the paper's reuse decks are inherently serial), so a GPU
+mesh carries ~2–3× the vertices of a CPU mesh with identical geometry and shading — the
+classic memory-for-parallelism trade. Positions are bit-identical across neighbouring
+chunks, so the surface stays watertight. If the platform lacks compute shaders or async
+readback (or a custom `DensityOverride` is active — arbitrary C# can't run on the GPU),
+the terrain falls back to `CpuThreads` with a console warning.
 
 ## How the seamless LOD works (the interesting part)
 
@@ -94,13 +126,27 @@ no shared data between neighbours. Correctness is proven by a headless watertigh
 
 ### Performance notes
 
-- Chunks are sampled and meshed on background `Task`s; only the final mesh upload touches the
-  main thread, under `meshApplyBudgetPerFrame`, so movement stays smooth (Concept.txt: async).
-- Coarse LODs sample the density field **only at the lattice points they actually use**, so
-  looking far into the distance costs far less than full-resolution detail (Concept.txt #5).
-- Old chunks stay on screen until their replacements are ready *and* the rest of the newly
-  selected set has settled (plus a small `lodSwapLinger`), so LOD swaps never flash holes or
-  cracks even while a neighbour is still rebuilding its transition faces.
+Everything per-frame is bounded, so the frame rate stays flat at any movement speed — fly,
+sprint or teleport; the worst case is unbuilt terrain filling in near-first, never a freeze:
+
+- **Distance-prioritized builds.** Scheduled chunks sit in a priority queue keyed by
+  distance to the viewer; CPU workers (or the GPU pump) always take the nearest one, and the
+  whole queue re-sorts whenever the viewer moves. After a teleport the ground under the
+  player meshes first, the horizon last. Terraform rebuilds jump the queue entirely.
+- **Async octree selection.** Deciding *what* should exist walks thousands of octree nodes;
+  that walk runs on a worker task, and only the cheap diff against the live scene touches
+  the main thread.
+- **Time-budgeted uploads.** Finished meshes upload under `meshApplyBudgetMs` per frame
+  (plus a count cap), so a burst of hundreds of finished chunks spreads across frames.
+- **Pooled chunk views.** Chunk GameObjects and their `Mesh` objects are recycled, not
+  created/destroyed — high-speed chunk churn costs no instantiation or GC spikes.
+- **Coarse LODs sample only their own lattice points**, so looking far into the distance
+  costs far less than full-resolution detail (Concept.txt #5).
+- **Hole-free swaps.** Old chunks stay on screen until their replacements are ready *and*
+  the newly selected set has settled (plus `lodSwapLinger`). All chunks touched by one
+  terraform stroke swap **in the same frame** (an "edit group"), so brushing never flashes
+  a one-frame hole along a chunk border.
+- Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
 ## Tests
 

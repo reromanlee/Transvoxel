@@ -411,5 +411,100 @@ namespace reromanlee.Transvoxel.Editor.Tests
             for (int i = 0; i < 64; i++)
                 Assert.AreEqual(b.SampleVoxel(i * 13, i * 7 - 100, -i * 3), values[i], "noise not deterministic");
         }
+
+        // ------------------------------------------------------------------ GPU backend pieces
+
+        /// <summary>
+        /// The compute kernels read the Lengyel tables from flattened buffers; every case's
+        /// vertex codes must fit the fixed stride and every triangle index must stay within
+        /// its class's vertex count, or the GPU would read garbage geometry.
+        /// </summary>
+        [Test]
+        public void GpuTables_FlattenWithinStrides()
+        {
+            Assert.AreEqual(256 * Gpu.TransvoxelGpuTables.VertexDataStride,
+                Gpu.TransvoxelGpuTables.RegularVertexData.Length);
+            Assert.AreEqual(512 * Gpu.TransvoxelGpuTables.VertexDataStride,
+                Gpu.TransvoxelGpuTables.TransitionVertexData.Length);
+
+            for (int c = 0; c < 16; c++)
+            {
+                int counts = Gpu.TransvoxelGpuTables.RegularCellCounts[c];
+                Assert.LessOrEqual(counts >> 4, Gpu.TransvoxelGpuTables.VertexDataStride);
+                for (int i = 0; i < (counts & 0xF) * 3; i++)
+                    Assert.Less(Gpu.TransvoxelGpuTables.RegularCellIndices[c * 15 + i], counts >> 4);
+            }
+            for (int c = 0; c < 56; c++)
+            {
+                int counts = Gpu.TransvoxelGpuTables.TransitionCellCounts[c];
+                Assert.LessOrEqual(counts >> 4, Gpu.TransvoxelGpuTables.VertexDataStride);
+                for (int i = 0; i < (counts & 0xF) * 3; i++)
+                    Assert.Less(Gpu.TransvoxelGpuTables.TransitionCellIndices[c * 36 + i], counts >> 4);
+            }
+
+            // Flattened rows must reproduce the managed tables verbatim.
+            int[] row = TransvoxelDataTables.regularVertexData[0x33];
+            for (int i = 0; i < row.Length; i++)
+                Assert.AreEqual(row[i], Gpu.TransvoxelGpuTables.RegularVertexData[0x33 * 12 + i]);
+        }
+
+        [Test]
+        public void BuildQueue_PopsNearestFirstAndReprioritizes()
+        {
+            const int cells = 16;
+            var queue = new BuildQueue(cells);
+            queue.UpdateViewer(Vector3.zero);
+
+            ChunkBuildJob Job(int cx, bool rush = false) =>
+                new ChunkBuildJob { Key = new NodeKey(0, new Vector3Int(cx, 0, 0)), Rush = rush };
+
+            var near = Job(1);
+            var far = Job(50);
+            var rushFar = Job(100, rush: true);
+            queue.Enqueue(far);
+            queue.Enqueue(near);
+            queue.Enqueue(rushFar);
+
+            Assert.IsTrue(queue.TryDequeue(out var first) && ReferenceEquals(first, rushFar),
+                "terraform (rush) builds must jump the queue");
+            Assert.IsTrue(queue.TryDequeue(out var second) && ReferenceEquals(second, near),
+                "nearest chunk must build first");
+            Assert.IsTrue(queue.TryDequeue(out var third) && ReferenceEquals(third, far));
+
+            // Teleport: what was far is now near, the queue must re-sort.
+            var a = Job(1);
+            var c = Job(50);
+            queue.Enqueue(a);
+            queue.Enqueue(c);
+            queue.UpdateViewer(new Vector3(50 * cells, 0, 0));
+            Assert.IsTrue(queue.TryDequeue(out var flipped) && ReferenceEquals(flipped, c),
+                "queue did not re-prioritize around the new viewer position");
+        }
+
+        [Test]
+        public void EditLayer_CollectsBricksForGpuUpload()
+        {
+            var edits = new VoxelEditLayer();
+            var layered = new LayeredDensitySource(new FlatGround(), edits);
+            layered.ApplySphereBrush(new Vector3(0, 0, 0), 4f, 1f, build: false);
+
+            var results = new List<(Vector3Int coord, float[] data)>();
+            edits.CollectBricks(new BoundsInt(-8, -8, -8, 17, 17, 17), results);
+            Assert.Greater(results.Count, 0, "no bricks collected near the brush");
+            foreach (var (coord, data) in results)
+                Assert.AreEqual(VoxelEditLayer.BrickVolume, data.Length);
+
+            results.Clear();
+            edits.CollectBricks(new BoundsInt(1000, 1000, 1000, 32, 32, 32), results);
+            Assert.AreEqual(0, results.Count, "bricks returned far from any edit");
+
+            // The GPU sentinel contract: edited voxels are real [0,1] values, untouched
+            // voxels are NaN (packed as -1 for the shader).
+            Assert.IsTrue(edits.TryGetVoxel(0, 0, 0, out float value));
+            results.Clear();
+            edits.CollectBricks(new BoundsInt(0, 0, 0, 1, 1, 1), results);
+            Assert.AreEqual(1, results.Count);
+            Assert.AreEqual(value, results[0].data[0], 1e-6f, "voxel (0,0,0) is brick index 0");
+        }
     }
 }

@@ -16,10 +16,10 @@ namespace reromanlee.Transvoxel.Density
     /// </summary>
     public sealed class VoxelEditLayer
     {
-        const int BrickBits = 4;
-        const int BrickSize = 1 << BrickBits;          // 16
-        const int BrickMask = BrickSize - 1;
-        const int BrickVolume = BrickSize * BrickSize * BrickSize;
+        public const int BrickBits = 4;
+        public const int BrickSize = 1 << BrickBits;          // 16
+        public const int BrickMask = BrickSize - 1;
+        public const int BrickVolume = BrickSize * BrickSize * BrickSize;
 
         /// <summary>Marks "no edit here" inside a brick.</summary>
         const float NoEdit = float.NaN;
@@ -84,6 +84,51 @@ namespace reromanlee.Transvoxel.Density
         }
 
         public void Clear() => bricks = new Dictionary<Vector3Int, float[]>();
+
+        /// <summary>
+        /// Collects every brick that overlaps the given voxel region, for upload to the GPU
+        /// density kernel. The returned arrays are the immutable copy-on-write snapshot
+        /// bricks — safe to read (never mutated), must not be written. Unedited voxels hold
+        /// <see cref="float.NaN"/>; convert to the GPU sentinel while packing.
+        /// </summary>
+        public void CollectBricks(BoundsInt voxelBounds, List<(Vector3Int coord, float[] data)> results)
+        {
+            results.Clear();
+            var snapshot = bricks;
+            if (snapshot.Count == 0)
+                return;
+
+            var minBrick = new Vector3Int(voxelBounds.xMin >> BrickBits, voxelBounds.yMin >> BrickBits,
+                voxelBounds.zMin >> BrickBits);
+            var maxBrick = new Vector3Int((voxelBounds.xMax - 1) >> BrickBits, (voxelBounds.yMax - 1) >> BrickBits,
+                (voxelBounds.zMax - 1) >> BrickBits);
+
+            long candidates = (long)(maxBrick.x - minBrick.x + 1)
+                              * (maxBrick.y - minBrick.y + 1)
+                              * (maxBrick.z - minBrick.z + 1);
+            if (candidates <= snapshot.Count)
+            {
+                for (int z = minBrick.z; z <= maxBrick.z; z++)
+                for (int y = minBrick.y; y <= maxBrick.y; y++)
+                for (int x = minBrick.x; x <= maxBrick.x; x++)
+                {
+                    var coord = new Vector3Int(x, y, z);
+                    if (snapshot.TryGetValue(coord, out float[] brick))
+                        results.Add((coord, brick));
+                }
+            }
+            else
+            {
+                foreach (var entry in snapshot)
+                {
+                    var c = entry.Key;
+                    if (c.x >= minBrick.x && c.x <= maxBrick.x
+                        && c.y >= minBrick.y && c.y <= maxBrick.y
+                        && c.z >= minBrick.z && c.z <= maxBrick.z)
+                        results.Add((c, entry.Value));
+                }
+            }
+        }
 
         static float[] NewBrick()
         {
