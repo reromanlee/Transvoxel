@@ -60,24 +60,34 @@ Shader "Transvoxel/Lit Dithered"
             15.5 / 16.0,  7.5 / 16.0, 13.5 / 16.0,  5.5 / 16.0
         };
 
-        float TransvoxelFadeAt(float3 positionWS)
+        // _TransvoxelFade in [0,1] fades a chunk in: keep pixels with threshold <= fade.
+        // NEGATIVE fade marks a ghost — an old mesh cross-fading out while its successor
+        // (driven with the complementary value) fades in: the ghost keeps exactly the
+        // pixels the successor does not draw yet, so the pair always covers the surface
+        // with no holes and no double-drawn pixels. Both windows are additionally capped
+        // by the per-pixel draw-distance dissolve.
+        void TransvoxelDitherClip(float4 positionCS, float3 positionWS)
         {
             float fade = _TransvoxelFade;
+            float edge = 1.0;
             if (_TransvoxelEdgeFadeBand > 0.0)
             {
                 float viewerDistance = distance(positionWS, _TransvoxelViewerPos.xyz);
-                fade = min(fade, saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand));
+                edge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
             }
-            return fade;
-        }
-
-        void TransvoxelDitherClip(float4 positionCS, float3 positionWS)
-        {
-            float fade = TransvoxelFadeAt(positionWS);
-            if (fade >= 1.0)
+            if (fade >= 1.0 && edge >= 1.0)
                 return;
+
             uint2 pixel = uint2(positionCS.xy) & 3;
-            clip(fade - TransvoxelDither[pixel.y * 4 + pixel.x]);
+            float threshold = TransvoxelDither[pixel.y * 4 + pixel.x];
+
+            if (fade < 0.0)
+            {
+                // Ghost visibility g = -fade (1 -> 0): keep thresholds in [1 - g, edge].
+                clip(min(threshold - (1.0 + fade), edge - threshold));
+                return;
+            }
+            clip(min(fade, edge) - threshold);
         }
         ENDHLSL
 
@@ -273,17 +283,24 @@ Shader "Transvoxel/Lit Dithered"
 
         void surf(Input IN, inout SurfaceOutputStandard o)
         {
+            // Same clip rules as the URP subshader: positive fade dithers in, negative fade
+            // is a ghost keeping the complementary pixel set, both capped by the edge dissolve.
             float fade = _TransvoxelFade;
+            float edge = 1.0;
             if (_TransvoxelEdgeFadeBand > 0.0)
             {
                 float viewerDistance = distance(IN.worldPos, _TransvoxelViewerPos.xyz);
-                fade = min(fade, saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand));
+                edge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
             }
-            if (fade < 1.0)
+            if (fade < 1.0 || edge < 1.0)
             {
                 float2 pixel = IN.screenPos.xy / max(IN.screenPos.w, 1e-4) * _ScreenParams.xy;
                 uint2 p = (uint2)pixel & 3;
-                clip(fade - TransvoxelDither[p.y * 4 + p.x]);
+                float threshold = TransvoxelDither[p.y * 4 + p.x];
+                if (fade < 0.0)
+                    clip(min(threshold - (1.0 + fade), edge - threshold));
+                else
+                    clip(min(fade, edge) - threshold);
             }
 
             fixed4 albedo = tex2D(_BaseMap, IN.uv_BaseMap) * _BaseColor;

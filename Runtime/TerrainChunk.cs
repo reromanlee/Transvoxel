@@ -43,7 +43,7 @@ namespace reromanlee.Transvoxel
         /// only retired against fully-visible replacements, or LOD swaps would show the
         /// stipple holes of a half-faded successor.
         /// </summary>
-        public bool FadeInComplete => appliedFade < 0f || appliedFade >= 1f;
+        public bool FadeInComplete => appliedFade >= 1f;
 
         readonly GameObject gameObject;
         readonly MeshFilter meshFilter;
@@ -52,7 +52,7 @@ namespace reromanlee.Transvoxel
         MeshCollider meshCollider;
         Mesh mesh;
         bool tintVisible;
-        float appliedFade = -1f; // -1 = never driven (feature off)
+        float appliedFade = 1f; // 1 = solid; (0,1) = fading in; negative = ghost fading out
 
         public TerrainChunk(NodeKey key, Transform parent, Material material, float voxelSize, int chunkCells)
         {
@@ -69,7 +69,7 @@ namespace reromanlee.Transvoxel
             Key = key;
             TransitionMask = 0;
             SpawnTime = Time.time;
-            appliedFade = -1f;
+            appliedFade = 1f;
             tintVisible = false;
 #if UNITY_EDITOR
             // Handy in the hierarchy, but a per-activation string allocation in builds.
@@ -160,6 +160,28 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>
+        /// Drives a ghost's fade-out (1 = fully covering, 0 = gone). Ghosts carry a NEGATIVE
+        /// fade value: the shader then keeps exactly the pixels the successor chunk (fading
+        /// in with the complementary value) does not draw yet, so a cross-fading pair always
+        /// covers the surface — no holes, no double-drawn pixels.
+        /// </summary>
+        public void SetGhostFade(float ghost)
+        {
+            float fade = -Mathf.Round(Mathf.Clamp01(ghost) * 64f) / 64f;
+            if (fade == appliedFade)
+                return;
+            appliedFade = fade;
+            PushPropertyBlock();
+        }
+
+        /// <summary>Restarts the fade-in ramp — used when a live chunk's mesh is replaced (terraform, LOD mask change) and cross-fades against its ghost.</summary>
+        public void RestartFadeIn()
+        {
+            SpawnTime = Time.time;
+            SetFadeIn(0f);
+        }
+
+        /// <summary>
         /// A renderer with a MaterialPropertyBlock is excluded from the SRP Batcher, so the
         /// block only exists while it says something: mid-fade or LOD-tinted. The moment a
         /// chunk is fully faded in and untinted the block is removed and the chunk batches
@@ -168,7 +190,7 @@ namespace reromanlee.Transvoxel
         /// </summary>
         void PushPropertyBlock()
         {
-            bool identity = !tintVisible && (appliedFade < 0f || appliedFade >= 1f);
+            bool identity = !tintVisible && appliedFade >= 1f;
             if (identity)
             {
                 meshRenderer.SetPropertyBlock(null);
@@ -176,8 +198,7 @@ namespace reromanlee.Transvoxel
             }
 
             propertyBlock.Clear();
-            if (appliedFade >= 0f)
-                propertyBlock.SetFloat(FadeId, appliedFade);
+            propertyBlock.SetFloat(FadeId, appliedFade);
             if (tintVisible)
             {
                 var tint = LodTints[Mathf.Min(Key.Lod, LodTints.Length - 1)];
@@ -197,18 +218,33 @@ namespace reromanlee.Transvoxel
 
         /// <summary>
         /// Releases the mesh from this view without destroying the GameObject — used when a
-        /// physics bake still reads the mesh on another thread. The view itself can then be
-        /// pooled; a fresh mesh is created on its next apply.
+        /// physics bake still reads the mesh on another thread, or to hand the old surface
+        /// to a cross-fade ghost. A fresh mesh is created on the next apply.
+        /// With <paramref name="keepColliderShape"/> the collider keeps referencing the old
+        /// mesh so physics stays solid until the replacement's bake attaches.
         /// </summary>
-        public Mesh DetachMesh()
+        public Mesh DetachMesh(bool keepColliderShape = false)
         {
             var kept = mesh;
             mesh = null;
             if (meshFilter != null)
                 meshFilter.sharedMesh = null;
-            if (meshCollider != null)
+            if (!keepColliderShape && meshCollider != null)
                 meshCollider.sharedMesh = null;
             return kept;
+        }
+
+        /// <summary>
+        /// Turns this (freshly activated) view into a cross-fade ghost showing a mesh
+        /// detached from another view. Purely visual: no collider, fades out via
+        /// <see cref="SetGhostFade"/> and is then recycled.
+        /// </summary>
+        public void AttachGhostMesh(Mesh ghostMesh)
+        {
+            mesh = ghostMesh;
+            meshFilter.sharedMesh = ghostMesh;
+            VertexCount = ghostMesh != null ? ghostMesh.vertexCount : 0;
+            meshRenderer.enabled = VertexCount > 0;
         }
     }
 }

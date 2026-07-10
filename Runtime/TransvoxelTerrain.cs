@@ -112,6 +112,17 @@ namespace reromanlee.Transvoxel
         readonly List<NodeKey> keyScratch = new List<NodeKey>();
         readonly Stack<TerrainChunk> chunkViewPool = new Stack<TerrainChunk>();
 
+        // Cross-fade ghosts: retired chunks and replaced meshes dither out here instead of
+        // popping. At most one ghost per chunk key, so rapid brushing can't stack them.
+        sealed class DyingChunk
+        {
+            public TerrainChunk View;
+            public float StartTime;
+        }
+
+        readonly List<DyingChunk> dying = new List<DyingChunk>();
+        readonly Dictionary<NodeKey, DyingChunk> dyingByKey = new Dictionary<NodeKey, DyingChunk>();
+
         ConcurrentQueue<ChunkBuildResult> completedBuilds = new ConcurrentQueue<ChunkBuildResult>();
         List<ChunkBuildResult> deferredApplies = new List<ChunkBuildResult>();
         readonly System.Diagnostics.Stopwatch applyStopwatch = new System.Diagnostics.Stopwatch();
@@ -458,6 +469,53 @@ namespace reromanlee.Transvoxel
             float now = Time.time;
             foreach (var chunk in live.Values)
                 chunk.SetFadeIn(duration <= 0f ? 1f : Mathf.Clamp01((now - chunk.SpawnTime) / duration));
+
+            UpdateDyingChunks(now, Mathf.Max(duration, 1e-3f));
+        }
+
+        // ------------------------------------------------------------------ cross-fade ghosts
+
+        /// <summary>
+        /// Puts a view on death row: it dithers out over the fade duration (complementary
+        /// pattern — see the shader) and is then recycled. Replaces any older ghost for the
+        /// same chunk, so rapid re-edits cross-fade between the latest two states only.
+        /// </summary>
+        void AddDyingChunk(TerrainChunk view)
+        {
+            if (settings.chunkFadeInSeconds <= 0f)
+            {
+                DestroyChunkView(view);
+                return;
+            }
+            if (dyingByKey.TryGetValue(view.Key, out var previous))
+            {
+                DestroyChunkView(previous.View);
+                dying.Remove(previous);
+            }
+            view.SetGhostFade(1f);
+            var entry = new DyingChunk { View = view, StartTime = Time.time };
+            dying.Add(entry);
+            dyingByKey[view.Key] = entry;
+        }
+
+        void UpdateDyingChunks(float now, float duration)
+        {
+            for (int i = dying.Count - 1; i >= 0; i--)
+            {
+                var entry = dying[i];
+                float ghost = 1f - (now - entry.StartTime) / duration;
+                if (ghost <= 0f)
+                {
+                    if (dyingByKey.TryGetValue(entry.View.Key, out var current) && current == entry)
+                        dyingByKey.Remove(entry.View.Key);
+                    DestroyChunkView(entry.View);
+                    dying.RemoveAt(i);
+                }
+                else
+                {
+                    entry.View.SetGhostFade(ghost);
+                }
+            }
         }
 
         // ------------------------------------------------------------------ selection
