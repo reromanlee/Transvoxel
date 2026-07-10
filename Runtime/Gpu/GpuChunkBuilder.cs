@@ -2,7 +2,9 @@ using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using reromanlee.Transvoxel.Density;
+using reromanlee.Transvoxel.Meshing;
 using Unity.Collections;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -14,27 +16,47 @@ namespace reromanlee.Transvoxel.Gpu
     /// distance priority as the CPU workers), dispatches the three compute kernels —
     /// density volume, regular cells, transition cells — and streams finished triangle
     /// soups back with <see cref="AsyncGPUReadback"/>, so the main thread never waits on
-    /// the GPU. Results enter the exact same completed-builds pipeline as CPU meshes.
+    /// the GPU. Each readback is then WELDED into an indexed mesh on a worker task
+    /// (<see cref="GpuMeshWelder"/>) before entering the shared completed-builds pipeline:
+    /// GPU chunks end up rendering exactly like CPU chunks (~3x fewer vertices than the
+    /// raw soup), which is what keeps the frame rate flat at large view distances.
+    ///
+    /// Player edits live in a RESIDENT brick pool on the GPU: bricks upload once (and
+    /// re-upload individually when a terraform stroke changes them via
+    /// <see cref="NotifyEditsChanged"/>); a chunk build only sends the few slot indices it
+    /// overlaps. Heavy terraforming therefore adds no per-chunk transfer cost.
     ///
     /// Per-job GPU buffers are pooled; at most <c>gpuJobsInFlight</c> chunks are on the
-    /// GPU at once. A readback goes through two stages (triangle count, then exactly that
-    /// many triangles) so empty or small chunks never transfer the worst-case buffer.
-    ///
-    /// Main thread only. Created per pipeline; any settings change rebuilds it.
+    /// GPU at once. Main thread only (worker tasks touch no GPU objects). Created per
+    /// pipeline; any settings change rebuilds it.
     /// </summary>
     public sealed class GpuChunkBuilder : IDisposable
     {
         const int TriangleFloatStride = 24; // 3 vertices x (3 position + 3 normal + 2 uv)
         const int TriangleByteStride = TriangleFloatStride * 4;
 
+        // Cached uniform ids — these are set per dispatch, so avoid the string hashing.
+        static readonly int MinVoxelXId = Shader.PropertyToID("_MinVoxelX");
+        static readonly int MinVoxelYId = Shader.PropertyToID("_MinVoxelY");
+        static readonly int MinVoxelZId = Shader.PropertyToID("_MinVoxelZ");
+        static readonly int LodStepId = Shader.PropertyToID("_LodStep");
+        static readonly int TransitionMaskId = Shader.PropertyToID("_TransitionMask");
+        static readonly int FlatShadingId = Shader.PropertyToID("_FlatShading");
+        static readonly int FaceId = Shader.PropertyToID("_Face");
+        static readonly int EditSlotCountId = Shader.PropertyToID("_EditSlotCount");
+        static readonly int VolumeId = Shader.PropertyToID("_Volume");
+        static readonly int TrianglesId = Shader.PropertyToID("_Triangles");
+        static readonly int ChunkEditSlotsId = Shader.PropertyToID("_ChunkEditSlots");
+        static readonly int EditBrickCoordsId = Shader.PropertyToID("_EditBrickCoords");
+        static readonly int EditBrickDataId = Shader.PropertyToID("_EditBrickData");
+
         sealed class JobSet
         {
             public ComputeBuffer Volume;        // (cells+3)^3 floats
             public ComputeBuffer Triangles;     // append, worst-case capacity
             public ComputeBuffer TriangleCount; // 1 raw uint, CopyCount target
-            public ComputeBuffer EditCoords;    // int3 per brick
-            public ComputeBuffer EditData;      // 4096 floats per brick
-            public int EditCapacity;            // bricks
+            public ComputeBuffer Slots;         // per-chunk edit pool slots
+            public int SlotCapacity;
         }
 
         readonly ComputeShader shader; // private instance — uniforms are per-builder state
@@ -52,10 +74,19 @@ namespace reromanlee.Transvoxel.Gpu
 
         readonly Stack<JobSet> setPool = new Stack<JobSet>();
         readonly List<JobSet> allSets = new List<JobSet>();
+
+        // ---- resident edit brick pool ----
+        readonly Dictionary<Vector3Int, int> brickSlots = new Dictionary<Vector3Int, int>();
+        ComputeBuffer editCoordsBuffer; // int3 per slot
+        ComputeBuffer editDataBuffer;   // BrickVolume floats per slot
+        int brickCount;
+        int brickCapacity;
+        int editPoolGeneration;
+        readonly float[] brickConvertScratch = new float[VoxelEditLayer.BrickVolume];
+        readonly int[] coordUploadScratch = new int[3];
         readonly List<(Vector3Int coord, float[] data)> brickScratch =
             new List<(Vector3Int, float[])>();
-        int[] coordScratch = Array.Empty<int>();
-        float[] editScratch = Array.Empty<float>();
+        int[] slotScratch = Array.Empty<int>();
 
         int inFlight;
         bool disposed;
@@ -111,6 +142,8 @@ namespace reromanlee.Transvoxel.Gpu
             BindTable(kernelTransition, "_TransitionCellCounts", TransvoxelGpuTables.TransitionCellCounts);
             BindTable(kernelTransition, "_TransitionCellIndices", TransvoxelGpuTables.TransitionCellIndices);
             BindTable(kernelTransition, "_TransitionVertexData", TransvoxelGpuTables.TransitionVertexData);
+
+            RebuildEditPool(64);
         }
 
         void BindTable(int kernel, string name, int[] data)
@@ -120,6 +153,81 @@ namespace reromanlee.Transvoxel.Gpu
             tableBuffers.Add(buffer);
             shader.SetBuffer(kernel, name, buffer);
         }
+
+        // ------------------------------------------------------------------ edit brick pool
+
+        /// <summary>
+        /// Call after the edit layer changed inside <paramref name="voxelBounds"/> (one
+        /// terraform stroke): the touched bricks are re-uploaded into their pool slots.
+        /// Cost is proportional to the stroke, never to the amount of terrain edited so far.
+        /// </summary>
+        public void NotifyEditsChanged(BoundsInt voxelBounds)
+        {
+            if (disposed || edits == null)
+                return;
+            edits.CollectBricks(voxelBounds, brickScratch);
+            int generation = editPoolGeneration;
+            foreach (var (coord, data) in brickScratch)
+            {
+                UploadBrick(coord, data);
+                if (editPoolGeneration != generation)
+                    return; // pool grew and re-uploaded everything, including the rest
+            }
+        }
+
+        void UploadBrick(Vector3Int coord, float[] data)
+        {
+            if (!brickSlots.TryGetValue(coord, out int slot))
+            {
+                if (brickCount >= brickCapacity)
+                {
+                    RebuildEditPool(brickCount + 1); // re-collects and uploads every brick
+                    return;
+                }
+                slot = brickCount++;
+                brickSlots.Add(coord, slot);
+                coordUploadScratch[0] = coord.x;
+                coordUploadScratch[1] = coord.y;
+                coordUploadScratch[2] = coord.z;
+                editCoordsBuffer.SetData(coordUploadScratch, 0, slot * 3, 3);
+            }
+
+            for (int i = 0; i < VoxelEditLayer.BrickVolume; i++)
+            {
+                float value = data[i];
+                brickConvertScratch[i] = float.IsNaN(value) ? -1f : value;
+            }
+            editDataBuffer.SetData(brickConvertScratch, 0, slot * VoxelEditLayer.BrickVolume,
+                VoxelEditLayer.BrickVolume);
+        }
+
+        /// <summary>(Re)creates the pool with room for at least <paramref name="minCapacity"/> bricks and uploads the whole edit layer.</summary>
+        void RebuildEditPool(int minCapacity)
+        {
+            editPoolGeneration++;
+            brickSlots.Clear();
+            brickCount = 0;
+
+            var allBricks = new List<(Vector3Int coord, float[] data)>();
+            if (edits != null)
+                edits.CollectAllBricks(allBricks);
+            brickCapacity = Mathf.NextPowerOfTwo(Mathf.Max(minCapacity, allBricks.Count, 64));
+
+            editCoordsBuffer?.Release();
+            editDataBuffer?.Release();
+            editCoordsBuffer = new ComputeBuffer(brickCapacity, 3 * sizeof(int));
+            editDataBuffer = new ComputeBuffer(brickCapacity * VoxelEditLayer.BrickVolume, sizeof(float));
+
+            foreach (var (coord, data) in allBricks)
+                UploadBrick(coord, data);
+
+            shader.SetBuffer(kernelVolume, EditBrickCoordsId, editCoordsBuffer);
+            shader.SetBuffer(kernelVolume, EditBrickDataId, editDataBuffer);
+            shader.SetBuffer(kernelTransition, EditBrickCoordsId, editCoordsBuffer);
+            shader.SetBuffer(kernelTransition, EditBrickDataId, editDataBuffer);
+        }
+
+        // ------------------------------------------------------------------ dispatch
 
         /// <summary>
         /// Starts as many queued builds as the in-flight limit allows. Call once per frame
@@ -145,39 +253,35 @@ namespace reromanlee.Transvoxel.Gpu
             int lodStep = 1 << job.Key.Lod;
             Vector3Int min = job.Key.MinVoxel(chunkCells);
 
-            UploadEdits(set, min, lodStep);
+            BindJobEdits(set, min, lodStep);
 
-            shader.SetInt("_MinVoxelX", min.x);
-            shader.SetInt("_MinVoxelY", min.y);
-            shader.SetInt("_MinVoxelZ", min.z);
-            shader.SetInt("_LodStep", lodStep);
-            shader.SetInt("_TransitionMask", job.Mask);
-            shader.SetInt("_FlatShading", job.SmoothShading ? 0 : 1);
+            shader.SetInt(MinVoxelXId, min.x);
+            shader.SetInt(MinVoxelYId, min.y);
+            shader.SetInt(MinVoxelZId, min.z);
+            shader.SetInt(LodStepId, lodStep);
+            shader.SetInt(TransitionMaskId, job.Mask);
+            shader.SetInt(FlatShadingId, job.SmoothShading ? 0 : 1);
 
-            shader.SetBuffer(kernelVolume, "_Volume", set.Volume);
-            shader.SetBuffer(kernelVolume, "_EditBrickCoords", set.EditCoords);
-            shader.SetBuffer(kernelVolume, "_EditBrickData", set.EditData);
+            shader.SetBuffer(kernelVolume, VolumeId, set.Volume);
             int volumeGroups = (pointsPerAxis + 3) / 4;
             shader.Dispatch(kernelVolume, volumeGroups, volumeGroups, volumeGroups);
 
             set.Triangles.SetCounterValue(0);
-            shader.SetBuffer(kernelRegular, "_Volume", set.Volume);
-            shader.SetBuffer(kernelRegular, "_Triangles", set.Triangles);
+            shader.SetBuffer(kernelRegular, VolumeId, set.Volume);
+            shader.SetBuffer(kernelRegular, TrianglesId, set.Triangles);
             int regularGroups = (chunkCells + 3) / 4;
             shader.Dispatch(kernelRegular, regularGroups, regularGroups, regularGroups);
 
             if (job.Mask != 0 && job.Key.Lod > 0)
             {
-                shader.SetBuffer(kernelTransition, "_Volume", set.Volume);
-                shader.SetBuffer(kernelTransition, "_Triangles", set.Triangles);
-                shader.SetBuffer(kernelTransition, "_EditBrickCoords", set.EditCoords);
-                shader.SetBuffer(kernelTransition, "_EditBrickData", set.EditData);
+                shader.SetBuffer(kernelTransition, VolumeId, set.Volume);
+                shader.SetBuffer(kernelTransition, TrianglesId, set.Triangles);
                 int transitionGroups = (chunkCells + 7) / 8;
                 for (int face = 0; face < 6; face++)
                 {
                     if ((job.Mask & (1 << face)) == 0)
                         continue;
-                    shader.SetInt("_Face", face);
+                    shader.SetInt(FaceId, face);
                     shader.Dispatch(kernelTransition, transitionGroups, transitionGroups, 1);
                 }
             }
@@ -188,48 +292,57 @@ namespace reromanlee.Transvoxel.Gpu
         }
 
         /// <summary>
-        /// Gathers the player-edit bricks the chunk's samples can read (the grid plus one
-        /// coarse step of margin for gradients and fine-lattice probes) and uploads them.
-        /// NaN "untouched" markers become the GPU sentinel -1.
+        /// Uploads the pool slot indices of the bricks this chunk's samples can read — a
+        /// handful of ints, not the brick data itself (that is already resident).
         /// </summary>
-        void UploadEdits(JobSet set, Vector3Int min, int lodStep)
+        void BindJobEdits(JobSet set, Vector3Int min, int lodStep)
         {
-            int brickCount = 0;
-            if (edits != null)
+            int slotCount = 0;
+            if (edits != null && brickCount > 0)
             {
                 int size = (chunkCells + 2) * lodStep + 1;
                 var bounds = new BoundsInt(min.x - lodStep, min.y - lodStep, min.z - lodStep, size, size, size);
                 edits.CollectBricks(bounds, brickScratch);
-                brickCount = brickScratch.Count;
-            }
+                slotCount = brickScratch.Count;
 
-            if (brickCount > 0)
-            {
-                EnsureEditCapacity(set, brickCount);
-                if (coordScratch.Length < brickCount * 3)
-                    coordScratch = new int[Mathf.NextPowerOfTwo(brickCount * 3)];
-                if (editScratch.Length < brickCount * VoxelEditLayer.BrickVolume)
-                    editScratch = new float[Mathf.NextPowerOfTwo(brickCount * VoxelEditLayer.BrickVolume)];
-
-                for (int b = 0; b < brickCount; b++)
+                if (slotCount > 0)
                 {
-                    (Vector3Int coord, float[] data) = brickScratch[b];
-                    coordScratch[b * 3] = coord.x;
-                    coordScratch[b * 3 + 1] = coord.y;
-                    coordScratch[b * 3 + 2] = coord.z;
-                    int baseIndex = b * VoxelEditLayer.BrickVolume;
-                    for (int i = 0; i < VoxelEditLayer.BrickVolume; i++)
+                    EnsureSlotCapacity(set, slotCount);
+                    if (slotScratch.Length < slotCount)
+                        slotScratch = new int[Mathf.NextPowerOfTwo(slotCount)];
+
+                    int generation = editPoolGeneration;
+                    for (int b = 0; b < slotCount; b++)
                     {
-                        float value = data[i];
-                        editScratch[baseIndex + i] = float.IsNaN(value) ? -1f : value;
+                        var (coord, data) = brickScratch[b];
+                        if (!brickSlots.TryGetValue(coord, out int slot))
+                        {
+                            // Shouldn't happen (NotifyEditsChanged keeps the pool a superset),
+                            // but recover rather than mesh with stale density.
+                            UploadBrick(coord, data);
+                            if (editPoolGeneration != generation)
+                            {
+                                // The pool grew and every slot was reassigned; restart so
+                                // already-written indices aren't stale.
+                                generation = editPoolGeneration;
+                                b = -1;
+                                continue;
+                            }
+                            if (!brickSlots.TryGetValue(coord, out slot))
+                                slot = 0; // vanished mid-frame; coord check in the kernel makes this benign
+                        }
+                        slotScratch[b] = slot;
                     }
+                    set.Slots.SetData(slotScratch, 0, 0, slotCount);
                 }
-                set.EditCoords.SetData(coordScratch, 0, 0, brickCount * 3);
-                set.EditData.SetData(editScratch, 0, 0, brickCount * VoxelEditLayer.BrickVolume);
             }
 
-            shader.SetInt("_EditBrickCount", brickCount);
+            shader.SetInt(EditSlotCountId, slotCount);
+            shader.SetBuffer(kernelVolume, ChunkEditSlotsId, set.Slots);
+            shader.SetBuffer(kernelTransition, ChunkEditSlotsId, set.Slots);
         }
+
+        // ------------------------------------------------------------------ readback + weld
 
         void OnCountReady(AsyncGPUReadbackRequest request, ChunkBuildJob job, JobSet set,
             ConcurrentQueue<ChunkBuildResult> results)
@@ -254,7 +367,13 @@ namespace reromanlee.Transvoxel.Gpu
             int triangleCount = Mathf.Min(request.GetData<int>()[0], triangleCapacity);
             if (triangleCount <= 0)
             {
-                results.Enqueue(new ChunkBuildResult { Key = job.Key, Mask = job.Mask, Ticket = job });
+                results.Enqueue(new ChunkBuildResult
+                {
+                    Key = job.Key,
+                    Mask = job.Mask,
+                    Ticket = job,
+                    Buffers = MeshBuffers.Rent(), // empty — air or solid chunk
+                });
                 ReleaseSet(set);
                 return;
             }
@@ -283,20 +402,52 @@ namespace reromanlee.Transvoxel.Gpu
                 return;
             }
 
+            // Copy the soup out (the native readback memory dies with this callback), free
+            // the GPU buffers immediately, and weld into an indexed mesh off the main thread.
             int floatCount = triangleCount * TriangleFloatStride;
             NativeArray<float> data = request.GetData<float>();
-            float[] managed = ArrayPool<float>.Shared.Rent(floatCount);
-            NativeArray<float>.Copy(data, 0, managed, 0, floatCount);
-
-            results.Enqueue(new ChunkBuildResult
-            {
-                Key = job.Key,
-                Mask = job.Mask,
-                Ticket = job,
-                RawVertices = managed,
-                RawVertexCount = triangleCount * 3,
-            });
+            float[] soup = ArrayPool<float>.Shared.Rent(floatCount);
+            NativeArray<float>.Copy(data, 0, soup, 0, floatCount);
             ReleaseSet(set);
+
+            Task.Run(() =>
+            {
+                MeshBuffers buffers = null;
+                try
+                {
+                    if (job.Superseded)
+                        return;
+                    buffers = MeshBuffers.Rent();
+                    var welder = GpuMeshWelder.Rent();
+                    try
+                    {
+                        welder.Weld(soup, triangleCount, buffers);
+                    }
+                    finally
+                    {
+                        GpuMeshWelder.Return(welder);
+                    }
+                    results.Enqueue(new ChunkBuildResult
+                    {
+                        Key = job.Key,
+                        Mask = job.Mask,
+                        Ticket = job,
+                        Buffers = buffers,
+                    });
+                    buffers = null; // ownership transferred
+                }
+                catch (Exception exception)
+                {
+                    Debug.LogException(exception);
+                    if (buffers != null)
+                        MeshBuffers.Return(buffers);
+                    results.Enqueue(FailedResult(job));
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(soup);
+                }
+            });
         }
 
         static ChunkBuildResult FailedResult(ChunkBuildJob job) =>
@@ -314,24 +465,28 @@ namespace reromanlee.Transvoxel.Gpu
                 Volume = new ComputeBuffer(pointsPerAxis * pointsPerAxis * pointsPerAxis, sizeof(float)),
                 Triangles = new ComputeBuffer(triangleCapacity, TriangleByteStride, ComputeBufferType.Append),
                 TriangleCount = new ComputeBuffer(1, sizeof(int), ComputeBufferType.Raw),
-                EditCoords = new ComputeBuffer(1, 3 * sizeof(int)),
-                EditData = new ComputeBuffer(VoxelEditLayer.BrickVolume, sizeof(float)),
-                EditCapacity = 1,
+                Slots = new ComputeBuffer(64, sizeof(int)),
+                SlotCapacity = 64,
             };
             allSets.Add(set);
             return set;
         }
 
-        void EnsureEditCapacity(JobSet set, int bricks)
+        static void DestroySetBuffers(JobSet set)
         {
-            if (set.EditCapacity >= bricks)
+            set.Volume.Release();
+            set.Triangles.Release();
+            set.TriangleCount.Release();
+            set.Slots.Release();
+        }
+
+        void EnsureSlotCapacity(JobSet set, int slots)
+        {
+            if (set.SlotCapacity >= slots)
                 return;
-            int capacity = Mathf.NextPowerOfTwo(bricks);
-            set.EditCoords.Release();
-            set.EditData.Release();
-            set.EditCoords = new ComputeBuffer(capacity, 3 * sizeof(int));
-            set.EditData = new ComputeBuffer(capacity * VoxelEditLayer.BrickVolume, sizeof(float));
-            set.EditCapacity = capacity;
+            set.Slots.Release();
+            set.SlotCapacity = Mathf.NextPowerOfTwo(slots);
+            set.Slots = new ComputeBuffer(set.SlotCapacity, sizeof(int));
         }
 
         void ReleaseSet(JobSet set)
@@ -352,13 +507,7 @@ namespace reromanlee.Transvoxel.Gpu
             AsyncGPUReadback.WaitAllRequests();
 
             foreach (JobSet set in allSets)
-            {
-                set.Volume.Release();
-                set.Triangles.Release();
-                set.TriangleCount.Release();
-                set.EditCoords.Release();
-                set.EditData.Release();
-            }
+                DestroySetBuffers(set);
             allSets.Clear();
             setPool.Clear();
 
@@ -366,6 +515,8 @@ namespace reromanlee.Transvoxel.Gpu
             foreach (ComputeBuffer table in tableBuffers)
                 table.Release();
             tableBuffers.Clear();
+            editCoordsBuffer?.Release();
+            editDataBuffer?.Release();
 
             UnityEngine.Object.Destroy(shader);
         }

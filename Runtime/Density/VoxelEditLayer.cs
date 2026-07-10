@@ -85,6 +85,14 @@ namespace reromanlee.Transvoxel.Density
 
         public void Clear() => bricks = new Dictionary<Vector3Int, float[]>();
 
+        /// <summary>Collects every brick in the layer (initial upload of the GPU brick pool).</summary>
+        public void CollectAllBricks(List<(Vector3Int coord, float[] data)> results)
+        {
+            results.Clear();
+            foreach (var entry in bricks)
+                results.Add((entry.Key, entry.Value));
+        }
+
         /// <summary>
         /// Collects every brick that overlaps the given voxel region, for upload to the GPU
         /// density kernel. The returned arrays are the immutable copy-on-write snapshot

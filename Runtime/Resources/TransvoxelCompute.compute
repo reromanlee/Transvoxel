@@ -53,10 +53,14 @@ StructuredBuffer<int> _TransitionCellCounts;   // 56
 StructuredBuffer<int> _TransitionCellIndices;  // 56 * 36
 StructuredBuffer<int> _TransitionVertexData;   // 512 * 12
 
-// Player-edit overlay: 16^3 bricks, value < -0.5 marks "not edited" (NaN on the C# side).
-StructuredBuffer<int3> _EditBrickCoords;
-StructuredBuffer<float> _EditBrickData;        // 4096 floats per brick
-int _EditBrickCount;
+// Player-edit overlay. The bricks (16^3 voxels, value < -0.5 marks "not edited" — NaN on
+// the C# side) live in ONE resident pool that persists across dispatches; only changed
+// bricks are ever re-uploaded. Each chunk build just receives the pool slots that overlap
+// it, so heavy terraforming costs no per-chunk data transfer at all.
+StructuredBuffer<int3> _EditBrickCoords;       // pool: brick coordinate per slot
+StructuredBuffer<float> _EditBrickData;        // pool: 4096 floats per slot
+StructuredBuffer<int> _ChunkEditSlots;         // per job: pool slots this chunk can read
+int _EditSlotCount;
 
 // Chunk parameters (ints kept scalar: SetInts packs arrays to 16-byte slots).
 int _MinVoxelX, _MinVoxelY, _MinVoxelZ;
@@ -221,12 +225,13 @@ float ProceduralDensity(int3 voxel)
 float SampleDensity(int3 voxel)
 {
     int3 brickCoord = voxel >> 4;
-    for (int i = 0; i < _EditBrickCount; i++)
+    for (int i = 0; i < _EditSlotCount; i++)
     {
-        if (all(_EditBrickCoords[i] == brickCoord))
+        int slot = _ChunkEditSlots[i];
+        if (all(_EditBrickCoords[slot] == brickCoord))
         {
             int idx = (voxel.x & 15) | ((voxel.y & 15) << 4) | ((voxel.z & 15) << 8);
-            float edited = _EditBrickData[i * 4096 + idx];
+            float edited = _EditBrickData[slot * 4096 + idx];
             if (edited >= -0.5)
                 return edited;
             break; // brick exists but this voxel is untouched

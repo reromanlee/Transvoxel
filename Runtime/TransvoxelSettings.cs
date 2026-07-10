@@ -12,10 +12,19 @@ namespace reromanlee.Transvoxel
 
         /// <summary>
         /// Compute shaders: density (noise + player edits) and the whole Transvoxel
-        /// triangulation run on the GPU; the CPU only uploads finished meshes. Falls back
-        /// to <see cref="CpuThreads"/> when the platform lacks compute or async readback.
+        /// triangulation run on the GPU; light CPU worker tasks only weld the streamed-back
+        /// triangles into indexed meshes. Falls back to <see cref="CpuThreads"/> when the
+        /// platform lacks compute or async readback.
         /// </summary>
         GpuCompute = 1,
+
+        /// <summary>
+        /// Both at once: CPU meshing workers and the GPU pipeline pull chunks from the same
+        /// distance-prioritized queue, so whichever processor is free builds the next
+        /// nearest chunk — the highest build throughput. Falls back like
+        /// <see cref="GpuCompute"/>.
+        /// </summary>
+        Hybrid = 2,
     }
 
     /// <summary>
@@ -80,8 +89,10 @@ namespace reromanlee.Transvoxel
         [Header("Performance")]
         [Tooltip("Where chunks are sampled and meshed. CPU = worker threads (runs everywhere). " +
                  "GPU = compute shaders do the noise, the player-edit overlay and the whole " +
-                 "Transvoxel triangulation, leaving the CPU nearly idle; results stream back " +
-                 "asynchronously. Falls back to CPU if the platform lacks compute shaders.")]
+                 "Transvoxel triangulation; results stream back asynchronously and are welded " +
+                 "into compact indexed meshes on light worker tasks. Hybrid = both pull from " +
+                 "the same nearest-first queue for maximum build throughput. GPU/Hybrid fall " +
+                 "back to CPU if the platform lacks compute shaders.")]
         public MeshingBackend meshingBackend = MeshingBackend.CpuThreads;
 
         [Tooltip("Optional replacement for the built-in TransvoxelCompute shader " +

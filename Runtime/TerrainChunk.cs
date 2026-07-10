@@ -31,21 +31,6 @@ namespace reromanlee.Transvoxel
         static readonly int ColorId = Shader.PropertyToID("_Color");         // Built-in Standard
         static readonly int FadeId = Shader.PropertyToID("_TransvoxelFade"); // stipple fade-in
 
-        // GPU results arrive as one interleaved vertex stream (position, normal, uv — the
-        // exact struct the compute kernel appends) with implicit sequential indices.
-        static readonly VertexAttributeDescriptor[] RawVertexLayout =
-        {
-            new VertexAttributeDescriptor(VertexAttribute.Position, VertexAttributeFormat.Float32, 3),
-            new VertexAttributeDescriptor(VertexAttribute.Normal, VertexAttributeFormat.Float32, 3),
-            new VertexAttributeDescriptor(VertexAttribute.TexCoord0, VertexAttributeFormat.Float32, 2),
-        };
-        const int RawFloatsPerVertex = 8;
-
-        // Shared, lazily grown 0,1,2,... index arrays for the sequential (triangle soup)
-        // index buffers of GPU meshes. Main thread only.
-        static ushort[] sequentialIndices16;
-        static int[] sequentialIndices32;
-
         public NodeKey Key { get; private set; }
         public byte TransitionMask { get; set; }
         public int VertexCount { get; private set; }
@@ -71,7 +56,7 @@ namespace reromanlee.Transvoxel
 
         public TerrainChunk(NodeKey key, Transform parent, Material material, float voxelSize, int chunkCells)
         {
-            gameObject = new GameObject();
+            gameObject = new GameObject("Transvoxel Chunk");
             gameObject.transform.SetParent(parent, false);
             meshFilter = gameObject.AddComponent<MeshFilter>();
             meshRenderer = gameObject.AddComponent<MeshRenderer>();
@@ -86,12 +71,14 @@ namespace reromanlee.Transvoxel
             SpawnTime = Time.time;
             appliedFade = -1f;
             tintVisible = false;
-            propertyBlock.Clear();
+#if UNITY_EDITOR
+            // Handy in the hierarchy, but a per-activation string allocation in builds.
             gameObject.name = $"Chunk {key}";
+#endif
             var min = key.MinVoxel(chunkCells);
             gameObject.transform.localPosition = new Vector3(min.x, min.y, min.z) * voxelSize;
             meshRenderer.sharedMaterial = material;
-            meshRenderer.SetPropertyBlock(propertyBlock);
+            PushPropertyBlock();
             gameObject.SetActive(true);
         }
 
@@ -131,47 +118,6 @@ namespace reromanlee.Transvoxel
             SetLodTintVisible(colorizeLod);
         }
 
-        /// <summary>
-        /// Uploads a GPU build result: an interleaved position/normal/uv vertex stream with
-        /// implicit sequential indices, copied straight into the mesh's vertex buffer via the
-        /// advanced Mesh API — no per-vertex managed work at all. Bounds are the chunk's box
-        /// (known analytically), so nothing needs recalculating.
-        /// </summary>
-        public void ApplyRaw(float[] interleavedVertices, int vertexCount, bool colorizeLod, Bounds localBounds)
-        {
-            EnsureMesh();
-            mesh.Clear();
-            VertexCount = vertexCount;
-            if (vertexCount > 0)
-            {
-                const MeshUpdateFlags Fast = MeshUpdateFlags.DontRecalculateBounds
-                                             | MeshUpdateFlags.DontValidateIndices
-                                             | MeshUpdateFlags.DontNotifyMeshUsers;
-                mesh.SetVertexBufferParams(vertexCount, RawVertexLayout);
-                mesh.SetVertexBufferData(interleavedVertices, 0, 0, vertexCount * RawFloatsPerVertex, 0, Fast);
-
-                if (vertexCount > ushort.MaxValue)
-                {
-                    EnsureSequential32(vertexCount);
-                    mesh.SetIndexBufferParams(vertexCount, IndexFormat.UInt32);
-                    mesh.SetIndexBufferData(sequentialIndices32, 0, 0, vertexCount, Fast);
-                }
-                else
-                {
-                    EnsureSequential16(vertexCount);
-                    mesh.SetIndexBufferParams(vertexCount, IndexFormat.UInt16);
-                    mesh.SetIndexBufferData(sequentialIndices16, 0, 0, vertexCount, Fast);
-                }
-
-                mesh.subMeshCount = 1;
-                mesh.SetSubMesh(0, new SubMeshDescriptor(0, vertexCount), Fast);
-                mesh.bounds = localBounds;
-            }
-
-            meshRenderer.enabled = vertexCount > 0;
-            SetLodTintVisible(colorizeLod);
-        }
-
         void EnsureMesh()
         {
             if (mesh != null)
@@ -179,24 +125,6 @@ namespace reromanlee.Transvoxel
             mesh = new Mesh { name = "Transvoxel Chunk" };
             mesh.MarkDynamic();
             meshFilter.sharedMesh = mesh;
-        }
-
-        static void EnsureSequential16(int count)
-        {
-            if (sequentialIndices16 != null && sequentialIndices16.Length >= count)
-                return;
-            int size = Mathf.NextPowerOfTwo(count);
-            sequentialIndices16 = new ushort[size];
-            for (int i = 0; i < size; i++) sequentialIndices16[i] = (ushort)i;
-        }
-
-        static void EnsureSequential32(int count)
-        {
-            if (sequentialIndices32 != null && sequentialIndices32.Length >= count)
-                return;
-            int size = Mathf.NextPowerOfTwo(count);
-            sequentialIndices32 = new int[size];
-            for (int i = 0; i < size; i++) sequentialIndices32[i] = i;
         }
 
         /// <summary>Attaches the physics shape once its bake (done off-thread) has finished.</summary>
@@ -214,7 +142,7 @@ namespace reromanlee.Transvoxel
         public void SetLodTintVisible(bool visible)
         {
             tintVisible = visible;
-            RebuildPropertyBlock();
+            PushPropertyBlock();
         }
 
         /// <summary>
@@ -228,12 +156,25 @@ namespace reromanlee.Transvoxel
             if (fade == appliedFade)
                 return;
             appliedFade = fade;
-            propertyBlock.SetFloat(FadeId, fade);
-            meshRenderer.SetPropertyBlock(propertyBlock);
+            PushPropertyBlock();
         }
 
-        void RebuildPropertyBlock()
+        /// <summary>
+        /// A renderer with a MaterialPropertyBlock is excluded from the SRP Batcher, so the
+        /// block only exists while it says something: mid-fade or LOD-tinted. The moment a
+        /// chunk is fully faded in and untinted the block is removed and the chunk batches
+        /// with every other steady chunk — at thousands of live chunks this is a large
+        /// render-thread saving.
+        /// </summary>
+        void PushPropertyBlock()
         {
+            bool identity = !tintVisible && (appliedFade < 0f || appliedFade >= 1f);
+            if (identity)
+            {
+                meshRenderer.SetPropertyBlock(null);
+                return;
+            }
+
             propertyBlock.Clear();
             if (appliedFade >= 0f)
                 propertyBlock.SetFloat(FadeId, appliedFade);

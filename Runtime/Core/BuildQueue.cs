@@ -7,11 +7,10 @@ using UnityEngine;
 namespace reromanlee.Transvoxel
 {
     /// <summary>
-    /// One finished chunk build, produced by a CPU worker or a GPU readback and consumed on
-    /// the main thread. Exactly one payload is set: <see cref="Buffers"/> (CPU meshing),
-    /// <see cref="RawVertices"/> (GPU triangle soup: interleaved position/normal/uv floats,
-    /// rented from <see cref="System.Buffers.ArrayPool{T}"/>), or neither with
-    /// <see cref="Failed"/> raised so the scheduler can retry.
+    /// One finished chunk build, produced by a CPU worker or a GPU readback (welded into
+    /// indexed buffers on a worker task) and consumed on the main thread. Either
+    /// <see cref="Buffers"/> is set, or <see cref="Failed"/> is raised so the scheduler
+    /// retries.
     /// </summary>
     public struct ChunkBuildResult
     {
@@ -19,8 +18,6 @@ namespace reromanlee.Transvoxel
         public byte Mask;
         public ChunkBuildJob Ticket;
         public MeshBuffers Buffers;
-        public float[] RawVertices;
-        public int RawVertexCount;
         public bool Failed;
 
         /// <summary>
@@ -29,7 +26,7 @@ namespace reromanlee.Transvoxel
         /// </summary>
         public float FirstDeferredTime;
 
-        public bool IsEmpty => Buffers != null ? Buffers.IsEmpty : RawVertexCount == 0;
+        public bool IsEmpty => Buffers == null || Buffers.IsEmpty;
 
         /// <summary>Returns pooled payloads. Call exactly once when the result is dropped or applied.</summary>
         public void ReleasePayload()
@@ -38,11 +35,6 @@ namespace reromanlee.Transvoxel
             {
                 MeshBuffers.Return(Buffers);
                 Buffers = null;
-            }
-            if (RawVertices != null)
-            {
-                System.Buffers.ArrayPool<float>.Shared.Return(RawVertices);
-                RawVertices = null;
             }
         }
     }

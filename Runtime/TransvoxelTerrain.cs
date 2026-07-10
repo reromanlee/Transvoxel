@@ -217,10 +217,10 @@ namespace reromanlee.Transvoxel
 
             pipelineGeneration++;
             ActiveBackend = ResolveBackend(out ComputeShader gpuShader);
-            if (ActiveBackend == MeshingBackend.GpuCompute)
+            if (ActiveBackend != MeshingBackend.CpuThreads)
                 gpuBuilder = new GpuChunkBuilder(gpuShader, settings, Layers.Edits);
-            else
-                StartCpuWorkers();
+            if (ActiveBackend != MeshingBackend.GpuCompute)
+                StartCpuWorkers(); // CpuThreads and Hybrid: CPU workers pull the same queue
 
             needsSelect = true;
         }
@@ -228,18 +228,18 @@ namespace reromanlee.Transvoxel
         MeshingBackend ResolveBackend(out ComputeShader gpuShader)
         {
             gpuShader = null;
-            if (settings.meshingBackend != MeshingBackend.GpuCompute)
+            if (settings.meshingBackend == MeshingBackend.CpuThreads)
                 return MeshingBackend.CpuThreads;
 
             if (!SystemInfo.supportsComputeShaders || !SystemInfo.supportsAsyncGPUReadback)
             {
-                Debug.LogWarning("[Transvoxel] GPU backend requested but the platform lacks compute " +
+                Debug.LogWarning("[Transvoxel] GPU meshing requested but the platform lacks compute " +
                                  "shaders or async GPU readback; using CPU threads.", this);
                 return MeshingBackend.CpuThreads;
             }
             if (DensityOverride != null)
             {
-                Debug.LogWarning("[Transvoxel] GPU backend cannot run a custom DensityOverride " +
+                Debug.LogWarning("[Transvoxel] GPU meshing cannot run a custom DensityOverride " +
                                  "(arbitrary C# density code); using CPU threads.", this);
                 return MeshingBackend.CpuThreads;
             }
@@ -253,7 +253,7 @@ namespace reromanlee.Transvoxel
                                  "using CPU threads.", this);
                 return MeshingBackend.CpuThreads;
             }
-            return MeshingBackend.GpuCompute;
+            return settings.meshingBackend;
         }
 
         void StartCpuWorkers()
@@ -739,11 +739,7 @@ namespace reromanlee.Transvoxel
 
             chunk.TransitionMask = result.Mask;
             bool empty = result.IsEmpty;
-            if (result.Buffers != null)
-                chunk.Apply(result.Buffers, settings.colorizeLods);
-            else
-                chunk.ApplyRaw(result.RawVertices, result.RawVertexCount, settings.colorizeLods,
-                    ChunkLocalBounds(result.Key));
+            chunk.Apply(result.Buffers, settings.colorizeLods);
             result.ReleasePayload();
 
             bool wantCollider = settings.colliderMaxLod >= 0
@@ -751,12 +747,6 @@ namespace reromanlee.Transvoxel
                                 && !empty;
             if (wantCollider)
                 StartColliderBake(chunk);
-        }
-
-        Bounds ChunkLocalBounds(NodeKey key)
-        {
-            float size = (settings.chunkCells << key.Lod) * settings.voxelSize;
-            return new Bounds(new Vector3(size, size, size) * 0.5f, new Vector3(size, size, size));
         }
 
         // ------------------------------------------------------------------ terraform groups
@@ -1052,6 +1042,7 @@ namespace reromanlee.Transvoxel
         public void InvalidateRegion(BoundsInt voxelBounds)
         {
             cache.RemoveOverlapping(voxelBounds, settings.chunkCells);
+            gpuBuilder?.NotifyEditsChanged(voxelBounds); // re-uploads only the touched bricks
 
             EditGroup group = null;
             int generation = 0;
