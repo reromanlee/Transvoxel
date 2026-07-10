@@ -76,6 +76,9 @@ Notable knobs (Concept.txt #4, #6):
 - **lodSplitFactor** — higher = more detail further away (more chunks).
 - **smoothShading** — smooth shared-vertex normals vs. flat low-poly triangles.
 - **colliderMaxLod** — which LODs get a `MeshCollider` (baked off the main thread).
+- **chunkFadeInSeconds / edgeFadeFraction** — stipple cross-fade (see *Dithered fading*
+  below): how long new chunks take to dither in, and the per-pixel dissolve band at the
+  draw-distance edge.
 - **meshApplyBudgetMs** — the main-thread time slice per frame for uploading finished
   meshes. Bursts of hundreds of chunks (teleport, high-speed flight) spread over frames
   instead of spiking one.
@@ -109,6 +112,51 @@ classic memory-for-parallelism trade. Positions are bit-identical across neighbo
 chunks, so the surface stays watertight. If the platform lacks compute shaders or async
 readback (or a custom `DensityOverride` is active — arbitrary C# can't run on the GPU),
 the terrain falls back to `CpuThreads` with a console warning.
+
+## Dithered fading (stipple cross-fade)
+
+Chunks never pop. Two fades combine into one screen-space Bayer-dither clip — the same
+technique as Unity LOD Group cross-fading:
+
+- **Fade-in** (`chunkFadeInSeconds`): a freshly built chunk dithers from invisible to solid.
+  Replaced chunks are retired only once their successors are *fully* faded in, so LOD swaps
+  read as a soft cross-fade, never a hole.
+- **Draw-distance dissolve** (`edgeFadeFraction`): terrain fades out toward `viewDistance`
+  **per pixel** (driven by shader globals, not per chunk), so even a kilometers-wide coarse
+  chunk dissolves smoothly like fog. Chunks leaving the view range are fully transparent
+  before they are actually removed; new frontier chunks are born inside the faded band and
+  brighten as you approach.
+
+Fading needs shader support. The bundled **`Transvoxel/Lit Dithered`** shader (URP and
+Built-in pipeline subshaders; the default runtime material uses it automatically outside
+HDRP) implements it. To make your **own** material fade, add this to its shader — or
+reproduce it with a Custom Function node in Shader Graph:
+
+```hlsl
+// Properties: _TransvoxelFade("Fade", Range(0,1)) = 1   (driven per chunk via MPB)
+float _TransvoxelFade;
+// Globals set by TransvoxelTerrain every frame:
+float4 _TransvoxelViewerPos;
+float  _TransvoxelViewDistance;
+float  _TransvoxelEdgeFadeBand;
+
+// In the fragment shader (positionCS = SV_POSITION, positionWS = world position):
+float fade = _TransvoxelFade;
+if (_TransvoxelEdgeFadeBand > 0)
+    fade = min(fade, saturate((_TransvoxelViewDistance
+                               - distance(positionWS, _TransvoxelViewerPos.xyz))
+                              / _TransvoxelEdgeFadeBand));
+if (fade < 1)
+{
+    const float dither[16] = { 0.5/16, 8.5/16, 2.5/16, 10.5/16, 12.5/16, 4.5/16, 14.5/16, 6.5/16,
+                               3.5/16, 11.5/16, 1.5/16, 9.5/16, 15.5/16, 7.5/16, 13.5/16, 5.5/16 };
+    uint2 p = uint2(positionCS.xy) & 3;
+    clip(fade - dither[p.y * 4 + p.x]);
+}
+```
+
+Shaders without these properties simply ignore the fade — everything still works, chunks
+just appear and disappear instantly.
 
 ## How the seamless LOD works (the interesting part)
 
