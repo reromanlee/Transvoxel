@@ -101,6 +101,12 @@ namespace reromanlee.Transvoxel
         readonly Dictionary<NodeKey, TerrainChunk> live = new Dictionary<NodeKey, TerrainChunk>();
         readonly Dictionary<NodeKey, ChunkBuildJob> pending = new Dictionary<NodeKey, ChunkBuildJob>();
         readonly Dictionary<NodeKey, byte> desired = new Dictionary<NodeKey, byte>();
+
+        // Every desired key plus all of its ancestors. Lets SubtreeReady answer "is anything
+        // wanted below this node?" with one lookup instead of recursing through 8^depth
+        // children — the difference between microseconds and multi-second freezes when a
+        // teleport obsoletes deep trees at high maxLodLevels.
+        readonly HashSet<NodeKey> desiredAncestors = new HashSet<NodeKey>();
         readonly HashSet<NodeKey> obsolete = new HashSet<NodeKey>();
         readonly Dictionary<NodeKey, float> obsoleteSince = new Dictionary<NodeKey, float>();
         readonly List<NodeKey> keyScratch = new List<NodeKey>();
@@ -376,6 +382,7 @@ namespace reromanlee.Transvoxel
                 DestroyChunkView(chunk);
             live.Clear();
             desired.Clear();
+            desiredAncestors.Clear();
             obsolete.Clear();
             obsoleteSince.Clear();
             pipelineGeneration++; // orphans any selection task still running
@@ -473,6 +480,14 @@ namespace reromanlee.Transvoxel
             desired.Clear();
             foreach (var command in selectionOutput)
                 desired[command.Key] = command.TransitionMask;
+
+            desiredAncestors.Clear();
+            foreach (var command in selectionOutput)
+            {
+                var walk = command.Key;
+                while (desiredAncestors.Add(walk) && walk.Lod < settings.maxLodLevels)
+                    walk = walk.Parent;
+            }
 
             // Schedule anything new or changed.
             foreach (var command in selectionOutput)
@@ -590,12 +605,31 @@ namespace reromanlee.Transvoxel
                 return;
             }
 
-            if (live.TryGetValue(result.Key, out var existing)
-                && bakingMeshIds.Contains(existing.MeshEntityId))
+            live.TryGetValue(result.Key, out var existing);
+
+            if (existing != null && bakingMeshIds.Contains(existing.MeshEntityId))
             {
                 // The physics bake still reads this mesh; try again next frame.
                 deferredApplies.Add(result);
                 return;
+            }
+
+            // A live chunk whose transition mask changed must not swap before the
+            // neighbours that caused the change are on screen, or the seam is open for
+            // however long the apply queue takes — very visible at distant LOD rings.
+            // Its current mesh still matches the old neighbourhood, so waiting is free;
+            // lodSwapLinger bounds the wait (0 disables the gate entirely).
+            if (existing != null && existing.TransitionMask != result.Mask
+                && !NeighboursReadyForMaskSwap(result.Key, result.Mask, existing.TransitionMask))
+            {
+                if (result.FirstDeferredTime == 0f)
+                    result.FirstDeferredTime = Time.time;
+                if (Time.time - result.FirstDeferredTime < settings.lodSwapLinger)
+                {
+                    deferredApplies.Add(result);
+                    return;
+                }
+                // Waited long enough — swap anyway rather than stall forever.
             }
 
             if (applyBudget <= 0 || applyStopwatch.ElapsedTicks >= budgetTicks)
@@ -606,6 +640,64 @@ namespace reromanlee.Transvoxel
 
             ApplyResultToScene(result);
             applyBudget--;
+        }
+
+        /// <summary>
+        /// True when every neighbour whose LOD change flipped one of this chunk's transition
+        /// mask bits is already live. A bit that turned on means finer chunks appeared across
+        /// that face (they must be on screen before we shift our boundary toward them); a bit
+        /// that turned off means the finer neighbours merged into a same-LOD chunk (it must
+        /// exist before we unshift). Gated chunks only ever wait on brand-new chunks, which
+        /// apply ungated — so chains cannot deadlock.
+        /// </summary>
+        bool NeighboursReadyForMaskSwap(NodeKey key, byte newMask, byte oldMask)
+        {
+            int changed = newMask ^ oldMask;
+            if (changed == 0)
+                return true;
+
+            for (int f = 0; f < 6; f++)
+            {
+                if ((changed & (1 << f)) == 0)
+                    continue;
+                var face = (CubeFace)f;
+                var neighbour = key.Neighbour(face);
+
+                if ((newMask & (1 << f)) != 0)
+                {
+                    // Gained transition cells: the finer chunks across the face (exactly one
+                    // level down, by the 2:1 balance) must be live.
+                    if (!FaceChildrenLive(neighbour, face))
+                        return false;
+                }
+                else if (desired.ContainsKey(neighbour) && !live.ContainsKey(neighbour))
+                {
+                    // Lost the transition: the same-LOD neighbour replacing the finer ones
+                    // is still building. (A now-coarser neighbour owns the seam itself and
+                    // is gated on us instead.)
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>Are the four children of <paramref name="neighbour"/> touching the shared face live (where desired)?</summary>
+        bool FaceChildrenLive(NodeKey neighbour, CubeFace face)
+        {
+            if (neighbour.Lod == 0)
+                return true;
+            int axis = face.Axis();
+            // Crossing our +axis face means the neighbour's children on its -axis side touch us.
+            int axisBit = face.IsPositive() ? 0 : 1;
+            for (int child = 0; child < 8; child++)
+            {
+                if (((child >> axis) & 1) != axisBit)
+                    continue;
+                var childKey = neighbour.Child(child);
+                if (desired.ContainsKey(childKey) && !live.ContainsKey(childKey))
+                    return false;
+            }
+            return true;
         }
 
         void ApplyResultToScene(ChunkBuildResult result)
@@ -778,12 +870,24 @@ namespace reromanlee.Transvoxel
             // pending — so a neighbour still rebuilding its transition mask can't briefly crack
             // the seam as the old geometry disappears. When the viewer keeps moving and builds
             // never fully drain, a per-chunk linger timeout releases it anyway (lodSwapLinger).
+            //
+            // Retirement is time-boxed: a teleport can obsolete thousands of chunks at once,
+            // and destroying (or even pooling) them all in one frame is a visible hitch.
+            // Leftovers keep their old geometry on screen and go next frame — harmless.
             bool settled = pending.Count == 0;
             float now = Time.time;
+            const int MaxRetirementsPerFrame = 256;
+            int retired = 0;
+            applyStopwatch.Restart();
+            long budgetTicks = (long)(settings.meshApplyBudgetMs
+                                      * (System.Diagnostics.Stopwatch.Frequency / 1000.0));
 
             keyScratch.Clear();
             foreach (var key in obsolete)
             {
+                if (retired >= MaxRetirementsPerFrame || applyStopwatch.ElapsedTicks >= budgetTicks)
+                    break;
+
                 if (desired.ContainsKey(key))
                 {
                     keyScratch.Add(key); // wanted again; no longer obsolete
@@ -802,6 +906,7 @@ namespace reromanlee.Transvoxel
                     DestroyChunkView(chunk);
                     live.Remove(key);
                     RemoveFromEditGroup(key);
+                    retired++;
                 }
                 keyScratch.Add(key);
             }
@@ -833,8 +938,10 @@ namespace reromanlee.Transvoxel
         {
             if (desired.ContainsKey(key))
                 return live.ContainsKey(key) && !pending.ContainsKey(key);
+            if (!desiredAncestors.Contains(key))
+                return true; // nothing wanted anywhere below — region is not rendered
             if (key.Lod == 0)
-                return true; // nothing wanted here
+                return true;
             for (int child = 0; child < 8; child++)
             {
                 if (!SubtreeReady(key.Child(child)))

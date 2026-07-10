@@ -23,6 +23,12 @@ namespace reromanlee.Transvoxel
         public int RawVertexCount;
         public bool Failed;
 
+        /// <summary>
+        /// Time the result was first deferred while waiting for the neighbours that changed
+        /// its transition mask to come on screen; 0 until then. Bounds the wait.
+        /// </summary>
+        public float FirstDeferredTime;
+
         public bool IsEmpty => Buffers != null ? Buffers.IsEmpty : RawVertexCount == 0;
 
         /// <summary>Returns pooled payloads. Call exactly once when the result is dropped or applied.</summary>
