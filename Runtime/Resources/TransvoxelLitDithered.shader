@@ -1,15 +1,25 @@
 // Lit terrain shader with screen-space stipple (Bayer dither) fading — the same visual
-// idea as Unity's LOD Group cross-fade. Two fade sources multiply into one clip test:
+// idea as Unity's LOD Group cross-fade.
 //
-//   * _TransvoxelFade (per chunk, via MaterialPropertyBlock): 0→1 ramp while a freshly
-//     built chunk dithers in.
-//   * The global viewer uniforms (_TransvoxelViewerPos / _TransvoxelViewDistance /
-//     _TransvoxelEdgeFadeBand, set by TransvoxelTerrain every frame): a per-PIXEL fade
-//     toward the draw-distance edge, so distant terrain dissolves smoothly like fog
-//     instead of popping — even when one far chunk spans kilometers.
+// The fade is driven ENTIRELY by mesh vertex data plus global uniforms — deliberately no
+// per-renderer state (MaterialPropertyBlocks) and no per-chunk material values, because
+// batched render paths (e.g. URP's GPU Resident Drawer) can bypass those. Mesh data and
+// globals reach every pixel on every path.
 //
-// Because the dither pattern is fixed in screen space, overlapping old/new chunks at the
-// same fade value cut identical pixels, so LOD swaps never open holes mid-fade.
+//   * UV2 per vertex = (fadeStartTime, ghostFlag), written once by TerrainChunk:
+//       ghostFlag 0 — the chunk dithers IN:  fade goes 0 -> 1 after fadeStartTime;
+//       ghostFlag 1 — a cross-fade GHOST dithering OUT: the shader keeps exactly the
+//                     pixels the successor (which started fading in at the same moment)
+//                     does not draw yet, so the pair always covers the surface with no
+//                     holes and no double-drawn pixels.
+//   * _TransvoxelTime / _TransvoxelFadeSeconds globals animate the fade — zero per-frame
+//     CPU work per chunk.
+//   * _TransvoxelViewerPos / _TransvoxelViewDistance / _TransvoxelEdgeFadeBand globals
+//     add a per-PIXEL dissolve toward the draw distance, so distant terrain fades like
+//     fog instead of popping — even when one far chunk spans kilometers.
+//
+// Meshes without UV2 read (0,0): with the default _TransvoxelFade of 1 and start time 0
+// they render solid, so the shader is safe on any mesh.
 //
 // SubShader 1 targets URP (skipped automatically when URP is absent), SubShader 2 is the
 // Built-in pipeline fallback. HDRP is not supported — keep the HDRP/Lit default there.
@@ -21,7 +31,7 @@ Shader "Transvoxel/Lit Dithered"
         _BaseColor("Color", Color) = (0.42, 0.55, 0.3, 1)
         _BaseMap("Albedo", 2D) = "white" {}
         _Smoothness("Smoothness", Range(0, 1)) = 0.1
-        _TransvoxelFade("Fade", Range(0, 1)) = 1
+        _TransvoxelFade("Fade (master)", Range(0, 1)) = 1
     }
 
     // ------------------------------------------------------------------ URP
@@ -43,13 +53,15 @@ Shader "Transvoxel/Lit Dithered"
         float4 _BaseMap_ST;
         half4 _BaseColor;
         half _Smoothness;
-        float _TransvoxelFade;
+        float _TransvoxelFade; // master multiplier; also marks the shader as fade-aware
         CBUFFER_END
 
-        // Globals driven by TransvoxelTerrain (band 0 = edge fade off).
+        // Globals driven by TransvoxelTerrain every frame.
+        float _TransvoxelTime;
+        float _TransvoxelFadeSeconds;   // 0 = fading disabled (everything solid)
         float4 _TransvoxelViewerPos;
         float _TransvoxelViewDistance;
-        float _TransvoxelEdgeFadeBand;
+        float _TransvoxelEdgeFadeBand;  // 0 = edge dissolve off
 
         // 4x4 Bayer matrix, thresholds centered so fade 1 keeps every pixel.
         static const float TransvoxelDither[16] =
@@ -60,15 +72,19 @@ Shader "Transvoxel/Lit Dithered"
             15.5 / 16.0,  7.5 / 16.0, 13.5 / 16.0,  5.5 / 16.0
         };
 
-        // _TransvoxelFade in [0,1] fades a chunk in: keep pixels with threshold <= fade.
-        // NEGATIVE fade marks a ghost — an old mesh cross-fading out while its successor
-        // (driven with the complementary value) fades in: the ghost keeps exactly the
-        // pixels the successor does not draw yet, so the pair always covers the surface
-        // with no holes and no double-drawn pixels. Both windows are additionally capped
-        // by the per-pixel draw-distance dissolve.
-        void TransvoxelDitherClip(float4 positionCS, float3 positionWS)
+        // Per-vertex fade from UV2 = (startTime, ghostFlag). Positive result = fading in,
+        // negative = ghost fading out with visibility -result (complementary clip below).
+        float TransvoxelVertexFade(float2 fadeData)
         {
-            float fade = _TransvoxelFade;
+            if (_TransvoxelFadeSeconds <= 0.0)
+                return 1.0;
+            float t = saturate((_TransvoxelTime - fadeData.x) / _TransvoxelFadeSeconds);
+            return fadeData.y > 0.5 ? -(1.0 - t) : t;
+        }
+
+        void TransvoxelDitherClip(float4 positionCS, float3 positionWS, float vertexFade)
+        {
+            float fade = vertexFade * _TransvoxelFade;
             float edge = 1.0;
             if (_TransvoxelEdgeFadeBand > 0.0)
             {
@@ -83,7 +99,8 @@ Shader "Transvoxel/Lit Dithered"
 
             if (fade < 0.0)
             {
-                // Ghost visibility g = -fade (1 -> 0): keep thresholds in [1 - g, edge].
+                // Ghost visibility g = -fade (1 -> 0): keep thresholds in [1 - g, edge] —
+                // exactly the pixels the successor's window [0, min(fade, edge)] omits.
                 clip(min(threshold - (1.0 + fade), edge - threshold));
                 return;
             }
@@ -110,6 +127,7 @@ Shader "Transvoxel/Lit Dithered"
                 float4 positionOS : POSITION;
                 float3 normalOS : NORMAL;
                 float2 uv : TEXCOORD0;
+                float2 fadeData : TEXCOORD1;
             };
 
             struct Varyings
@@ -119,6 +137,7 @@ Shader "Transvoxel/Lit Dithered"
                 float3 normalWS : TEXCOORD1;
                 float2 uv : TEXCOORD2;
                 half fogFactor : TEXCOORD3;
+                float fade : TEXCOORD4;
             };
 
             Varyings LitPassVertex(Attributes input)
@@ -131,12 +150,13 @@ Shader "Transvoxel/Lit Dithered"
                 output.normalWS = normal.normalWS;
                 output.uv = TRANSFORM_TEX(input.uv, _BaseMap);
                 output.fogFactor = ComputeFogFactor(position.positionCS.z);
+                output.fade = TransvoxelVertexFade(input.fadeData);
                 return output;
             }
 
             half4 LitPassFragment(Varyings input) : SV_Target
             {
-                TransvoxelDitherClip(input.positionCS, input.positionWS);
+                TransvoxelDitherClip(input.positionCS, input.positionWS, input.fade);
 
                 half3 albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv).rgb * _BaseColor.rgb;
                 float3 normalWS = normalize(input.normalWS);
@@ -174,12 +194,14 @@ Shader "Transvoxel/Lit Dithered"
             {
                 float4 positionOS : POSITION;
                 float3 normalOS : NORMAL;
+                float2 fadeData : TEXCOORD1;
             };
 
             struct Varyings
             {
                 float4 positionCS : SV_POSITION;
                 float3 positionWS : TEXCOORD0;
+                float fade : TEXCOORD1;
             };
 
             Varyings ShadowPassVertex(Attributes input)
@@ -195,12 +217,13 @@ Shader "Transvoxel/Lit Dithered"
 #endif
                 output.positionCS = positionCS;
                 output.positionWS = positionWS;
+                output.fade = TransvoxelVertexFade(input.fadeData);
                 return output;
             }
 
             half4 ShadowPassFragment(Varyings input) : SV_Target
             {
-                TransvoxelDitherClip(input.positionCS, input.positionWS);
+                TransvoxelDitherClip(input.positionCS, input.positionWS, input.fade);
                 return 0;
             }
             ENDHLSL
@@ -220,12 +243,14 @@ Shader "Transvoxel/Lit Dithered"
             struct Attributes
             {
                 float4 positionOS : POSITION;
+                float2 fadeData : TEXCOORD1;
             };
 
             struct Varyings
             {
                 float4 positionCS : SV_POSITION;
                 float3 positionWS : TEXCOORD0;
+                float fade : TEXCOORD1;
             };
 
             Varyings DepthOnlyVertex(Attributes input)
@@ -233,12 +258,13 @@ Shader "Transvoxel/Lit Dithered"
                 Varyings output;
                 output.positionWS = TransformObjectToWorld(input.positionOS.xyz);
                 output.positionCS = TransformWorldToHClip(output.positionWS);
+                output.fade = TransvoxelVertexFade(input.fadeData);
                 return output;
             }
 
             half4 DepthOnlyFragment(Varyings input) : SV_Target
             {
-                TransvoxelDitherClip(input.positionCS, input.positionWS);
+                TransvoxelDitherClip(input.positionCS, input.positionWS, input.fade);
                 return 0;
             }
             ENDHLSL
@@ -254,7 +280,7 @@ Shader "Transvoxel/Lit Dithered"
         CGPROGRAM
         // addshadow regenerates the shadow pass from surf, so the dither clip also
         // dissolves the chunk's shadow while it fades.
-        #pragma surface surf Standard fullforwardshadows addshadow
+        #pragma surface surf Standard fullforwardshadows addshadow vertex:vert
         #pragma target 3.5
 
         sampler2D _BaseMap;
@@ -262,6 +288,8 @@ Shader "Transvoxel/Lit Dithered"
         half _Smoothness;
         float _TransvoxelFade;
 
+        float _TransvoxelTime;
+        float _TransvoxelFadeSeconds;
         float4 _TransvoxelViewerPos;
         float _TransvoxelViewDistance;
         float _TransvoxelEdgeFadeBand;
@@ -279,13 +307,26 @@ Shader "Transvoxel/Lit Dithered"
             float2 uv_BaseMap;
             float4 screenPos;
             float3 worldPos;
+            float tvFade;
         };
+
+        void vert(inout appdata_full v, out Input o)
+        {
+            UNITY_INITIALIZE_OUTPUT(Input, o);
+            float fade = 1.0;
+            if (_TransvoxelFadeSeconds > 0.0)
+            {
+                float t = saturate((_TransvoxelTime - v.texcoord1.x) / _TransvoxelFadeSeconds);
+                fade = v.texcoord1.y > 0.5 ? -(1.0 - t) : t;
+            }
+            o.tvFade = fade;
+        }
 
         void surf(Input IN, inout SurfaceOutputStandard o)
         {
             // Same clip rules as the URP subshader: positive fade dithers in, negative fade
             // is a ghost keeping the complementary pixel set, both capped by the edge dissolve.
-            float fade = _TransvoxelFade;
+            float fade = IN.tvFade * _TransvoxelFade;
             float edge = 1.0;
             if (_TransvoxelEdgeFadeBand > 0.0)
             {

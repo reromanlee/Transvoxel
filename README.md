@@ -146,17 +146,27 @@ HDRP) implements it. To make your **own** material fade, add this to its shader 
 reproduce it with a Custom Function node in Shader Graph:
 
 ```hlsl
-// Properties: _TransvoxelFade("Fade", Range(0,1)) = 1   (driven per chunk via shared
-// per-level materials; NEGATIVE values mark a cross-fade ghost keeping the
-// complementary pixel set)
+// Properties: _TransvoxelFade("Fade (master)", Range(0,1)) = 1
+// (declaring this property is what marks a shader as fade-aware)
 float _TransvoxelFade;
 // Globals set by TransvoxelTerrain every frame:
+float  _TransvoxelTime;
+float  _TransvoxelFadeSeconds;
 float4 _TransvoxelViewerPos;
 float  _TransvoxelViewDistance;
 float  _TransvoxelEdgeFadeBand;
 
-// In the fragment shader (positionCS = SV_POSITION, positionWS = world position):
-float fade = _TransvoxelFade;
+// VERTEX stage — the terrain bakes (fadeStartTime, ghostFlag) into UV2 (TEXCOORD1).
+// Pass the result to the fragment stage as a varying:
+float TransvoxelVertexFade(float2 fadeData)
+{
+    if (_TransvoxelFadeSeconds <= 0) return 1;
+    float t = saturate((_TransvoxelTime - fadeData.x) / _TransvoxelFadeSeconds);
+    return fadeData.y > 0.5 ? -(1 - t) : t; // negative = cross-fade ghost
+}
+
+// FRAGMENT stage (positionCS = SV_POSITION, positionWS = world position):
+float fade = vertexFade * _TransvoxelFade;
 float edge = 1.0;
 if (_TransvoxelEdgeFadeBand > 0)
     edge = saturate((_TransvoxelViewDistance
@@ -221,10 +231,11 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
   brushing never flashes a one-frame hole along a chunk border.
 - **Bounded retirement.** Obsolete chunks are destroyed under a per-frame cap, so even a
   far teleport (thousands of chunks replaced at once) never spends a whole frame cleaning up.
-- **SRP-Batcher friendly.** Fades are delivered as a small set of shared per-level
-  materials (not MaterialPropertyBlocks, which some Unity 6 render paths such as URP's
-  GPU Resident Drawer ignore per renderer), so steady chunks batch normally and fading
-  chunks batch with each other. Only the debug LOD tint uses a property block.
+- **Batching-proof fades.** Fade parameters are baked into each mesh (a UV2 channel of
+  start time + ghost flag) and animated by the shader from global time — no per-renderer
+  state, no MaterialPropertyBlocks, no per-chunk materials. This survives every render
+  path (SRP Batcher, URP GPU Resident Drawer, Built-in) and costs zero per-frame CPU.
+  Only the debug LOD tint uses a property block.
 - Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
 ## Tests
