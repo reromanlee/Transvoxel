@@ -31,7 +31,10 @@ Shader "Transvoxel/Lit Dithered"
         _BaseColor("Color", Color) = (0.42, 0.55, 0.3, 1)
         _BaseMap("Albedo", 2D) = "white" {}
         _Smoothness("Smoothness", Range(0, 1)) = 0.1
-        _TransvoxelFade("Fade (master)", Range(0, 1)) = 1
+        // Marker only: TransvoxelTerrain detects fade-aware materials via HasProperty.
+        // The master fade itself (_TransvoxelFade) is a GLOBAL uniform — deliberately not
+        // a serialized property, so the SRP Batcher can never lock it to a material value.
+        [HideInInspector] _TransvoxelFadeAware("Fade Aware", Float) = 1
     }
 
     // ------------------------------------------------------------------ URP
@@ -53,15 +56,17 @@ Shader "Transvoxel/Lit Dithered"
         float4 _BaseMap_ST;
         half4 _BaseColor;
         half _Smoothness;
-        float _TransvoxelFade; // master multiplier; also marks the shader as fade-aware
         CBUFFER_END
 
-        // Globals driven by TransvoxelTerrain every frame (edge dissolve only — the time
-        // fade deliberately uses Unity's built-in _Time so no custom uniform can be baked
-        // or skipped by exotic render paths).
+        // Globals driven by TransvoxelTerrain every frame. All fade inputs live in global
+        // scope (never in UnityPerMaterial): the SRP Batcher sources per-material cbuffer
+        // values from the material and ignores Shader.SetGlobalFloat for them, so a fade
+        // value trapped there would be locked at the inspector value for batched draws.
+        // The per-chunk time fade additionally uses only Unity's built-in _Time.
         float4 _TransvoxelViewerPos;
         float _TransvoxelViewDistance;
         float _TransvoxelEdgeFadeBand;  // 0 = edge dissolve off
+        float _TransvoxelFade;          // master fade, set globally (1 = normal)
 
         // 4x4 Bayer matrix, thresholds centered so fade 1 keeps every pixel.
         static const float TransvoxelDither[16] =
@@ -290,11 +295,12 @@ Shader "Transvoxel/Lit Dithered"
         sampler2D _BaseMap;
         fixed4 _BaseColor;
         half _Smoothness;
-        float _TransvoxelFade;
 
+        // Globals (see the URP subshader note: fade inputs are never material properties).
         float4 _TransvoxelViewerPos;
         float _TransvoxelViewDistance;
         float _TransvoxelEdgeFadeBand;
+        float _TransvoxelFade; // master fade, set globally (1 = normal)
 
         static const float TransvoxelDither[16] =
         {

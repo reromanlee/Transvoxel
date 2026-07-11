@@ -156,6 +156,7 @@ namespace reromanlee.Transvoxel
         static readonly int ViewDistanceId = Shader.PropertyToID("_TransvoxelViewDistance");
         static readonly int EdgeFadeBandId = Shader.PropertyToID("_TransvoxelEdgeFadeBand");
         static readonly int FadePropertyId = Shader.PropertyToID("_TransvoxelFade");
+        static readonly int FadeAwareMarkerId = Shader.PropertyToID("_TransvoxelFadeAware");
 
         // Whether the terrain material's shader declares _TransvoxelFade. Without shader
         // support a cross-fade ghost would just sit fully opaque on top of the new mesh for
@@ -239,7 +240,11 @@ namespace reromanlee.Transvoxel
             // Fading is implemented in the shader; a material without _TransvoxelFade can't
             // show it, so disable the whole fade/ghost machinery instead of producing
             // opaque ghosts and invisible delays.
-            fadeAwareMaterial = runtimeMaterial.HasProperty(FadePropertyId);
+            // The marker property tags this package's shader; _TransvoxelFade covers custom
+            // shaders that followed the older README snippet (a material property there
+            // still detects, even though our own shader now keeps the fade global-only).
+            fadeAwareMaterial = runtimeMaterial.HasProperty(FadeAwareMarkerId)
+                                || runtimeMaterial.HasProperty(FadePropertyId);
             effectiveFadeSeconds = fadeAwareMaterial ? settings.chunkFadeInSeconds : 0f;
             if (!fadeAwareMaterial && (settings.chunkFadeInSeconds > 0f || settings.edgeFadeFraction > 0f))
                 Debug.LogWarning("[Transvoxel] Chunk fading is enabled in the settings, but the " +
@@ -514,8 +519,11 @@ namespace reromanlee.Transvoxel
         /// </summary>
         void UpdateChunkFades()
         {
-            // The time fade lives entirely in each mesh's UV2 + the shader (via _Time);
-            // only the edge dissolve needs globals.
+            // The time fade lives entirely in each mesh's UV2 + the shader (via _Time).
+            // The master fade is a GLOBAL uniform (globals default to 0 — without this the
+            // terrain would be invisible); it is deliberately not a material property so
+            // the SRP Batcher can never lock it to an inspector value.
+            Shader.SetGlobalFloat(FadePropertyId, 1f);
             float band = fadeAwareMaterial ? settings.edgeFadeFraction * settings.viewDistance : 0f;
             Shader.SetGlobalFloat(EdgeFadeBandId, band);
             if (band > 0f)

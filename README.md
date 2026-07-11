@@ -146,13 +146,17 @@ HDRP) implements it. To make your **own** material fade, add this to its shader 
 reproduce it with a Custom Function node in Shader Graph:
 
 ```hlsl
-// Properties: _TransvoxelFade("Fade (master)", Range(0,1)) = 1
-// (declaring this property is what marks a shader as fade-aware)
-float _TransvoxelFade;
-// Globals set by TransvoxelTerrain every frame (edge dissolve only):
-float4 _TransvoxelViewerPos;
+// Properties: [HideInInspector] _TransvoxelFadeAware("Fade Aware", Float) = 1
+// (a marker only — declaring it is what tags the shader as fade-aware)
+//
+// IMPORTANT: every fade uniform below must live in GLOBAL scope — never inside the
+// UnityPerMaterial cbuffer and never as a serialized property. The SRP Batcher sources
+// per-material cbuffer values from the material and ignores Shader.SetGlobalFloat for
+// them, which would lock the fade at the inspector value for batched draws.
+float4 _TransvoxelViewerPos;   // set by TransvoxelTerrain every frame
 float  _TransvoxelViewDistance;
 float  _TransvoxelEdgeFadeBand;
+float  _TransvoxelFade;        // global master fade (terrain sets 1 every frame)
 
 // VERTEX stage — the terrain bakes (fadeStartTime, ±fadeDuration) into UV2 (TEXCOORD1);
 // the sign marks a cross-fade ghost, 0 = solid. Time base is Unity's built-in _Time.y.
