@@ -84,7 +84,7 @@ namespace reromanlee.Transvoxel
                  "draw-distance edge — per pixel, so even huge far chunks dissolve smoothly " +
                  "like fog instead of popping. 0 disables edge fading. Needs a fade-aware " +
                  "shader (see above).")]
-        [Range(0f, 0.5f)] public float edgeFadeFraction = 0.1f;
+        [Range(0f, 1.0f)] public float edgeFadeFraction = 0.1f;
 
         [Header("Landscape (density layer B)")]
         public NoiseSettings noise = new NoiseSettings();
