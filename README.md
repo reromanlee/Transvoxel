@@ -123,12 +123,17 @@ console warning.
 
 ## Dithered fading (stipple cross-fade)
 
-Chunks never pop. Two fades combine into one screen-space Bayer-dither clip — the same
-technique as Unity LOD Group cross-fading:
+Nothing about the landscape ever pops. Every visual change runs through one screen-space
+Bayer-dither clip — the same technique as Unity LOD Group cross-fading:
 
 - **Fade-in** (`chunkFadeInSeconds`): a freshly built chunk dithers from invisible to solid.
-  Replaced chunks are retired only once their successors are *fully* faded in, so LOD swaps
-  read as a soft cross-fade, never a hole.
+- **Fade-out**: a retired chunk (LOD swap, moved out of range) dithers away over the same
+  duration — and only after its replacements are *fully* faded in underneath.
+- **Mesh-swap cross-fade**: when a live chunk re-meshes (terraforming, a transition-mask
+  change as LOD rings shift), its old surface moves onto a short-lived *ghost* that dithers
+  out with the **complementary** stipple pattern while the new mesh dithers in — at every
+  moment each screen pixel is drawn by exactly one of the two, so the swap is seamless:
+  no holes, no double-brightness. Rapid re-edits keep at most one ghost per chunk.
 - **Draw-distance dissolve** (`edgeFadeFraction`): terrain fades out toward `viewDistance`
   **per pixel** (driven by shader globals, not per chunk), so even a kilometers-wide coarse
   chunk dissolves smoothly like fog. Chunks leaving the view range are fully transparent
@@ -141,7 +146,8 @@ HDRP) implements it. To make your **own** material fade, add this to its shader 
 reproduce it with a Custom Function node in Shader Graph:
 
 ```hlsl
-// Properties: _TransvoxelFade("Fade", Range(0,1)) = 1   (driven per chunk via MPB)
+// Properties: _TransvoxelFade("Fade", Range(0,1)) = 1   (driven per chunk via MPB;
+// NEGATIVE values mark a cross-fade ghost keeping the complementary pixel set)
 float _TransvoxelFade;
 // Globals set by TransvoxelTerrain every frame:
 float4 _TransvoxelViewerPos;
@@ -150,16 +156,21 @@ float  _TransvoxelEdgeFadeBand;
 
 // In the fragment shader (positionCS = SV_POSITION, positionWS = world position):
 float fade = _TransvoxelFade;
+float edge = 1.0;
 if (_TransvoxelEdgeFadeBand > 0)
-    fade = min(fade, saturate((_TransvoxelViewDistance
-                               - distance(positionWS, _TransvoxelViewerPos.xyz))
-                              / _TransvoxelEdgeFadeBand));
-if (fade < 1)
+    edge = saturate((_TransvoxelViewDistance
+                     - distance(positionWS, _TransvoxelViewerPos.xyz))
+                    / _TransvoxelEdgeFadeBand);
+if (fade < 1 || edge < 1)
 {
     const float dither[16] = { 0.5/16, 8.5/16, 2.5/16, 10.5/16, 12.5/16, 4.5/16, 14.5/16, 6.5/16,
                                3.5/16, 11.5/16, 1.5/16, 9.5/16, 15.5/16, 7.5/16, 13.5/16, 5.5/16 };
     uint2 p = uint2(positionCS.xy) & 3;
-    clip(fade - dither[p.y * 4 + p.x]);
+    float threshold = dither[p.y * 4 + p.x];
+    if (fade < 0) // ghost: draw exactly what the successor doesn't draw yet
+        clip(min(threshold - (1 + fade), edge - threshold));
+    else
+        clip(min(fade, edge) - threshold);
 }
 ```
 
