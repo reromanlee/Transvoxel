@@ -153,6 +153,14 @@ namespace reromanlee.Transvoxel
         static readonly int ViewerPosId = Shader.PropertyToID("_TransvoxelViewerPos");
         static readonly int ViewDistanceId = Shader.PropertyToID("_TransvoxelViewDistance");
         static readonly int EdgeFadeBandId = Shader.PropertyToID("_TransvoxelEdgeFadeBand");
+        static readonly int FadePropertyId = Shader.PropertyToID("_TransvoxelFade");
+
+        // Whether the terrain material's shader declares _TransvoxelFade. Without shader
+        // support a cross-fade ghost would just sit fully opaque on top of the new mesh for
+        // the whole duration and then pop — worse than no fade — so every fade feature is
+        // gated on this. effectiveFadeSeconds is chunkFadeInSeconds or 0 accordingly.
+        bool fadeAwareMaterial;
+        float effectiveFadeSeconds;
 
         int statsCountdown;
 
@@ -225,6 +233,18 @@ namespace reromanlee.Transvoxel
             runtimeMaterial = settings.material != null
                 ? settings.material
                 : generatedMaterial ??= CreateDefaultMaterial();
+
+            // Fading is implemented in the shader; a material without _TransvoxelFade can't
+            // show it, so disable the whole fade/ghost machinery instead of producing
+            // opaque ghosts and invisible delays.
+            fadeAwareMaterial = runtimeMaterial.HasProperty(FadePropertyId);
+            effectiveFadeSeconds = fadeAwareMaterial ? settings.chunkFadeInSeconds : 0f;
+            if (!fadeAwareMaterial && (settings.chunkFadeInSeconds > 0f || settings.edgeFadeFraction > 0f))
+                Debug.LogWarning("[Transvoxel] Chunk fading is enabled in the settings, but the " +
+                                 $"terrain material's shader ('{runtimeMaterial.shader.name}') has no " +
+                                 "_TransvoxelFade support — fading and cross-fades are disabled. Switch " +
+                                 "the material to 'Transvoxel/Lit Dithered' or add the fade snippet from " +
+                                 "the README to your shader.", this);
 
             pipelineGeneration++;
             ActiveBackend = ResolveBackend(out ComputeShader gpuShader);
@@ -461,7 +481,8 @@ namespace reromanlee.Transvoxel
         /// </summary>
         void UpdateChunkFades()
         {
-            float band = settings.edgeFadeFraction * settings.viewDistance;
+            // Edge dissolve needs the same shader support as the per-chunk fades.
+            float band = fadeAwareMaterial ? settings.edgeFadeFraction * settings.viewDistance : 0f;
             Shader.SetGlobalFloat(EdgeFadeBandId, band);
             if (band > 0f)
             {
@@ -469,7 +490,7 @@ namespace reromanlee.Transvoxel
                 Shader.SetGlobalFloat(ViewDistanceId, settings.viewDistance);
             }
 
-            float duration = settings.chunkFadeInSeconds;
+            float duration = effectiveFadeSeconds;
             float now = Time.time;
             foreach (var chunk in live.Values)
                 chunk.SetFadeIn(duration <= 0f ? 1f : Mathf.Clamp01((now - chunk.SpawnTime) / duration));
@@ -486,7 +507,7 @@ namespace reromanlee.Transvoxel
         /// </summary>
         void AddDyingChunk(TerrainChunk view)
         {
-            if (settings.chunkFadeInSeconds <= 0f)
+            if (effectiveFadeSeconds <= 0f)
             {
                 DestroyChunkView(view);
                 return;
@@ -798,7 +819,7 @@ namespace reromanlee.Transvoxel
                 chunk = RentChunkView(result.Key);
                 live.Add(result.Key, chunk);
             }
-            else if (settings.chunkFadeInSeconds > 0f)
+            else if (effectiveFadeSeconds > 0f)
             {
                 // Cross-fade the mesh swap (terraform, transition-mask change): the old
                 // surface moves onto a ghost view that dithers out with the complementary

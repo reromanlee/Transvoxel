@@ -174,8 +174,10 @@ if (fade < 1 || edge < 1)
 }
 ```
 
-Shaders without these properties simply ignore the fade — everything still works, chunks
-just appear and disappear instantly.
+The terrain checks at startup whether its material declares `_TransvoxelFade`. If it does
+not, all fading (including cross-fade ghosts and the edge dissolve) is cleanly disabled —
+chunks switch instantly, with a console warning telling you how to enable it. So a custom
+material without the snippet keeps working; it just cannot fade.
 
 ## How the seamless LOD works (the interesting part)
 
