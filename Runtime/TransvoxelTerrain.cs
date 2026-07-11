@@ -149,13 +149,12 @@ namespace reromanlee.Transvoxel
         readonly HashSet<EntityId> bakingMeshIds = new HashSet<EntityId>();
         readonly Dictionary<EntityId, Mesh> parkedMeshes = new Dictionary<EntityId, Mesh>();
 
-        // Stipple-fade globals for fade-aware shaders (see TransvoxelLitDithered.shader).
-        // The per-chunk fade itself is baked into each mesh's UV2; these globals animate it.
+        // Stipple-fade globals for fade-aware shaders (see TransvoxelLitDithered.shader) —
+        // edge dissolve only. The per-chunk time fade is baked into each mesh's UV2 and
+        // animated by the shader from Unity's built-in _Time.
         static readonly int ViewerPosId = Shader.PropertyToID("_TransvoxelViewerPos");
         static readonly int ViewDistanceId = Shader.PropertyToID("_TransvoxelViewDistance");
         static readonly int EdgeFadeBandId = Shader.PropertyToID("_TransvoxelEdgeFadeBand");
-        static readonly int TimeId = Shader.PropertyToID("_TransvoxelTime");
-        static readonly int FadeSecondsId = Shader.PropertyToID("_TransvoxelFadeSeconds");
         static readonly int FadePropertyId = Shader.PropertyToID("_TransvoxelFade");
 
         // Whether the terrain material's shader declares _TransvoxelFade. Without shader
@@ -248,6 +247,7 @@ namespace reromanlee.Transvoxel
                                  "_TransvoxelFade support — fading and cross-fades are disabled. Switch " +
                                  "the material to 'Transvoxel/Lit Dithered' or add the fade snippet from " +
                                  "the README to your shader.", this);
+            WarnIfGpuResidentDrawerActive();
 
             pipelineGeneration++;
             ActiveBackend = ResolveBackend(out ComputeShader gpuShader);
@@ -257,6 +257,36 @@ namespace reromanlee.Transvoxel
                 StartCpuWorkers(); // CpuThreads and Hybrid: CPU workers pull the same queue
 
             needsSelect = true;
+        }
+
+        /// <summary>
+        /// URP's GPU Resident Drawer draws "stable" renderers through a batched path that
+        /// can bypass renderer and material state for shaders without DOTS-instancing
+        /// support (this package's dithered shader included) — chunks then render with
+        /// baked defaults: no fades, sometimes not even globals. Detect it via reflection
+        /// (this package has no URP assembly reference) and tell the user, once.
+        /// </summary>
+        static bool warnedAboutResidentDrawer;
+
+        void WarnIfGpuResidentDrawerActive()
+        {
+            if (warnedAboutResidentDrawer || !fadeAwareMaterial)
+                return;
+            var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+            if (pipeline == null)
+                return;
+            var property = pipeline.GetType().GetProperty("gpuResidentDrawerMode");
+            if (property == null)
+                return;
+            object mode = property.GetValue(pipeline);
+            if (mode == null || mode.ToString() == "Disabled")
+                return;
+            warnedAboutResidentDrawer = true;
+            Debug.LogWarning("[Transvoxel] The render pipeline asset has 'GPU Resident Drawer' set to " +
+                             $"'{mode}'. That path can render terrain chunks with baked shader state, " +
+                             "breaking the stipple fades (chunks pop or stay solid). If fades don't " +
+                             "animate, set GPU Resident Drawer to 'Disabled' on the URP asset " +
+                             "(Rendering section).", this);
         }
 
         MeshingBackend ResolveBackend(out ComputeShader gpuShader)
@@ -484,12 +514,8 @@ namespace reromanlee.Transvoxel
         /// </summary>
         void UpdateChunkFades()
         {
-            // The fade itself lives in each mesh's UV2 and is animated by the shader from
-            // these globals — nothing per-chunk to update per frame.
-            Shader.SetGlobalFloat(TimeId, Time.time);
-            Shader.SetGlobalFloat(FadeSecondsId, effectiveFadeSeconds);
-
-            // Edge dissolve needs the same shader support as the per-chunk fades.
+            // The time fade lives entirely in each mesh's UV2 + the shader (via _Time);
+            // only the edge dissolve needs globals.
             float band = fadeAwareMaterial ? settings.edgeFadeFraction * settings.viewDistance : 0f;
             Shader.SetGlobalFloat(EdgeFadeBandId, band);
             if (band > 0f)
@@ -529,7 +555,7 @@ namespace reromanlee.Transvoxel
                 DestroyChunkView(previous.View);
                 dying.Remove(previous);
             }
-            view.MakeGhost(Time.time);
+            view.MakeGhost(effectiveFadeSeconds);
             var entry = new DyingChunk { View = view, StartTime = Time.time };
             dying.Add(entry);
             dyingByKey[view.Key] = entry;
@@ -849,7 +875,7 @@ namespace reromanlee.Transvoxel
 
             chunk.TransitionMask = result.Mask;
             bool empty = result.IsEmpty;
-            chunk.Apply(result.Buffers, settings.colorizeLods, effectiveFadeSeconds > 0f);
+            chunk.Apply(result.Buffers, settings.colorizeLods, effectiveFadeSeconds);
             result.ReleasePayload();
 
             bool wantCollider = settings.colliderMaxLod >= 0

@@ -149,20 +149,20 @@ reproduce it with a Custom Function node in Shader Graph:
 // Properties: _TransvoxelFade("Fade (master)", Range(0,1)) = 1
 // (declaring this property is what marks a shader as fade-aware)
 float _TransvoxelFade;
-// Globals set by TransvoxelTerrain every frame:
-float  _TransvoxelTime;
-float  _TransvoxelFadeSeconds;
+// Globals set by TransvoxelTerrain every frame (edge dissolve only):
 float4 _TransvoxelViewerPos;
 float  _TransvoxelViewDistance;
 float  _TransvoxelEdgeFadeBand;
 
-// VERTEX stage — the terrain bakes (fadeStartTime, ghostFlag) into UV2 (TEXCOORD1).
+// VERTEX stage — the terrain bakes (fadeStartTime, ±fadeDuration) into UV2 (TEXCOORD1);
+// the sign marks a cross-fade ghost, 0 = solid. Time base is Unity's built-in _Time.y.
 // Pass the result to the fragment stage as a varying:
 float TransvoxelVertexFade(float2 fadeData)
 {
-    if (_TransvoxelFadeSeconds <= 0) return 1;
-    float t = saturate((_TransvoxelTime - fadeData.x) / _TransvoxelFadeSeconds);
-    return fadeData.y > 0.5 ? -(1 - t) : t; // negative = cross-fade ghost
+    float duration = abs(fadeData.y);
+    if (duration <= 0) return 1;
+    float t = saturate((_Time.y - fadeData.x) / duration);
+    return fadeData.y < 0 ? -(1 - t) : t; // negative = cross-fade ghost
 }
 
 // FRAGMENT stage (positionCS = SV_POSITION, positionWS = world position):

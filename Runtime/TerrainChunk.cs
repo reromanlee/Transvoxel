@@ -32,10 +32,12 @@ namespace reromanlee.Transvoxel
         static readonly int ColorId = Shader.PropertyToID("_Color");         // Built-in Standard
 
         // Fade parameters ride in the mesh itself as a UV2 channel of (fadeStartTime,
-        // ghostFlag): renderer state (MaterialPropertyBlocks) and per-chunk material values
-        // are bypassed by some render paths (e.g. URP's GPU Resident Drawer), but vertex
-        // data reaches the shader on every path. The shader animates the fade from the
-        // _TransvoxelTime global, so nothing per-chunk is touched per frame.
+        // signedFadeDuration): renderer state (MaterialPropertyBlocks) and per-chunk
+        // material values are bypassed by some render paths (e.g. URP's GPU Resident
+        // Drawer), but vertex data reaches the shader on every path. The shader animates
+        // the fade from Unity's built-in _Time — no custom uniform in the time path at
+        // all — so nothing per-chunk is touched per frame. The duration's sign marks a
+        // cross-fade ghost; zero (or a missing channel) renders solid.
         static readonly List<Vector2> FadeDataScratch = new List<Vector2>(8192); // main thread only
 
         public NodeKey Key { get; private set; }
@@ -99,7 +101,7 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>Uploads freshly built buffers into this chunk's mesh (main thread only).</summary>
-        public void Apply(MeshBuffers buffers, bool colorizeLod, bool writeFadeData)
+        public void Apply(MeshBuffers buffers, bool colorizeLod, float fadeSeconds)
         {
             EnsureMesh();
             mesh.Clear();
@@ -112,8 +114,8 @@ namespace reromanlee.Transvoxel
                 mesh.SetVertices(buffers.Vertices);
                 mesh.SetNormals(buffers.Normals);
                 mesh.SetUVs(0, buffers.Uvs);
-                if (writeFadeData)
-                    WriteFadeData(SpawnTime, ghost: false);
+                if (fadeSeconds > 0f)
+                    WriteFadeData(fadeSeconds);
                 mesh.SetTriangles(buffers.Indices, 0, calculateBounds: true);
             }
 
@@ -122,20 +124,21 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>
-        /// Marks this view's mesh as a cross-fade ghost: from <paramref name="deathTime"/>
-        /// on, the shader draws exactly the pixels the successor doesn't draw yet, shrinking
-        /// to nothing over the fade duration. Do not call while the mesh is being baked.
+        /// Marks this view's mesh as a cross-fade ghost: from now on, the shader draws
+        /// exactly the pixels the successor doesn't draw yet, shrinking to nothing over the
+        /// fade duration. Do not call while the mesh is being baked.
         /// </summary>
-        public void MakeGhost(float deathTime)
+        public void MakeGhost(float fadeSeconds)
         {
             if (mesh == null || mesh.vertexCount == 0)
                 return;
-            WriteFadeData(deathTime, ghost: true);
+            WriteFadeData(-fadeSeconds);
         }
 
-        void WriteFadeData(float startTime, bool ghost)
+        void WriteFadeData(float signedDuration)
         {
-            var value = new Vector2(startTime, ghost ? 1f : 0f);
+            // The shader compares against Unity's built-in _Time.y = time since level load.
+            var value = new Vector2(Time.timeSinceLevelLoad, signedDuration);
             int count = mesh.vertexCount;
             FadeDataScratch.Clear();
             for (int i = 0; i < count; i++)

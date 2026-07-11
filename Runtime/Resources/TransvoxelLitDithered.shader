@@ -56,9 +56,9 @@ Shader "Transvoxel/Lit Dithered"
         float _TransvoxelFade; // master multiplier; also marks the shader as fade-aware
         CBUFFER_END
 
-        // Globals driven by TransvoxelTerrain every frame.
-        float _TransvoxelTime;
-        float _TransvoxelFadeSeconds;   // 0 = fading disabled (everything solid)
+        // Globals driven by TransvoxelTerrain every frame (edge dissolve only — the time
+        // fade deliberately uses Unity's built-in _Time so no custom uniform can be baked
+        // or skipped by exotic render paths).
         float4 _TransvoxelViewerPos;
         float _TransvoxelViewDistance;
         float _TransvoxelEdgeFadeBand;  // 0 = edge dissolve off
@@ -72,14 +72,18 @@ Shader "Transvoxel/Lit Dithered"
             15.5 / 16.0,  7.5 / 16.0, 13.5 / 16.0,  5.5 / 16.0
         };
 
-        // Per-vertex fade from UV2 = (startTime, ghostFlag). Positive result = fading in,
+        // Per-vertex fade from UV2 = (startTime, signedDuration): duration's sign marks a
+        // ghost, its magnitude is the fade length in seconds, 0 = solid (meshes without
+        // UV2 read zero). Time base: Unity's built-in _Time.y (time since level load) —
+        // the C# side writes start times on the same clock. Positive result = fading in,
         // negative = ghost fading out with visibility -result (complementary clip below).
         float TransvoxelVertexFade(float2 fadeData)
         {
-            if (_TransvoxelFadeSeconds <= 0.0)
+            float duration = abs(fadeData.y);
+            if (duration <= 0.0)
                 return 1.0;
-            float t = saturate((_TransvoxelTime - fadeData.x) / _TransvoxelFadeSeconds);
-            return fadeData.y > 0.5 ? -(1.0 - t) : t;
+            float t = saturate((_Time.y - fadeData.x) / duration);
+            return fadeData.y < 0.0 ? -(1.0 - t) : t;
         }
 
         void TransvoxelDitherClip(float4 positionCS, float3 positionWS, float vertexFade)
@@ -288,8 +292,6 @@ Shader "Transvoxel/Lit Dithered"
         half _Smoothness;
         float _TransvoxelFade;
 
-        float _TransvoxelTime;
-        float _TransvoxelFadeSeconds;
         float4 _TransvoxelViewerPos;
         float _TransvoxelViewDistance;
         float _TransvoxelEdgeFadeBand;
@@ -314,10 +316,11 @@ Shader "Transvoxel/Lit Dithered"
         {
             UNITY_INITIALIZE_OUTPUT(Input, o);
             float fade = 1.0;
-            if (_TransvoxelFadeSeconds > 0.0)
+            float duration = abs(v.texcoord1.y);
+            if (duration > 0.0)
             {
-                float t = saturate((_TransvoxelTime - v.texcoord1.x) / _TransvoxelFadeSeconds);
-                fade = v.texcoord1.y > 0.5 ? -(1.0 - t) : t;
+                float t = saturate((_Time.y - v.texcoord1.x) / duration);
+                fade = v.texcoord1.y < 0.0 ? -(1.0 - t) : t;
             }
             o.tvFade = fade;
         }
