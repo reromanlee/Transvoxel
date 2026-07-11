@@ -157,6 +157,19 @@ namespace reromanlee.Transvoxel
         static readonly int EdgeFadeBandId = Shader.PropertyToID("_TransvoxelEdgeFadeBand");
         static readonly int FadePropertyId = Shader.PropertyToID("_TransvoxelFade");
         static readonly int FadeAwareMarkerId = Shader.PropertyToID("_TransvoxelFadeAware");
+        static readonly int EdgeFadeCurveId = Shader.PropertyToID("_TransvoxelEdgeFadeCurve");
+
+        // The edgeFadeCurve is baked into a small LUT texture (curve.Evaluate can't run per
+        // pixel) and pushed as a global so it reaches every render path, like the other fade
+        // inputs. Rebaked on pipeline (re)build and on a fade-only settings edit.
+        const int EdgeFadeLutSize = 256;
+        Texture2D edgeFadeLut;
+        readonly float[] edgeFadeLutScratch = new float[EdgeFadeLutSize];
+
+        // Signature of the settings that require a full geometry rebuild. A settings edit that
+        // leaves it unchanged (only edgeFadeFraction / edgeFadeCurve moved) refreshes the fade
+        // LUT in place instead of tearing down every chunk — so the curve can be tuned live.
+        string appliedStructuralKey;
 
         // Whether the terrain material's shader declares _TransvoxelFade. Without shader
         // support a cross-fade ghost would just sit fully opaque on top of the new mesh for
@@ -181,6 +194,11 @@ namespace reromanlee.Transvoxel
             ClearScene();
             while (chunkViewPool.Count > 0)
                 chunkViewPool.Pop().Destroy();
+            if (edgeFadeLut != null)
+            {
+                Destroy(edgeFadeLut);
+                edgeFadeLut = null;
+            }
         }
 
         // Editing the settings asset (even during Play) fires TransvoxelSettings.Changed.
@@ -261,6 +279,8 @@ namespace reromanlee.Transvoxel
             if (ActiveBackend != MeshingBackend.GpuCompute)
                 StartCpuWorkers(); // CpuThreads and Hybrid: CPU workers pull the same queue
 
+            BakeEdgeFadeCurve();
+            appliedStructuralKey = ComputeStructuralKey();
             needsSelect = true;
         }
 
@@ -499,7 +519,13 @@ namespace reromanlee.Transvoxel
             if (settingsDirty)
             {
                 settingsDirty = false;
-                ApplySettings();
+                // A fade-only edit (edge fade fraction/curve) leaves the structural key intact:
+                // just rebake the LUT and let UpdateChunkFades push the band, keeping every live
+                // chunk on screen so the curve can be tuned without a full rebuild + re-fade.
+                if (appliedStructuralKey != null && ComputeStructuralKey() == appliedStructuralKey)
+                    BakeEdgeFadeCurve();
+                else
+                    ApplySettings();
             }
 
             DrainBakedColliders();
@@ -533,6 +559,60 @@ namespace reromanlee.Transvoxel
             }
 
             UpdateDyingChunks(Time.time, Mathf.Max(effectiveFadeSeconds, 1e-3f));
+        }
+
+        /// <summary>
+        /// Bakes <see cref="TransvoxelSettings.edgeFadeCurve"/> into a 1D LUT texture and
+        /// publishes it as the <c>_TransvoxelEdgeFadeCurve</c> global. The shader samples it by
+        /// the raw edge fade (0 at the draw distance, 1 at the viewer) to reshape the dither
+        /// opacity per pixel. An empty curve falls back to the identity ramp (a no-op remap).
+        /// </summary>
+        void BakeEdgeFadeCurve()
+        {
+            if (edgeFadeLut == null)
+            {
+                edgeFadeLut = new Texture2D(EdgeFadeLutSize, 1, TextureFormat.RFloat, false, true)
+                {
+                    name = "Transvoxel Edge Fade Curve LUT",
+                    wrapMode = TextureWrapMode.Clamp,
+                    filterMode = FilterMode.Bilinear,
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+            }
+
+            AnimationCurve curve = settings.edgeFadeCurve;
+            bool usable = curve != null && curve.length > 0;
+            for (int i = 0; i < EdgeFadeLutSize; i++)
+            {
+                float x = i / (float)(EdgeFadeLutSize - 1);
+                edgeFadeLutScratch[i] = usable ? Mathf.Clamp01(curve.Evaluate(x)) : x;
+            }
+            edgeFadeLut.SetPixelData(edgeFadeLutScratch, 0);
+            edgeFadeLut.Apply(updateMipmaps: false, makeNoLongerReadable: false);
+            Shader.SetGlobalTexture(EdgeFadeCurveId, edgeFadeLut);
+        }
+
+        /// <summary>
+        /// A fingerprint of every setting that requires rebuilding the octree/density/meshing
+        /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/> and
+        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> are deliberately excluded — they only
+        /// feed shader globals and the fade LUT, so editing them refreshes those in place
+        /// instead of tearing down the whole scene. Keep this in sync when adding settings that
+        /// affect geometry.
+        /// </summary>
+        string ComputeStructuralKey()
+        {
+            return string.Join("|",
+                settings.voxelSize, settings.chunkCells, settings.maxLodLevels, settings.viewDistance,
+                settings.lodSplitFactor, settings.isoLevel, settings.smoothShading,
+                settings.material != null ? settings.material.GetEntityId().ToString() : "0", settings.uvScale,
+                settings.colorizeLods, settings.chunkFadeInSeconds,
+                JsonUtility.ToJson(settings.noise),
+                (int)settings.meshingBackend,
+                settings.gpuComputeOverride != null ? settings.gpuComputeOverride.GetEntityId().ToString() : "0",
+                settings.gpuJobsInFlight, settings.meshApplyBudgetMs, settings.meshApplyBudgetPerFrame,
+                settings.maxConcurrentBuilds, settings.colliderMaxLod, settings.viewerMoveThreshold,
+                settings.lodSwapLinger, settings.densityCacheChunks);
         }
 
         // ------------------------------------------------------------------ cross-fade ghosts

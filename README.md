@@ -138,7 +138,11 @@ Bayer-dither clip — the same technique as Unity LOD Group cross-fading:
   **per pixel** (driven by shader globals, not per chunk), so even a kilometers-wide coarse
   chunk dissolves smoothly like fog. Chunks leaving the view range are fully transparent
   before they are actually removed; new frontier chunks are born inside the faded band and
-  brighten as you approach.
+  brighten as you approach. **`edgeFadeCurve`** reshapes that falloff: the terrain bakes the
+  curve into a small LUT (`_TransvoxelEdgeFadeCurve`) and the shader remaps the dither
+  opacity through it per pixel — X = raw fade (0 at the draw distance, 1 at the viewer),
+  Y = kept opacity. Lift the middle/left to keep near and mid LODs solid (less grain) while
+  the far edge still dissolves. The default straight line is the plain linear ramp.
 
 Fading needs shader support. The bundled **`Transvoxel/Lit Dithered`** shader (URP and
 Built-in pipeline subshaders; the default runtime material uses it automatically outside
@@ -157,6 +161,8 @@ float4 _TransvoxelViewerPos;   // set by TransvoxelTerrain every frame
 float  _TransvoxelViewDistance;
 float  _TransvoxelEdgeFadeBand;
 float  _TransvoxelFade;        // global master fade (terrain sets 1 every frame)
+TEXTURE2D(_TransvoxelEdgeFadeCurve); // edgeFadeCurve LUT: raw edge fade -> kept opacity
+SAMPLER(sampler_TransvoxelEdgeFadeCurve); // (Built-in: sampler2D _TransvoxelEdgeFadeCurve;)
 
 // VERTEX stage — the terrain bakes (fadeStartTime, ±fadeDuration) into UV2 (TEXCOORD1);
 // the sign marks a cross-fade ghost, 0 = solid. Time base is Unity's built-in _Time.y.
@@ -173,9 +179,15 @@ float TransvoxelVertexFade(float2 fadeData)
 float fade = vertexFade * _TransvoxelFade;
 float edge = 1.0;
 if (_TransvoxelEdgeFadeBand > 0)
-    edge = saturate((_TransvoxelViewDistance
-                     - distance(positionWS, _TransvoxelViewerPos.xyz))
-                    / _TransvoxelEdgeFadeBand);
+{
+    float rawEdge = saturate((_TransvoxelViewDistance
+                              - distance(positionWS, _TransvoxelViewerPos.xyz))
+                             / _TransvoxelEdgeFadeBand);
+    // Reshape through the edgeFadeCurve LUT (Built-in: tex2D). A missing texture would
+    // read 0 — if you skip the curve, use `edge = rawEdge;` instead.
+    edge = SAMPLE_TEXTURE2D_LOD(_TransvoxelEdgeFadeCurve,
+                                sampler_TransvoxelEdgeFadeCurve, float2(rawEdge, 0.5), 0).r;
+}
 if (fade < 1 || edge < 1)
 {
     const float dither[16] = { 0.5/16, 8.5/16, 2.5/16, 10.5/16, 12.5/16, 4.5/16, 14.5/16, 6.5/16,

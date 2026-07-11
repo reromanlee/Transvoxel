@@ -86,6 +86,14 @@ namespace reromanlee.Transvoxel
                  "shader (see above).")]
         [Range(0f, 1.0f)] public float edgeFadeFraction = 0.1f;
 
+        [Tooltip("Shapes the edge dither across distance so it isn't uniformly grainy. " +
+                 "X = raw fade amount (0 at the draw-distance edge, 1 closest to the viewer); " +
+                 "Y = kept opacity (1 = solid, 0 = fully dithered away). The default straight " +
+                 "0→1 line is the plain linear ramp. Lift the middle/left to keep near and mid " +
+                 "LODs solid (less dotting) while the far edge still dissolves. Only active " +
+                 "when Edge Fade Fraction > 0; needs a fade-aware shader.")]
+        public AnimationCurve edgeFadeCurve = AnimationCurve.Linear(0f, 0f, 1f, 1f);
+
         [Header("Landscape (density layer B)")]
         public NoiseSettings noise = new NoiseSettings();
 

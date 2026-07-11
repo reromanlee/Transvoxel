@@ -68,6 +68,12 @@ Shader "Transvoxel/Lit Dithered"
         float _TransvoxelEdgeFadeBand;  // 0 = edge dissolve off
         float _TransvoxelFade;          // master fade, set globally (1 = normal)
 
+        // 256x1 LUT baked from the edgeFadeCurve: input = raw edge fade (0 at the draw
+        // distance, 1 at the viewer), output = kept opacity. Identity ramp by default, so a
+        // missing/unbound texture just needs the branch below skipped (band 0) to stay safe.
+        TEXTURE2D(_TransvoxelEdgeFadeCurve);
+        SAMPLER(sampler_TransvoxelEdgeFadeCurve);
+
         // 4x4 Bayer matrix, thresholds centered so fade 1 keeps every pixel.
         static const float TransvoxelDither[16] =
         {
@@ -98,7 +104,9 @@ Shader "Transvoxel/Lit Dithered"
             if (_TransvoxelEdgeFadeBand > 0.0)
             {
                 float viewerDistance = distance(positionWS, _TransvoxelViewerPos.xyz);
-                edge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
+                float rawEdge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
+                edge = SAMPLE_TEXTURE2D_LOD(_TransvoxelEdgeFadeCurve, sampler_TransvoxelEdgeFadeCurve,
+                                            float2(rawEdge, 0.5), 0).r;
             }
             if (fade >= 1.0 && edge >= 1.0)
                 return;
@@ -301,6 +309,7 @@ Shader "Transvoxel/Lit Dithered"
         float _TransvoxelViewDistance;
         float _TransvoxelEdgeFadeBand;
         float _TransvoxelFade; // master fade, set globally (1 = normal)
+        sampler2D _TransvoxelEdgeFadeCurve; // edgeFadeCurve LUT: raw edge fade -> kept opacity
 
         static const float TransvoxelDither[16] =
         {
@@ -340,7 +349,8 @@ Shader "Transvoxel/Lit Dithered"
             if (_TransvoxelEdgeFadeBand > 0.0)
             {
                 float viewerDistance = distance(IN.worldPos, _TransvoxelViewerPos.xyz);
-                edge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
+                float rawEdge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
+                edge = tex2D(_TransvoxelEdgeFadeCurve, float2(rawEdge, 0.5)).r;
             }
             if (fade < 1.0 || edge < 1.0)
             {
