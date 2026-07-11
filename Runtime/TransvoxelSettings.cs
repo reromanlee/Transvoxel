@@ -71,10 +71,13 @@ namespace reromanlee.Transvoxel
         [Tooltip("Tint chunks by LOD level to visualize the octree (debug).")]
         public bool colorizeLods;
 
-        [Tooltip("Seconds a freshly built chunk takes to dither in — a screen-space stipple " +
-                 "fade like Unity's LOD Group cross-fade. 0 = chunks appear instantly. Needs " +
-                 "a fade-aware shader: the built-in default material (Transvoxel/Lit Dithered) " +
-                 "supports it; see the README to add it to a custom shader.")]
+        [Tooltip("Duration of every stipple cross-fade, in seconds: new chunks dither in, " +
+                 "retired chunks (LOD swaps, out of range) dither out, and a re-meshed chunk " +
+                 "(terraform, LOD-ring shift) cross-fades against a ghost of its old surface " +
+                 "with complementary patterns — no visual change ever pops. 0 = everything " +
+                 "switches instantly. Needs a fade-aware shader: the built-in default " +
+                 "material (Transvoxel/Lit Dithered) supports it; see the README for custom " +
+                 "shaders.")]
         [Range(0f, 2f)] public float chunkFadeInSeconds = 0.4f;
 
         [Tooltip("Fraction of the view distance over which terrain dithers out toward the " +

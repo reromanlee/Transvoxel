@@ -397,6 +397,10 @@ namespace reromanlee.Transvoxel
             foreach (var chunk in live.Values)
                 DestroyChunkView(chunk);
             live.Clear();
+            foreach (var entry in dying)
+                DestroyChunkView(entry.View);
+            dying.Clear();
+            dyingByKey.Clear();
             desired.Clear();
             desiredAncestors.Clear();
             obsolete.Clear();
@@ -794,6 +798,26 @@ namespace reromanlee.Transvoxel
                 chunk = RentChunkView(result.Key);
                 live.Add(result.Key, chunk);
             }
+            else if (settings.chunkFadeInSeconds > 0f)
+            {
+                // Cross-fade the mesh swap (terraform, transition-mask change): the old
+                // surface moves onto a ghost view that dithers out with the complementary
+                // pattern while this chunk's new mesh dithers in — the pair always covers
+                // the surface, so the swap is seamless. The collider keeps the old shape
+                // until the new mesh's bake attaches.
+                if (chunk.VertexCount > 0)
+                {
+                    Mesh oldMesh = chunk.DetachMesh(keepColliderShape: true);
+                    if (oldMesh != null)
+                    {
+                        var ghost = RentChunkView(result.Key);
+                        ghost.AttachGhostMesh(oldMesh);
+                        ghost.SetLodTintVisible(settings.colorizeLods);
+                        AddDyingChunk(ghost);
+                    }
+                }
+                chunk.RestartFadeIn();
+            }
 
             chunk.TransitionMask = result.Mask;
             bool empty = result.IsEmpty;
@@ -978,7 +1002,9 @@ namespace reromanlee.Transvoxel
 
                 if (live.TryGetValue(key, out var chunk))
                 {
-                    DestroyChunkView(chunk);
+                    // Dither out instead of popping; replacements are already fully faded
+                    // in underneath (LiveAndFadedIn), so this reads as a cross-fade.
+                    AddDyingChunk(chunk);
                     live.Remove(key);
                     RemoveFromEditGroup(key);
                     retired++;
