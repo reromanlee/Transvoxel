@@ -123,17 +123,26 @@ console warning.
 
 ## Dithered fading (stipple cross-fade)
 
-Chunks never pop. Two fades combine into one screen-space Bayer-dither clip — the same
-technique as Unity LOD Group cross-fading:
+Nothing about the landscape ever pops. Every visual change runs through one screen-space
+Bayer-dither clip — the same technique as Unity LOD Group cross-fading:
 
 - **Fade-in** (`chunkFadeInSeconds`): a freshly built chunk dithers from invisible to solid.
-  Replaced chunks are retired only once their successors are *fully* faded in, so LOD swaps
-  read as a soft cross-fade, never a hole.
+- **Fade-out**: a retired chunk (LOD swap, moved out of range) dithers away over the same
+  duration — and only after its replacements are *fully* faded in underneath.
+- **Mesh-swap cross-fade**: when a live chunk re-meshes (terraforming, a transition-mask
+  change as LOD rings shift), its old surface moves onto a short-lived *ghost* that dithers
+  out with the **complementary** stipple pattern while the new mesh dithers in — at every
+  moment each screen pixel is drawn by exactly one of the two, so the swap is seamless:
+  no holes, no double-brightness. Rapid re-edits keep at most one ghost per chunk.
 - **Draw-distance dissolve** (`edgeFadeFraction`): terrain fades out toward `viewDistance`
   **per pixel** (driven by shader globals, not per chunk), so even a kilometers-wide coarse
   chunk dissolves smoothly like fog. Chunks leaving the view range are fully transparent
   before they are actually removed; new frontier chunks are born inside the faded band and
-  brighten as you approach.
+  brighten as you approach. **`edgeFadeCurve`** reshapes that falloff: the terrain bakes the
+  curve into a small LUT (`_TransvoxelEdgeFadeCurve`) and the shader remaps the dither
+  opacity through it per pixel — X = raw fade (0 at the draw distance, 1 at the viewer),
+  Y = kept opacity. Lift the middle/left to keep near and mid LODs solid (less grain) while
+  the far edge still dissolves. The default straight line is the plain linear ramp.
 
 Fading needs shader support. The bundled **`Transvoxel/Lit Dithered`** shader (URP and
 Built-in pipeline subshaders; the default runtime material uses it automatically outside
@@ -141,30 +150,61 @@ HDRP) implements it. To make your **own** material fade, add this to its shader 
 reproduce it with a Custom Function node in Shader Graph:
 
 ```hlsl
-// Properties: _TransvoxelFade("Fade", Range(0,1)) = 1   (driven per chunk via MPB)
-float _TransvoxelFade;
-// Globals set by TransvoxelTerrain every frame:
-float4 _TransvoxelViewerPos;
+// Properties: [HideInInspector] _TransvoxelFadeAware("Fade Aware", Float) = 1
+// (a marker only — declaring it is what tags the shader as fade-aware)
+//
+// IMPORTANT: every fade uniform below must live in GLOBAL scope — never inside the
+// UnityPerMaterial cbuffer and never as a serialized property. The SRP Batcher sources
+// per-material cbuffer values from the material and ignores Shader.SetGlobalFloat for
+// them, which would lock the fade at the inspector value for batched draws.
+float4 _TransvoxelViewerPos;   // set by TransvoxelTerrain every frame
 float  _TransvoxelViewDistance;
 float  _TransvoxelEdgeFadeBand;
+float  _TransvoxelFade;        // global master fade (terrain sets 1 every frame)
+TEXTURE2D(_TransvoxelEdgeFadeCurve); // edgeFadeCurve LUT: raw edge fade -> kept opacity
+SAMPLER(sampler_TransvoxelEdgeFadeCurve); // (Built-in: sampler2D _TransvoxelEdgeFadeCurve;)
 
-// In the fragment shader (positionCS = SV_POSITION, positionWS = world position):
-float fade = _TransvoxelFade;
+// VERTEX stage — the terrain bakes (fadeStartTime, ±fadeDuration) into UV2 (TEXCOORD1);
+// the sign marks a cross-fade ghost, 0 = solid. Time base is Unity's built-in _Time.y.
+// Pass the result to the fragment stage as a varying:
+float TransvoxelVertexFade(float2 fadeData)
+{
+    float duration = abs(fadeData.y);
+    if (duration <= 0) return 1;
+    float t = saturate((_Time.y - fadeData.x) / duration);
+    return fadeData.y < 0 ? -(1 - t) : t; // negative = cross-fade ghost
+}
+
+// FRAGMENT stage (positionCS = SV_POSITION, positionWS = world position):
+float fade = vertexFade * _TransvoxelFade;
+float edge = 1.0;
 if (_TransvoxelEdgeFadeBand > 0)
-    fade = min(fade, saturate((_TransvoxelViewDistance
-                               - distance(positionWS, _TransvoxelViewerPos.xyz))
-                              / _TransvoxelEdgeFadeBand));
-if (fade < 1)
+{
+    float rawEdge = saturate((_TransvoxelViewDistance
+                              - distance(positionWS, _TransvoxelViewerPos.xyz))
+                             / _TransvoxelEdgeFadeBand);
+    // Reshape through the edgeFadeCurve LUT (Built-in: tex2D). A missing texture would
+    // read 0 — if you skip the curve, use `edge = rawEdge;` instead.
+    edge = SAMPLE_TEXTURE2D_LOD(_TransvoxelEdgeFadeCurve,
+                                sampler_TransvoxelEdgeFadeCurve, float2(rawEdge, 0.5), 0).r;
+}
+if (fade < 1 || edge < 1)
 {
     const float dither[16] = { 0.5/16, 8.5/16, 2.5/16, 10.5/16, 12.5/16, 4.5/16, 14.5/16, 6.5/16,
                                3.5/16, 11.5/16, 1.5/16, 9.5/16, 15.5/16, 7.5/16, 13.5/16, 5.5/16 };
     uint2 p = uint2(positionCS.xy) & 3;
-    clip(fade - dither[p.y * 4 + p.x]);
+    float threshold = dither[p.y * 4 + p.x];
+    if (fade < 0) // ghost: draw exactly what the successor doesn't draw yet
+        clip(min(threshold - (1 + fade), edge - threshold));
+    else
+        clip(min(fade, edge) - threshold);
 }
 ```
 
-Shaders without these properties simply ignore the fade — everything still works, chunks
-just appear and disappear instantly.
+The terrain checks at startup whether its material declares `_TransvoxelFade`. If it does
+not, all fading (including cross-fade ghosts and the edge dissolve) is cleanly disabled —
+chunks switch instantly, with a console warning telling you how to enable it. So a custom
+material without the snippet keeps working; it just cannot fade.
 
 ## How the seamless LOD works (the interesting part)
 
@@ -207,9 +247,11 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
   brushing never flashes a one-frame hole along a chunk border.
 - **Bounded retirement.** Obsolete chunks are destroyed under a per-frame cap, so even a
   far teleport (thousands of chunks replaced at once) never spends a whole frame cleaning up.
-- **SRP-Batcher friendly.** A chunk carries a MaterialPropertyBlock only while it is
-  actively fading or LOD-tinted; steady chunks drop the block and batch normally — at
-  thousands of live chunks that is a large render-thread saving.
+- **Batching-proof fades.** Fade parameters are baked into each mesh (a UV2 channel of
+  start time + ghost flag) and animated by the shader from global time — no per-renderer
+  state, no MaterialPropertyBlocks, no per-chunk materials. This survives every render
+  path (SRP Batcher, URP GPU Resident Drawer, Built-in) and costs zero per-frame CPU.
+  Only the debug LOD tint uses a property block.
 - Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
 ## Tests

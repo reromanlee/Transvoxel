@@ -112,6 +112,17 @@ namespace reromanlee.Transvoxel
         readonly List<NodeKey> keyScratch = new List<NodeKey>();
         readonly Stack<TerrainChunk> chunkViewPool = new Stack<TerrainChunk>();
 
+        // Cross-fade ghosts: retired chunks and replaced meshes dither out here instead of
+        // popping. At most one ghost per chunk key, so rapid brushing can't stack them.
+        sealed class DyingChunk
+        {
+            public TerrainChunk View;
+            public float StartTime;
+        }
+
+        readonly List<DyingChunk> dying = new List<DyingChunk>();
+        readonly Dictionary<NodeKey, DyingChunk> dyingByKey = new Dictionary<NodeKey, DyingChunk>();
+
         ConcurrentQueue<ChunkBuildResult> completedBuilds = new ConcurrentQueue<ChunkBuildResult>();
         List<ChunkBuildResult> deferredApplies = new List<ChunkBuildResult>();
         readonly System.Diagnostics.Stopwatch applyStopwatch = new System.Diagnostics.Stopwatch();
@@ -138,10 +149,34 @@ namespace reromanlee.Transvoxel
         readonly HashSet<EntityId> bakingMeshIds = new HashSet<EntityId>();
         readonly Dictionary<EntityId, Mesh> parkedMeshes = new Dictionary<EntityId, Mesh>();
 
-        // Stipple-fade globals for fade-aware shaders (see TransvoxelLitDithered.shader).
+        // Stipple-fade globals for fade-aware shaders (see TransvoxelLitDithered.shader) —
+        // edge dissolve only. The per-chunk time fade is baked into each mesh's UV2 and
+        // animated by the shader from Unity's built-in _Time.
         static readonly int ViewerPosId = Shader.PropertyToID("_TransvoxelViewerPos");
         static readonly int ViewDistanceId = Shader.PropertyToID("_TransvoxelViewDistance");
         static readonly int EdgeFadeBandId = Shader.PropertyToID("_TransvoxelEdgeFadeBand");
+        static readonly int FadePropertyId = Shader.PropertyToID("_TransvoxelFade");
+        static readonly int FadeAwareMarkerId = Shader.PropertyToID("_TransvoxelFadeAware");
+        static readonly int EdgeFadeCurveId = Shader.PropertyToID("_TransvoxelEdgeFadeCurve");
+
+        // The edgeFadeCurve is baked into a small LUT texture (curve.Evaluate can't run per
+        // pixel) and pushed as a global so it reaches every render path, like the other fade
+        // inputs. Rebaked on pipeline (re)build and on a fade-only settings edit.
+        const int EdgeFadeLutSize = 256;
+        Texture2D edgeFadeLut;
+        readonly float[] edgeFadeLutScratch = new float[EdgeFadeLutSize];
+
+        // Signature of the settings that require a full geometry rebuild. A settings edit that
+        // leaves it unchanged (only edgeFadeFraction / edgeFadeCurve moved) refreshes the fade
+        // LUT in place instead of tearing down every chunk — so the curve can be tuned live.
+        string appliedStructuralKey;
+
+        // Whether the terrain material's shader declares _TransvoxelFade. Without shader
+        // support a cross-fade ghost would just sit fully opaque on top of the new mesh for
+        // the whole duration and then pop — worse than no fade — so every fade feature is
+        // gated on this. effectiveFadeSeconds is chunkFadeInSeconds or 0 accordingly.
+        bool fadeAwareMaterial;
+        float effectiveFadeSeconds;
 
         int statsCountdown;
 
@@ -159,6 +194,11 @@ namespace reromanlee.Transvoxel
             ClearScene();
             while (chunkViewPool.Count > 0)
                 chunkViewPool.Pop().Destroy();
+            if (edgeFadeLut != null)
+            {
+                Destroy(edgeFadeLut);
+                edgeFadeLut = null;
+            }
         }
 
         // Editing the settings asset (even during Play) fires TransvoxelSettings.Changed.
@@ -215,6 +255,23 @@ namespace reromanlee.Transvoxel
                 ? settings.material
                 : generatedMaterial ??= CreateDefaultMaterial();
 
+            // Fading is implemented in the shader; a material without _TransvoxelFade can't
+            // show it, so disable the whole fade/ghost machinery instead of producing
+            // opaque ghosts and invisible delays.
+            // The marker property tags this package's shader; _TransvoxelFade covers custom
+            // shaders that followed the older README snippet (a material property there
+            // still detects, even though our own shader now keeps the fade global-only).
+            fadeAwareMaterial = runtimeMaterial.HasProperty(FadeAwareMarkerId)
+                                || runtimeMaterial.HasProperty(FadePropertyId);
+            effectiveFadeSeconds = fadeAwareMaterial ? settings.chunkFadeInSeconds : 0f;
+            if (!fadeAwareMaterial && (settings.chunkFadeInSeconds > 0f || settings.edgeFadeFraction > 0f))
+                Debug.LogWarning("[Transvoxel] Chunk fading is enabled in the settings, but the " +
+                                 $"terrain material's shader ('{runtimeMaterial.shader.name}') has no " +
+                                 "_TransvoxelFade support — fading and cross-fades are disabled. Switch " +
+                                 "the material to 'Transvoxel/Lit Dithered' or add the fade snippet from " +
+                                 "the README to your shader.", this);
+            WarnIfGpuResidentDrawerActive();
+
             pipelineGeneration++;
             ActiveBackend = ResolveBackend(out ComputeShader gpuShader);
             if (ActiveBackend != MeshingBackend.CpuThreads)
@@ -222,7 +279,39 @@ namespace reromanlee.Transvoxel
             if (ActiveBackend != MeshingBackend.GpuCompute)
                 StartCpuWorkers(); // CpuThreads and Hybrid: CPU workers pull the same queue
 
+            BakeEdgeFadeCurve();
+            appliedStructuralKey = ComputeStructuralKey();
             needsSelect = true;
+        }
+
+        /// <summary>
+        /// URP's GPU Resident Drawer draws "stable" renderers through a batched path that
+        /// can bypass renderer and material state for shaders without DOTS-instancing
+        /// support (this package's dithered shader included) — chunks then render with
+        /// baked defaults: no fades, sometimes not even globals. Detect it via reflection
+        /// (this package has no URP assembly reference) and tell the user, once.
+        /// </summary>
+        static bool warnedAboutResidentDrawer;
+
+        void WarnIfGpuResidentDrawerActive()
+        {
+            if (warnedAboutResidentDrawer || !fadeAwareMaterial)
+                return;
+            var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+            if (pipeline == null)
+                return;
+            var property = pipeline.GetType().GetProperty("gpuResidentDrawerMode");
+            if (property == null)
+                return;
+            object mode = property.GetValue(pipeline);
+            if (mode == null || mode.ToString() == "Disabled")
+                return;
+            warnedAboutResidentDrawer = true;
+            Debug.LogWarning("[Transvoxel] The render pipeline asset has 'GPU Resident Drawer' set to " +
+                             $"'{mode}'. That path can render terrain chunks with baked shader state, " +
+                             "breaking the stipple fades (chunks pop or stay solid). If fades don't " +
+                             "animate, set GPU Resident Drawer to 'Disabled' on the URP asset " +
+                             "(Rendering section).", this);
         }
 
         MeshingBackend ResolveBackend(out ComputeShader gpuShader)
@@ -386,6 +475,10 @@ namespace reromanlee.Transvoxel
             foreach (var chunk in live.Values)
                 DestroyChunkView(chunk);
             live.Clear();
+            foreach (var entry in dying)
+                DestroyChunkView(entry.View);
+            dying.Clear();
+            dyingByKey.Clear();
             desired.Clear();
             desiredAncestors.Clear();
             obsolete.Clear();
@@ -426,7 +519,13 @@ namespace reromanlee.Transvoxel
             if (settingsDirty)
             {
                 settingsDirty = false;
-                ApplySettings();
+                // A fade-only edit (edge fade fraction/curve) leaves the structural key intact:
+                // just rebake the LUT and let UpdateChunkFades push the band, keeping every live
+                // chunk on screen so the curve can be tuned without a full rebuild + re-fade.
+                if (appliedStructuralKey != null && ComputeStructuralKey() == appliedStructuralKey)
+                    BakeEdgeFadeCurve();
+                else
+                    ApplySettings();
             }
 
             DrainBakedColliders();
@@ -446,7 +545,12 @@ namespace reromanlee.Transvoxel
         /// </summary>
         void UpdateChunkFades()
         {
-            float band = settings.edgeFadeFraction * settings.viewDistance;
+            // The time fade lives entirely in each mesh's UV2 + the shader (via _Time).
+            // The master fade is a GLOBAL uniform (globals default to 0 — without this the
+            // terrain would be invisible); it is deliberately not a material property so
+            // the SRP Batcher can never lock it to an inspector value.
+            Shader.SetGlobalFloat(FadePropertyId, 1f);
+            float band = fadeAwareMaterial ? settings.edgeFadeFraction * settings.viewDistance : 0f;
             Shader.SetGlobalFloat(EdgeFadeBandId, band);
             if (band > 0f)
             {
@@ -454,10 +558,110 @@ namespace reromanlee.Transvoxel
                 Shader.SetGlobalFloat(ViewDistanceId, settings.viewDistance);
             }
 
-            float duration = settings.chunkFadeInSeconds;
-            float now = Time.time;
-            foreach (var chunk in live.Values)
-                chunk.SetFadeIn(duration <= 0f ? 1f : Mathf.Clamp01((now - chunk.SpawnTime) / duration));
+            UpdateDyingChunks(Time.time, Mathf.Max(effectiveFadeSeconds, 1e-3f));
+        }
+
+        /// <summary>
+        /// Bakes <see cref="TransvoxelSettings.edgeFadeCurve"/> into a 1D LUT texture and
+        /// publishes it as the <c>_TransvoxelEdgeFadeCurve</c> global. The shader samples it by
+        /// the raw edge fade (0 at the draw distance, 1 at the viewer) to reshape the dither
+        /// opacity per pixel. An empty curve falls back to the identity ramp (a no-op remap).
+        /// </summary>
+        void BakeEdgeFadeCurve()
+        {
+            if (edgeFadeLut == null)
+            {
+                edgeFadeLut = new Texture2D(EdgeFadeLutSize, 1, TextureFormat.RFloat, false, true)
+                {
+                    name = "Transvoxel Edge Fade Curve LUT",
+                    wrapMode = TextureWrapMode.Clamp,
+                    filterMode = FilterMode.Bilinear,
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+            }
+
+            AnimationCurve curve = settings.edgeFadeCurve;
+            bool usable = curve != null && curve.length > 0;
+            for (int i = 0; i < EdgeFadeLutSize; i++)
+            {
+                float x = i / (float)(EdgeFadeLutSize - 1);
+                edgeFadeLutScratch[i] = usable ? Mathf.Clamp01(curve.Evaluate(x)) : x;
+            }
+            edgeFadeLut.SetPixelData(edgeFadeLutScratch, 0);
+            edgeFadeLut.Apply(updateMipmaps: false, makeNoLongerReadable: false);
+            Shader.SetGlobalTexture(EdgeFadeCurveId, edgeFadeLut);
+        }
+
+        /// <summary>
+        /// A fingerprint of every setting that requires rebuilding the octree/density/meshing
+        /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/> and
+        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> are deliberately excluded — they only
+        /// feed shader globals and the fade LUT, so editing them refreshes those in place
+        /// instead of tearing down the whole scene. Keep this in sync when adding settings that
+        /// affect geometry.
+        /// </summary>
+        string ComputeStructuralKey()
+        {
+            return string.Join("|",
+                settings.voxelSize, settings.chunkCells, settings.maxLodLevels, settings.viewDistance,
+                settings.lodSplitFactor, settings.isoLevel, settings.smoothShading,
+                settings.material != null ? settings.material.GetEntityId().ToString() : "0", settings.uvScale,
+                settings.colorizeLods, settings.chunkFadeInSeconds,
+                JsonUtility.ToJson(settings.noise),
+                (int)settings.meshingBackend,
+                settings.gpuComputeOverride != null ? settings.gpuComputeOverride.GetEntityId().ToString() : "0",
+                settings.gpuJobsInFlight, settings.meshApplyBudgetMs, settings.meshApplyBudgetPerFrame,
+                settings.maxConcurrentBuilds, settings.colliderMaxLod, settings.viewerMoveThreshold,
+                settings.lodSwapLinger, settings.densityCacheChunks);
+        }
+
+        // ------------------------------------------------------------------ cross-fade ghosts
+
+        /// <summary>
+        /// Puts a view on death row: it dithers out over the fade duration (complementary
+        /// pattern — see the shader) and is then recycled. Replaces any older ghost for the
+        /// same chunk, so rapid re-edits cross-fade between the latest two states only.
+        /// </summary>
+        void AddDyingChunk(TerrainChunk view)
+        {
+            if (effectiveFadeSeconds <= 0f)
+            {
+                DestroyChunkView(view);
+                return;
+            }
+            // A mesh being read by an off-thread physics bake must not be rewritten; just
+            // drop it instantly in that rare case.
+            EntityId meshId = view.MeshEntityId;
+            if (meshId != EntityId.None && bakingMeshIds.Contains(meshId))
+            {
+                DestroyChunkView(view);
+                return;
+            }
+
+            if (dyingByKey.TryGetValue(view.Key, out var previous))
+            {
+                DestroyChunkView(previous.View);
+                dying.Remove(previous);
+            }
+            view.MakeGhost(effectiveFadeSeconds);
+            var entry = new DyingChunk { View = view, StartTime = Time.time };
+            dying.Add(entry);
+            dyingByKey[view.Key] = entry;
+        }
+
+        void UpdateDyingChunks(float now, float duration)
+        {
+            // The fade-out itself is shader-animated; this only recycles finished ghosts.
+            for (int i = dying.Count - 1; i >= 0; i--)
+            {
+                var entry = dying[i];
+                if (now - entry.StartTime < duration)
+                    continue;
+                if (dyingByKey.TryGetValue(entry.View.Key, out var current) && current == entry)
+                    dyingByKey.Remove(entry.View.Key);
+                DestroyChunkView(entry.View);
+                dying.RemoveAt(i);
+            }
         }
 
         // ------------------------------------------------------------------ selection
@@ -736,10 +940,30 @@ namespace reromanlee.Transvoxel
                 chunk = RentChunkView(result.Key);
                 live.Add(result.Key, chunk);
             }
+            else if (effectiveFadeSeconds > 0f)
+            {
+                // Cross-fade the mesh swap (terraform, transition-mask change): the old
+                // surface moves onto a ghost view that dithers out with the complementary
+                // pattern while this chunk's new mesh dithers in — the pair always covers
+                // the surface, so the swap is seamless. The collider keeps the old shape
+                // until the new mesh's bake attaches.
+                if (chunk.VertexCount > 0)
+                {
+                    Mesh oldMesh = chunk.DetachMesh(keepColliderShape: true);
+                    if (oldMesh != null)
+                    {
+                        var ghost = RentChunkView(result.Key);
+                        ghost.AttachGhostMesh(oldMesh);
+                        ghost.SetLodTintVisible(settings.colorizeLods);
+                        AddDyingChunk(ghost);
+                    }
+                }
+                chunk.RestartFadeIn();
+            }
 
             chunk.TransitionMask = result.Mask;
             bool empty = result.IsEmpty;
-            chunk.Apply(result.Buffers, settings.colorizeLods);
+            chunk.Apply(result.Buffers, settings.colorizeLods, effectiveFadeSeconds);
             result.ReleasePayload();
 
             bool wantCollider = settings.colliderMaxLod >= 0
@@ -920,7 +1144,9 @@ namespace reromanlee.Transvoxel
 
                 if (live.TryGetValue(key, out var chunk))
                 {
-                    DestroyChunkView(chunk);
+                    // Dither out instead of popping; replacements are already fully faded
+                    // in underneath (LiveAndFadedIn), so this reads as a cross-fade.
+                    AddDyingChunk(chunk);
                     live.Remove(key);
                     RemoveFromEditGroup(key);
                     retired++;
@@ -970,12 +1196,13 @@ namespace reromanlee.Transvoxel
         /// <summary>
         /// A replacement counts only when applied AND fully dithered in — retiring the old
         /// chunk against a half-faded successor would show the successor's stipple holes.
+        /// (Empty chunks have nothing to fade and count immediately.)
         /// </summary>
         bool LiveAndFadedIn(NodeKey key)
         {
-            return live.TryGetValue(key, out var chunk)
-                   && chunk.FadeInComplete
-                   && !pending.ContainsKey(key);
+            if (!live.TryGetValue(key, out var chunk) || pending.ContainsKey(key))
+                return false;
+            return chunk.VertexCount == 0 || Time.time - chunk.SpawnTime >= effectiveFadeSeconds;
         }
 
         TerrainChunk RentChunkView(NodeKey key)

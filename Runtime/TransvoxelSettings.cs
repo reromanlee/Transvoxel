@@ -71,17 +71,28 @@ namespace reromanlee.Transvoxel
         [Tooltip("Tint chunks by LOD level to visualize the octree (debug).")]
         public bool colorizeLods;
 
-        [Tooltip("Seconds a freshly built chunk takes to dither in — a screen-space stipple " +
-                 "fade like Unity's LOD Group cross-fade. 0 = chunks appear instantly. Needs " +
-                 "a fade-aware shader: the built-in default material (Transvoxel/Lit Dithered) " +
-                 "supports it; see the README to add it to a custom shader.")]
+        [Tooltip("Duration of every stipple cross-fade, in seconds: new chunks dither in, " +
+                 "retired chunks (LOD swaps, out of range) dither out, and a re-meshed chunk " +
+                 "(terraform, LOD-ring shift) cross-fades against a ghost of its old surface " +
+                 "with complementary patterns — no visual change ever pops. 0 = everything " +
+                 "switches instantly. Needs a fade-aware shader: the built-in default " +
+                 "material (Transvoxel/Lit Dithered) supports it; see the README for custom " +
+                 "shaders.")]
         [Range(0f, 2f)] public float chunkFadeInSeconds = 0.4f;
 
         [Tooltip("Fraction of the view distance over which terrain dithers out toward the " +
                  "draw-distance edge — per pixel, so even huge far chunks dissolve smoothly " +
                  "like fog instead of popping. 0 disables edge fading. Needs a fade-aware " +
                  "shader (see above).")]
-        [Range(0f, 0.5f)] public float edgeFadeFraction = 0.1f;
+        [Range(0f, 1.0f)] public float edgeFadeFraction = 0.1f;
+
+        [Tooltip("Shapes the edge dither across distance so it isn't uniformly grainy. " +
+                 "X = raw fade amount (0 at the draw-distance edge, 1 closest to the viewer); " +
+                 "Y = kept opacity (1 = solid, 0 = fully dithered away). The default straight " +
+                 "0→1 line is the plain linear ramp. Lift the middle/left to keep near and mid " +
+                 "LODs solid (less dotting) while the far edge still dissolves. Only active " +
+                 "when Edge Fade Fraction > 0; needs a fade-aware shader.")]
+        public AnimationCurve edgeFadeCurve = AnimationCurve.Linear(0f, 0f, 1f, 1f);
 
         [Header("Landscape (density layer B)")]
         public NoiseSettings noise = new NoiseSettings();
