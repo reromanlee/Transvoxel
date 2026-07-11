@@ -161,6 +161,64 @@ namespace reromanlee.Transvoxel
         // gated on this. effectiveFadeSeconds is chunkFadeInSeconds or 0 accordingly.
         bool fadeAwareMaterial;
         float effectiveFadeSeconds;
+        FadeMaterialSet fadeMaterials;
+
+        /// <summary>
+        /// One shared material per quantized fade level, cloned lazily from the terrain
+        /// material. Fades ride on the material (not on MaterialPropertyBlocks, which some
+        /// Unity 6 render paths — e.g. URP's GPU Resident Drawer — ignore per renderer),
+        /// and chunks at the same level still batch with each other.
+        /// </summary>
+        sealed class FadeMaterialSet
+        {
+            readonly Material baseMaterial;
+            readonly Material[] fadeIn = new Material[TerrainChunk.FadeLevels];      // 0..63
+            readonly Material[] ghosts = new Material[TerrainChunk.FadeLevels + 1];  // 1..64
+
+            public FadeMaterialSet(Material baseMaterial)
+            {
+                this.baseMaterial = baseMaterial;
+            }
+
+            public Material GetFadeIn(int level)
+            {
+                if (level >= TerrainChunk.FadeLevels)
+                    return baseMaterial;
+                level = Mathf.Max(level, 0);
+                return fadeIn[level] ??= CreateLevel(level / (float)TerrainChunk.FadeLevels);
+            }
+
+            public Material GetGhost(int level)
+            {
+                level = Mathf.Clamp(level, 1, TerrainChunk.FadeLevels);
+                return ghosts[level] ??= CreateLevel(-level / (float)TerrainChunk.FadeLevels);
+            }
+
+            Material CreateLevel(float fade)
+            {
+                var material = new Material(baseMaterial)
+                {
+                    name = $"{baseMaterial.name} (fade {fade:0.00})",
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+                material.SetFloat(FadePropertyId, fade);
+                return material;
+            }
+
+            public void Destroy()
+            {
+                for (int i = 0; i < fadeIn.Length; i++)
+                {
+                    if (fadeIn[i] != null) UnityEngine.Object.Destroy(fadeIn[i]);
+                    fadeIn[i] = null;
+                }
+                for (int i = 0; i < ghosts.Length; i++)
+                {
+                    if (ghosts[i] != null) UnityEngine.Object.Destroy(ghosts[i]);
+                    ghosts[i] = null;
+                }
+            }
+        }
 
         int statsCountdown;
 
@@ -239,6 +297,8 @@ namespace reromanlee.Transvoxel
             // opaque ghosts and invisible delays.
             fadeAwareMaterial = runtimeMaterial.HasProperty(FadePropertyId);
             effectiveFadeSeconds = fadeAwareMaterial ? settings.chunkFadeInSeconds : 0f;
+            fadeMaterials?.Destroy();
+            fadeMaterials = new FadeMaterialSet(runtimeMaterial);
             if (!fadeAwareMaterial && (settings.chunkFadeInSeconds > 0f || settings.edgeFadeFraction > 0f))
                 Debug.LogWarning("[Transvoxel] Chunk fading is enabled in the settings, but the " +
                                  $"terrain material's shader ('{runtimeMaterial.shader.name}') has no " +
@@ -421,6 +481,7 @@ namespace reromanlee.Transvoxel
                 DestroyChunkView(entry.View);
             dying.Clear();
             dyingByKey.Clear();
+            fadeMaterials?.Destroy(); // recreated by BuildPipeline; pooled views re-materialize on Activate
             desired.Clear();
             desiredAncestors.Clear();
             obsolete.Clear();
@@ -493,7 +554,12 @@ namespace reromanlee.Transvoxel
             float duration = effectiveFadeSeconds;
             float now = Time.time;
             foreach (var chunk in live.Values)
-                chunk.SetFadeIn(duration <= 0f ? 1f : Mathf.Clamp01((now - chunk.SpawnTime) / duration));
+            {
+                int level = TerrainChunk.FadeLevels;
+                if (duration > 0f)
+                    level = (int)(Mathf.Clamp01((now - chunk.SpawnTime) / duration) * TerrainChunk.FadeLevels);
+                chunk.SetFadeLevel(level, fadeMaterials.GetFadeIn(level));
+            }
 
             UpdateDyingChunks(now, Mathf.Max(duration, 1e-3f));
         }
@@ -517,7 +583,7 @@ namespace reromanlee.Transvoxel
                 DestroyChunkView(previous.View);
                 dying.Remove(previous);
             }
-            view.SetGhostFade(1f);
+            view.SetFadeLevel(-TerrainChunk.FadeLevels, fadeMaterials.GetGhost(TerrainChunk.FadeLevels));
             var entry = new DyingChunk { View = view, StartTime = Time.time };
             dying.Add(entry);
             dyingByKey[view.Key] = entry;
@@ -538,7 +604,9 @@ namespace reromanlee.Transvoxel
                 }
                 else
                 {
-                    entry.View.SetGhostFade(ghost);
+                    int level = Mathf.Clamp(Mathf.CeilToInt(ghost * TerrainChunk.FadeLevels),
+                        1, TerrainChunk.FadeLevels);
+                    entry.View.SetFadeLevel(-level, fadeMaterials.GetGhost(level));
                 }
             }
         }
@@ -837,7 +905,7 @@ namespace reromanlee.Transvoxel
                         AddDyingChunk(ghost);
                     }
                 }
-                chunk.RestartFadeIn();
+                chunk.RestartFadeIn(fadeMaterials.GetFadeIn(0));
             }
 
             chunk.TransitionMask = result.Mask;

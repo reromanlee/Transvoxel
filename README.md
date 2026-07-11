@@ -146,8 +146,9 @@ HDRP) implements it. To make your **own** material fade, add this to its shader 
 reproduce it with a Custom Function node in Shader Graph:
 
 ```hlsl
-// Properties: _TransvoxelFade("Fade", Range(0,1)) = 1   (driven per chunk via MPB;
-// NEGATIVE values mark a cross-fade ghost keeping the complementary pixel set)
+// Properties: _TransvoxelFade("Fade", Range(0,1)) = 1   (driven per chunk via shared
+// per-level materials; NEGATIVE values mark a cross-fade ghost keeping the
+// complementary pixel set)
 float _TransvoxelFade;
 // Globals set by TransvoxelTerrain every frame:
 float4 _TransvoxelViewerPos;
@@ -220,9 +221,10 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
   brushing never flashes a one-frame hole along a chunk border.
 - **Bounded retirement.** Obsolete chunks are destroyed under a per-frame cap, so even a
   far teleport (thousands of chunks replaced at once) never spends a whole frame cleaning up.
-- **SRP-Batcher friendly.** A chunk carries a MaterialPropertyBlock only while it is
-  actively fading or LOD-tinted; steady chunks drop the block and batch normally — at
-  thousands of live chunks that is a large render-thread saving.
+- **SRP-Batcher friendly.** Fades are delivered as a small set of shared per-level
+  materials (not MaterialPropertyBlocks, which some Unity 6 render paths such as URP's
+  GPU Resident Drawer ignore per renderer), so steady chunks batch normally and fading
+  chunks batch with each other. Only the debug LOD tint uses a property block.
 - Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
 ## Tests

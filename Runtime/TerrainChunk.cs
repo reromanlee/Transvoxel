@@ -29,7 +29,14 @@ namespace reromanlee.Transvoxel
 
         static readonly int BaseColorId = Shader.PropertyToID("_BaseColor"); // URP/HDRP Lit
         static readonly int ColorId = Shader.PropertyToID("_Color");         // Built-in Standard
-        static readonly int FadeId = Shader.PropertyToID("_TransvoxelFade"); // stipple fade-in
+
+        /// <summary>
+        /// Fade quantization steps. Fades are delivered as a small set of shared materials
+        /// (one per level) rather than MaterialPropertyBlocks: per-renderer blocks are
+        /// ignored by some Unity 6 render paths (e.g. URP's GPU Resident Drawer), while
+        /// per-material values work everywhere — and chunks at the same level still batch.
+        /// </summary>
+        public const int FadeLevels = 64;
 
         public NodeKey Key { get; private set; }
         public byte TransitionMask { get; set; }
@@ -39,11 +46,17 @@ namespace reromanlee.Transvoxel
         public float SpawnTime { get; private set; }
 
         /// <summary>
+        /// Current quantized fade: <see cref="FadeLevels"/> = solid, 0..63 = fading in,
+        /// negative = ghost fading out (complementary pattern).
+        /// </summary>
+        public int FadeLevel { get; private set; } = FadeLevels;
+
+        /// <summary>
         /// True once the chunk is fully dithered in (or fading is off). Replaced chunks are
         /// only retired against fully-visible replacements, or LOD swaps would show the
         /// stipple holes of a half-faded successor.
         /// </summary>
-        public bool FadeInComplete => appliedFade >= 1f;
+        public bool FadeInComplete => FadeLevel >= FadeLevels;
 
         readonly GameObject gameObject;
         readonly MeshFilter meshFilter;
@@ -52,7 +65,6 @@ namespace reromanlee.Transvoxel
         MeshCollider meshCollider;
         Mesh mesh;
         bool tintVisible;
-        float appliedFade = 1f; // 1 = solid; (0,1) = fading in; negative = ghost fading out
 
         public TerrainChunk(NodeKey key, Transform parent, Material material, float voxelSize, int chunkCells)
         {
@@ -69,7 +81,7 @@ namespace reromanlee.Transvoxel
             Key = key;
             TransitionMask = 0;
             SpawnTime = Time.time;
-            appliedFade = 1f;
+            FadeLevel = FadeLevels;
             tintVisible = false;
 #if UNITY_EDITOR
             // Handy in the hierarchy, but a per-activation string allocation in builds.
@@ -146,65 +158,42 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>
-        /// Drives the stipple fade-in (0 = invisible, 1 = solid). Quantized so the property
-        /// block is only touched when the value visibly changes; shaders without
-        /// _TransvoxelFade simply ignore it.
+        /// Sets the chunk's quantized fade level and the shared material carrying that
+        /// level's _TransvoxelFade value (see <see cref="FadeLevels"/>). Positive levels
+        /// fade in; negative levels mark a cross-fade ghost (complementary pattern).
         /// </summary>
-        public void SetFadeIn(float fade)
+        public void SetFadeLevel(int level, Material material)
         {
-            fade = Mathf.Round(Mathf.Clamp01(fade) * 64f) / 64f;
-            if (fade == appliedFade)
+            if (level == FadeLevel)
                 return;
-            appliedFade = fade;
-            PushPropertyBlock();
+            FadeLevel = level;
+            meshRenderer.sharedMaterial = material;
         }
 
-        /// <summary>
-        /// Drives a ghost's fade-out (1 = fully covering, 0 = gone). Ghosts carry a NEGATIVE
-        /// fade value: the shader then keeps exactly the pixels the successor chunk (fading
-        /// in with the complementary value) does not draw yet, so a cross-fading pair always
-        /// covers the surface — no holes, no double-drawn pixels.
-        /// </summary>
-        public void SetGhostFade(float ghost)
-        {
-            float fade = -Mathf.Round(Mathf.Clamp01(ghost) * 64f) / 64f;
-            if (fade == appliedFade)
-                return;
-            appliedFade = fade;
-            PushPropertyBlock();
-        }
-
-        /// <summary>Restarts the fade-in ramp — used when a live chunk's mesh is replaced (terraform, LOD mask change) and cross-fades against its ghost.</summary>
-        public void RestartFadeIn()
+        /// <summary>Restarts the fade-in clock — used when a live chunk's mesh is replaced (terraform, LOD mask change) and cross-fades against its ghost.</summary>
+        public void RestartFadeIn(Material invisibleMaterial)
         {
             SpawnTime = Time.time;
-            SetFadeIn(0f);
+            SetFadeLevel(0, invisibleMaterial);
         }
 
         /// <summary>
-        /// A renderer with a MaterialPropertyBlock is excluded from the SRP Batcher, so the
-        /// block only exists while it says something: mid-fade or LOD-tinted. The moment a
-        /// chunk is fully faded in and untinted the block is removed and the chunk batches
-        /// with every other steady chunk — at thousands of live chunks this is a large
-        /// render-thread saving.
+        /// The debug LOD tint stays on a MaterialPropertyBlock (it may not show on render
+        /// paths that skip per-renderer blocks, but it is a debug feature). A renderer with
+        /// a block is excluded from the SRP Batcher, so the block only exists while tinted.
         /// </summary>
         void PushPropertyBlock()
         {
-            bool identity = !tintVisible && appliedFade >= 1f;
-            if (identity)
+            if (!tintVisible)
             {
                 meshRenderer.SetPropertyBlock(null);
                 return;
             }
 
             propertyBlock.Clear();
-            propertyBlock.SetFloat(FadeId, appliedFade);
-            if (tintVisible)
-            {
-                var tint = LodTints[Mathf.Min(Key.Lod, LodTints.Length - 1)];
-                propertyBlock.SetColor(BaseColorId, tint);
-                propertyBlock.SetColor(ColorId, tint);
-            }
+            var tint = LodTints[Mathf.Min(Key.Lod, LodTints.Length - 1)];
+            propertyBlock.SetColor(BaseColorId, tint);
+            propertyBlock.SetColor(ColorId, tint);
             meshRenderer.SetPropertyBlock(propertyBlock);
         }
 
