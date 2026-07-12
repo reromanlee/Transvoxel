@@ -22,6 +22,11 @@
 #pragma kernel CSRegular
 #pragma kernel CSTransition
 
+// With a material palette, every soup vertex also carries the palette id of the solid
+// voxel it hugs (the same solid-corner rule as the CPU meshers); the welder streams it
+// into MeshBuffers.MaterialIds. Without a palette the leaner 8-float vertex is used.
+#pragma multi_compile _ TRANSVOXEL_MATERIALS
+
 // ------------------------------------------------------------------ data
 
 struct TVertex
@@ -29,6 +34,9 @@ struct TVertex
     float3 position;
     float3 normal;
     float2 uv;
+#if defined(TRANSVOXEL_MATERIALS)
+    float material;
+#endif
 };
 
 struct TTriangle
@@ -61,6 +69,13 @@ StructuredBuffer<int3> _EditBrickCoords;       // pool: brick coordinate per slo
 StructuredBuffer<float> _EditBrickData;        // pool: 4096 floats per slot
 StructuredBuffer<int> _ChunkEditSlots;         // per job: pool slots this chunk can read
 int _EditSlotCount;
+
+#if defined(TRANSVOXEL_MATERIALS)
+// Voxel material ids, riding the SAME slot space as the density bricks (the pool holds
+// the union of both layers' bricks; a slot with no painted voxels is all zeros, id 0 =
+// default material). Packed 4 ids per uint.
+StructuredBuffer<uint> _EditBrickMaterials;    // pool: 1024 uints per slot
+#endif
 
 // Chunk parameters (ints kept scalar: SetInts packs arrays to 16-byte slots).
 int _MinVoxelX, _MinVoxelY, _MinVoxelZ;
@@ -245,6 +260,26 @@ float SignedAt(int3 voxel)
     return _IsoLevel - SampleDensity(voxel);
 }
 
+#if defined(TRANSVOXEL_MATERIALS)
+// Mirror of VoxelMaterialLayer.SampleMaterial: painted bricks override, everything else
+// is the default material 0. Same slot walk as SampleDensity.
+uint SampleMaterialId(int3 voxel)
+{
+    int3 brickCoord = voxel >> 4;
+    for (int i = 0; i < _EditSlotCount; i++)
+    {
+        int slot = _ChunkEditSlots[i];
+        if (all(_EditBrickCoords[slot] == brickCoord))
+        {
+            int idx = (voxel.x & 15) | ((voxel.y & 15) << 4) | ((voxel.z & 15) << 8);
+            uint packed = _EditBrickMaterials[slot * 1024 + (idx >> 2)];
+            return (packed >> ((idx & 3) * 8)) & 0xFF;
+        }
+    }
+    return 0;
+}
+#endif
+
 // ------------------------------------------------------------------ shared meshing helpers
 
 int3 MinVoxel()
@@ -320,7 +355,7 @@ float EdgeParameter(float d0, float d1)
     return d0 / (d0 - d1);
 }
 
-TVertex FinishVertex(float3 positionVoxels, float3 normal)
+TVertex FinishVertex(float3 positionVoxels, float3 normal, float materialId)
 {
     TVertex vtx;
     vtx.position = positionVoxels * _VoxelSize;
@@ -328,6 +363,9 @@ TVertex FinishVertex(float3 positionVoxels, float3 normal)
     vtx.uv = float2(
         (_MinVoxelX + positionVoxels.x) * _VoxelSize * _UvScale,
         (_MinVoxelZ + positionVoxels.z) * _VoxelSize * _UvScale);
+#if defined(TRANSVOXEL_MATERIALS)
+    vtx.material = materialId;
+#endif
     return vtx;
 }
 
@@ -389,8 +427,15 @@ TVertex MakeRegularVertex(int3 cell, int v0, int v1, float d0, float d1)
     float3 g1 = VolumeGradient(cell + 1 + c1);
     float3 normal = SafeNormalize(g0 + s * (g1 - g0));
 
+    float material = 0.0;
+#if defined(TRANSVOXEL_MATERIALS)
+    // Material of the solid endpoint (d < 0; zero counts as air) — the voxel this vertex
+    // is the surface of, exactly like TransvoxelMesher.SolidCornerMaterial.
+    material = (float)SampleMaterialId(MinVoxel() + (cell + (d0 < 0.0 ? c0 : c1)) * _LodStep);
+#endif
+
     position = ApplySecondaryShift(position, normal);
-    return FinishVertex(position, normal);
+    return FinishVertex(position, normal, material);
 }
 
 [numthreads(4, 4, 4)]
@@ -510,10 +555,18 @@ TVertex MakeTransitionVertex(int cx, int cy, int l0, int l1, float d0, float d1)
     float3 g1 = TransitionLocationGradient(l1, fu1, fv1);
     float3 normal = SafeNormalize(g0 + s * (g1 - g0));
 
+    float material = 0.0;
+#if defined(TRANSVOXEL_MATERIALS)
+    // Solid endpoint on the face lattice — every location sits on an integer voxel, so
+    // ids match the finer neighbour's across the seam (TransvoxelTransitionMesher rule).
+    material = (float)SampleMaterialId(MinVoxel()
+        + FineLocal(d0 < 0.0 ? fu0 : fu1, d0 < 0.0 ? fv0 : fv1));
+#endif
+
     if (halfRes)
         position = ApplySecondaryShift(position, normal);
 
-    return FinishVertex(position, normal);
+    return FinishVertex(position, normal, material);
 }
 
 [numthreads(8, 8, 1)]

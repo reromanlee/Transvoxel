@@ -314,7 +314,8 @@ namespace reromanlee.Transvoxel
             pipelineGeneration++;
             ActiveBackend = ResolveBackend(out ComputeShader gpuShader);
             if (ActiveBackend != MeshingBackend.CpuThreads)
-                gpuBuilder = new GpuChunkBuilder(gpuShader, settings, Layers.Edits);
+                gpuBuilder = new GpuChunkBuilder(gpuShader, settings, Layers.Edits,
+                    paletteActive ? Materials : null);
             if (ActiveBackend != MeshingBackend.GpuCompute)
                 StartCpuWorkers(); // CpuThreads and Hybrid: CPU workers pull the same queue
 
