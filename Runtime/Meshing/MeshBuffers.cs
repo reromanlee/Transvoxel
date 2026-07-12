@@ -81,6 +81,12 @@ namespace reromanlee.Transvoxel.Meshing
             for (int i = 0; i < triCount * 3; i++) Indices.Add(i);
         }
 
+        /// <summary>Bytes held by this instance's lists (capacities — Clear keeps them), for stats.</summary>
+        public long EstimateBytes() =>
+            (long)Vertices.Capacity * 12 + (long)Normals.Capacity * 12 + (long)Uvs.Capacity * 8
+            + (long)Indices.Capacity * 4
+            + (long)MaterialIds.Capacity + (long)MaterialBlend.Capacity * 4;
+
         // ---- pooling ----
 
         static readonly ConcurrentBag<MeshBuffers> Pool = new ConcurrentBag<MeshBuffers>();
@@ -91,6 +97,20 @@ namespace reromanlee.Transvoxel.Meshing
         {
             buffers.Clear();
             Pool.Add(buffers);
+        }
+
+        /// <summary>Bytes held by pooled (idle) instances, for stats. Snapshot enumeration.</summary>
+        public static long EstimatePooledBytes(out int pooledCount)
+        {
+            long bytes = 0;
+            int count = 0;
+            foreach (MeshBuffers buffers in Pool)
+            {
+                bytes += buffers.EstimateBytes();
+                count++;
+            }
+            pooledCount = count;
+            return bytes;
         }
     }
 }

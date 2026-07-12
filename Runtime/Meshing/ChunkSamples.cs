@@ -43,6 +43,18 @@ namespace reromanlee.Transvoxel.Meshing
 
         public float MainAt(int x, int y, int z) => Main[x + PointsPerAxis * (y + PointsPerAxis * z)];
 
+        /// <summary>Payload bytes of this grid (main grid + sampled face sheets), for stats.</summary>
+        public long EstimateBytes()
+        {
+            long floats = Main.Length;
+            foreach (float[] sheet in FaceSheets)
+            {
+                if (sheet != null)
+                    floats += sheet.Length;
+            }
+            return floats * sizeof(float);
+        }
+
         /// <summary>
         /// Central-difference gradient of the signed distance at a cell corner (grid point).
         /// Points from solid towards air, i.e. along the outward surface normal. Unnormalized;

@@ -28,6 +28,9 @@ namespace reromanlee.Transvoxel.Density
 
         public int BrickCount => bricks.Count;
 
+        /// <summary>Payload bytes of the stored bricks, for stats.</summary>
+        public long EstimateBytes() => (long)bricks.Count * BrickVolume * sizeof(float);
+
         /// <summary>True (with the stored density) if the player has edited this voxel.</summary>
         public bool TryGetVoxel(int x, int y, int z, out float value)
         {

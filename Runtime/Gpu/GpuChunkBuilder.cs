@@ -69,6 +69,7 @@ namespace reromanlee.Transvoxel.Gpu
         readonly VoxelEditLayer edits;
         readonly VoxelMaterialLayer materials; // null = no palette, kernels skip material work
         readonly bool materialsEnabled;
+        readonly TransvoxelWorkStats workStats; // null = no timing collection
         readonly int kernelVolume;
         readonly int kernelRegular;
         readonly int kernelTransition;
@@ -81,6 +82,12 @@ namespace reromanlee.Transvoxel.Gpu
 
         readonly ComputeBuffer permBuffer;
         readonly List<ComputeBuffer> tableBuffers = new List<ComputeBuffer>();
+        long tableBufferBytes;
+
+        // GPU timing probe: a 4-byte readback issued right before a job's dispatches; the
+        // existing triangle-count readback right after them closes the bracket. See
+        // TransvoxelResourceStats.GpuComputeMsPerSecond for the sampling caveat.
+        ComputeBuffer probeBuffer;
 
         readonly Stack<JobSet> setPool = new Stack<JobSet>();
         readonly List<JobSet> allSets = new List<JobSet>();
@@ -119,11 +126,20 @@ namespace reromanlee.Transvoxel.Gpu
 
         public GpuChunkBuilder(ComputeShader shaderAsset, TransvoxelSettings settings, VoxelEditLayer editLayer,
             VoxelMaterialLayer materialLayer = null)
+            : this(shaderAsset, settings, editLayer, materialLayer, null)
+        {
+        }
+
+        internal GpuChunkBuilder(ComputeShader shaderAsset, TransvoxelSettings settings, VoxelEditLayer editLayer,
+            VoxelMaterialLayer materialLayer, TransvoxelWorkStats stats)
         {
             shader = UnityEngine.Object.Instantiate(shaderAsset);
             edits = editLayer;
             materials = materialLayer;
             materialsEnabled = materialLayer != null;
+            workStats = stats;
+            if (stats != null)
+                probeBuffer = new ComputeBuffer(1, sizeof(int));
             if (materialsEnabled)
                 shader.EnableKeyword(MaterialsKeyword);
             else
@@ -186,7 +202,25 @@ namespace reromanlee.Transvoxel.Gpu
             var buffer = new ComputeBuffer(data.Length, sizeof(int));
             buffer.SetData(data);
             tableBuffers.Add(buffer);
+            tableBufferBytes += (long)data.Length * sizeof(int);
             shader.SetBuffer(kernel, name, buffer);
+        }
+
+        /// <summary>Bytes of every compute buffer this builder holds on the GPU, for stats.</summary>
+        public long EstimateGpuBufferBytes()
+        {
+            long bytes = tableBufferBytes + 512 * sizeof(int); // tables + noise permutation
+            if (probeBuffer != null)
+                bytes += sizeof(int);
+            bytes += (long)brickCapacity * (3 * sizeof(int) + VoxelEditLayer.BrickVolume * sizeof(float)
+                                            + (materialsEnabled ? PackedUintsPerBrick * sizeof(uint) : 0));
+            long volumeBytes = (long)pointsPerAxis * pointsPerAxis * pointsPerAxis * sizeof(float);
+            foreach (JobSet set in allSets)
+            {
+                bytes += volumeBytes + (long)triangleCapacity * triangleByteStride
+                         + sizeof(int) + (long)set.SlotCapacity * sizeof(int);
+            }
+            return bytes;
         }
 
         // ------------------------------------------------------------------ edit brick pool
@@ -378,6 +412,14 @@ namespace reromanlee.Transvoxel.Gpu
             int lodStep = 1 << job.Key.Lod;
             Vector3Int min = job.Key.MinVoxel(chunkCells);
 
+            // GPU timing bracket, part 1: the GPU reaches this trivial readback right
+            // before the job's kernels; the count readback below completes right after
+            // them. Both callbacks land on the main thread in submission order.
+            double gpuBracketStart = -1;
+            if (workStats != null)
+                AsyncGPUReadback.Request(probeBuffer,
+                    _ => gpuBracketStart = Time.realtimeSinceStartupAsDouble);
+
             BindJobEdits(set, min, lodStep);
 
             shader.SetInt(MinVoxelXId, min.x);
@@ -412,8 +454,15 @@ namespace reromanlee.Transvoxel.Gpu
             }
 
             ComputeBuffer.CopyCount(set.Triangles, set.TriangleCount, 0);
-            AsyncGPUReadback.Request(set.TriangleCount,
-                request => OnCountReady(request, job, set, results));
+            AsyncGPUReadback.Request(set.TriangleCount, request =>
+            {
+                // Bracket part 2. One sample is quantized to frame boundaries, but with a
+                // random phase per job the average converges on the true kernel cost.
+                if (workStats != null && gpuBracketStart >= 0)
+                    workStats.AddGpuSampleMs(
+                        (Time.realtimeSinceStartupAsDouble - gpuBracketStart) * 1000.0);
+                OnCountReady(request, job, set, results);
+            });
         }
 
         /// <summary>
@@ -540,6 +589,7 @@ namespace reromanlee.Transvoxel.Gpu
             bool withMaterials = materialsEnabled;
             Task.Run(() =>
             {
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
                 MeshBuffers buffers = null;
                 try
                 {
@@ -587,6 +637,8 @@ namespace reromanlee.Transvoxel.Gpu
                 finally
                 {
                     ArrayPool<float>.Shared.Return(soup);
+                    // The CPU share of a GPU build: welding + blend encoding.
+                    workStats?.AddBuild(System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 }
             });
         }
@@ -659,6 +711,7 @@ namespace reromanlee.Transvoxel.Gpu
             editCoordsBuffer?.Release();
             editDataBuffer?.Release();
             editMaterialsBuffer?.Release();
+            probeBuffer?.Release();
 
             UnityEngine.Object.Destroy(shader);
         }

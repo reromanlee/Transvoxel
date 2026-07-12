@@ -43,6 +43,13 @@ namespace reromanlee.Transvoxel
         public NodeKey Key { get; private set; }
         public byte TransitionMask { get; set; }
         public int VertexCount { get; private set; }
+        public int IndexCount { get; private set; }
+
+        /// <summary>
+        /// Bytes of this view's mesh data (vertex layout + index buffer), for stats. The
+        /// mesh is readable, so the same amount lives once in RAM and once on the GPU.
+        /// </summary>
+        public long MeshBytes { get; private set; }
 
         /// <summary>
         /// Start of the fade-in ramp, baked into the mesh's UV2 on apply. The terrain uses
@@ -94,6 +101,8 @@ namespace reromanlee.Transvoxel
         {
             gameObject.SetActive(false);
             VertexCount = 0;
+            IndexCount = 0;
+            MeshBytes = 0;
             if (mesh != null)
                 mesh.Clear();
             if (meshCollider != null)
@@ -106,8 +115,15 @@ namespace reromanlee.Transvoxel
             EnsureMesh();
             mesh.Clear();
             VertexCount = buffers.Vertices.Count;
+            IndexCount = buffers.Indices.Count;
+            MeshBytes = 0;
             if (!buffers.IsEmpty)
             {
+                int vertexStride = 12 + 12 + 8                          // position, normal, uv0
+                                   + (fadeSeconds > 0f ? 8 : 0)         // fade data (uv2)
+                                   + (buffers.MaterialBlend.Count > 0 ? 4 : 0); // blend color
+                int indexStride = buffers.Vertices.Count > ushort.MaxValue ? 4 : 2;
+                MeshBytes = (long)VertexCount * vertexStride + (long)IndexCount * indexStride;
                 mesh.indexFormat = buffers.Vertices.Count > ushort.MaxValue
                     ? IndexFormat.UInt32
                     : IndexFormat.UInt16;
@@ -226,6 +242,7 @@ namespace reromanlee.Transvoxel
         {
             var kept = mesh;
             mesh = null;
+            MeshBytes = 0;
             if (meshFilter != null)
                 meshFilter.sharedMesh = null;
             if (!keepColliderShape && meshCollider != null)
@@ -243,7 +260,28 @@ namespace reromanlee.Transvoxel
             mesh = ghostMesh;
             meshFilter.sharedMesh = ghostMesh;
             VertexCount = ghostMesh != null ? ghostMesh.vertexCount : 0;
+            IndexCount = ghostMesh != null ? (int)ghostMesh.GetIndexCount(0) : 0;
+            MeshBytes = EstimateMeshBytes(ghostMesh);
             meshRenderer.enabled = VertexCount > 0;
+        }
+
+        /// <summary>
+        /// Mesh data bytes from an arbitrary mesh (ghosts, meshes parked for collider
+        /// bakes), derived from its actual vertex layout and index format.
+        /// </summary>
+        public static long EstimateMeshBytes(Mesh target)
+        {
+            if (target == null || target.vertexCount == 0)
+                return 0;
+            int vertexStride =
+                (target.HasVertexAttribute(VertexAttribute.Position) ? 12 : 0)
+                + (target.HasVertexAttribute(VertexAttribute.Normal) ? 12 : 0)
+                + (target.HasVertexAttribute(VertexAttribute.TexCoord0) ? 8 : 0)
+                + (target.HasVertexAttribute(VertexAttribute.TexCoord1) ? 8 : 0)
+                + (target.HasVertexAttribute(VertexAttribute.Color) ? 4 : 0);
+            int indexStride = target.indexFormat == IndexFormat.UInt32 ? 4 : 2;
+            return (long)target.vertexCount * vertexStride
+                   + (long)target.GetIndexCount(0) * indexStride;
         }
     }
 }

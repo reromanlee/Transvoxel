@@ -100,6 +100,23 @@ namespace reromanlee.Transvoxel.Meshing
             }
         }
 
+        public int Count
+        {
+            get { lock (gate) return map.Count; }
+        }
+
+        /// <summary>Payload bytes of every cached grid, for stats.</summary>
+        public long EstimateBytes()
+        {
+            lock (gate)
+            {
+                long bytes = 0;
+                foreach (ChunkSamples samples in map.Values)
+                    bytes += samples.EstimateBytes();
+                return bytes;
+            }
+        }
+
         public void Clear()
         {
             lock (gate)
