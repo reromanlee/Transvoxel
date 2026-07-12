@@ -22,7 +22,7 @@ through a tiny interface, so you can replace any of them on its own.
 
 | Layer | Folder | Responsibility | Key type |
 |-------|--------|----------------|----------|
-| **Density** — *where* is there ground? | `Runtime/Density/` | Answers `SampleVoxel(x,y,z) → 0..1`. Two stacked layers: player edits (A) over procedural landscape (B). | `IDensitySource`, `LayeredDensitySource` |
+| **Density** — *where* is there ground? | `Runtime/Density/` | Answers `SampleVoxel(x,y,z) → 0..1`. Two stacked layers: player edits (A) over procedural landscape (B). A parallel sparse layer answers `SampleMaterial(x,y,z) → palette id`. | `IDensitySource`, `LayeredDensitySource`, `VoxelMaterialLayer` |
 | **Meshing (CPU)** — *how* do we triangulate a chunk? | `Runtime/Meshing/` | Turns a sampled chunk into vertices/normals/UVs using the Transvoxel tables. Regular cells + transition cells. | `TransvoxelMesher`, `TransvoxelTransitionMesher` |
 | **Meshing (GPU)** — the same, in compute shaders | `Runtime/Gpu/`, `Runtime/Resources/TransvoxelCompute.compute` | Density (noise + edit overlay) and the whole triangulation run in three compute kernels; triangles stream back via async readback. | `GpuChunkBuilder`, `TransvoxelGpuTables` |
 | **Octree** — *what* should exist right now? | `Runtime/Octree/` | Pure function of viewer position → the set of chunks and which faces need transition cells. | `TerrainOctree` → `ChunkDrawCommand` |
@@ -40,8 +40,10 @@ The raw lookup tables translated from Lengyel's C++ live in
 It spawns a camera, a light and the terrain, then lets you:
 
 - **RMB drag** to look, **WASD + Q/E** to fly (**Shift** = faster),
-- **LMB** to dig, **Shift + LMB** to build,
-- toggle smooth/flat shading and LOD colorization from the on-screen overlay.
+- **LMB** to dig, **Shift + LMB** to build — with the material picked in the overlay
+  (the demo ships a small grass/rock/sand/snow palette),
+- toggle smooth/flat shading and LOD colorization from the on-screen overlay, and tune the
+  material blend sharpness live.
 
 > Camera and terraforming controls use the legacy Input Manager. If your project is set to
 > the new Input System only, open **Project Settings ▸ Player ▸ Active Input Handling** and
@@ -79,6 +81,9 @@ Notable knobs (Concept.txt #4, #6):
 - **chunkFadeInSeconds / edgeFadeFraction** — stipple cross-fade (see *Dithered fading*
   below): how long new chunks take to dither in, and the per-pixel dissolve band at the
   draw-distance edge.
+- **materialPalette / materialBlendSharpness** — the terrain's material set and how sharply
+  neighbouring voxel materials cut into each other (see *Voxel materials* below). The
+  sharpness is a live shader global — drag it during Play, nothing rebuilds.
 - **meshApplyBudgetMs** — the main-thread time slice per frame for uploading finished
   meshes. Bursts of hundreds of chunks (teleport, high-speed flight) spread over frames
   instead of spiking one.
@@ -206,6 +211,51 @@ not, all fading (including cross-fade ghosts and the edge dissolve) is cleanly d
 chunks switch instantly, with a console warning telling you how to enable it. So a custom
 material without the snippet keeps working; it just cannot fade.
 
+## Voxel materials
+
+Every voxel can be made of a different material. Create a palette via **Assets ▸ Create ▸
+Transvoxel ▸ Material Palette**, add layers (albedo texture, tint, smoothness, per-layer UV
+scale — each with a rotatable preview sphere in the Inspector), assign it to
+`TransvoxelSettings.materialPalette`, and build with it:
+
+```csharp
+terrain.Terraform(worldPoint, radius: 5f, strength: 0.9f, build: true, materialId: 2);
+```
+
+- **The list index is the material id.** Layer 0 fills the whole world by default; build
+  strokes stamp the selected id onto every solid voxel they touch (so the placed blob reads
+  as one substance), digging never touches ids. Custom painting code can write
+  `terrain.Materials` directly and call `InvalidateRegion` to re-mesh.
+- **Storage is sparse and tiny.** Ids live in 16³ byte bricks
+  (`VoxelMaterialLayer`, 4 KB per painted brick) next to the 16 KB density bricks a stroke
+  creates anyway — an unpainted world costs zero bytes, and the GPU backend folds both
+  layers into the one resident brick pool (ids packed 4-per-uint).
+- **One material, any number of textures.** Layers are texture/parameter sets — not
+  `Material` assets, whose arbitrary shaders could not run on one blended pixel. All layer
+  albedos bake into a single `Texture2DArray` indexed per pixel (a plain GPU copy when the
+  layers share size/format/mips; mixed inputs are resized and stored uncompressed), so the
+  whole landscape still renders with **one material and full SRP batching**, whatever the
+  palette size.
+- **Transitions blend per pixel — and the width is live-tunable.** Each vertex takes the id
+  of the solid voxel it hugs; each triangle carries its (up to three) ids plus one-hot corner
+  weights in the mesh color channel (`MaterialBlendEncoder`, 4 bytes per vertex — vertices
+  split only along material boundaries). The shader sharpens the rasterized barycentric
+  weights with `pow(w, materialBlendSharpness)`: 1 blends across the whole boundary cell,
+  16 is a near-hard cut. Material ids resolve identically across chunk borders, LOD seams
+  and both meshers, so blends never tear at a seam — proven by the watertightness +
+  seam-consistency tests.
+- **Everything else composes.** Painting re-meshes through the normal edit-group path, so a
+  material change cross-fades through the stipple ghosts like any terraform; CPU, GPU and
+  Hybrid backends produce identical ids (the `TRANSVOXEL_MATERIALS` kernel variant adds one
+  float per soup vertex, welded and encoded exactly like the CPU path).
+
+Like fading, this needs shader support (`_TransvoxelPaletteAware` marker; palette inputs are
+global uniforms + the `TRANSVOXEL_PALETTE` keyword). The bundled `Transvoxel/Lit Dithered`
+shader implements it in both pipelines; with a palette assigned but a non-palette-aware
+material, voxel materials are cleanly disabled with a console warning. Palette *content*
+edits (textures, tints, sharpness) re-bind live without rebuilding chunks; assigning or
+swapping the palette asset re-meshes the world once so every vertex carries blend data.
+
 ## How the seamless LOD works (the interesting part)
 
 Adjacent chunks may differ by one LOD level (the octree enforces this **2:1 balance**). Where
@@ -259,7 +309,10 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
 EditMode tests live in `Editor/` (Window ▸ General ▸ Test Runner ▸ EditMode). They prove the
 core invariant — the union of all chunk meshes is a closed, consistently wound 2-manifold —
 for single chunks, same-LOD borders, every LOD-transition face, and after a transition-mask
-change (the stale-cache regression). Requires the `com.unity.test-framework` package.
+change (the stale-cache regression); plus, for voxel materials: watertightness of encoded
+(split) meshes, blend-attribute structure, and material-id agreement at every shared vertex
+across chunk borders, LOD seams and both meshers. Requires the `com.unity.test-framework`
+package.
 
 ## Requirements
 
