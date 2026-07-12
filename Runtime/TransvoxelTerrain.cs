@@ -423,6 +423,18 @@ namespace reromanlee.Transvoxel
                         }
                         if (!job.SmoothShading)
                             buffers.ConvertToFlatShaded();
+                        if (context.Materials != null)
+                        {
+                            var encoder = MaterialBlendEncoder.Rent();
+                            try
+                            {
+                                encoder.Encode(buffers);
+                            }
+                            finally
+                            {
+                                MaterialBlendEncoder.Return(encoder);
+                            }
+                        }
                     }
                     finally
                     {
