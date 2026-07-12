@@ -1374,8 +1374,20 @@ namespace reromanlee.Transvoxel
         /// Digs (or with <paramref name="build"/> raises) a soft-edged sphere of terrain.
         /// Writes go to the player-edit layer; every affected chunk re-meshes in the
         /// background (at rush priority) and the whole set hot-swaps in a single frame.
+        /// Built ground is made of palette material 0.
         /// </summary>
         public void Terraform(Vector3 worldPosition, float radiusMeters, float strength, bool build)
+            => Terraform(worldPosition, radiusMeters, strength, build, 0);
+
+        /// <summary>
+        /// <see cref="Terraform(Vector3, float, float, bool)"/> with a palette material:
+        /// build strokes stamp <paramref name="materialId"/> onto every solid voxel the
+        /// brush touches, so new ground is made of — and existing ground inside the brush
+        /// repaints to — the selected material. Ids persist even while no palette is
+        /// assigned (they just render once one is). Dig strokes ignore the id.
+        /// </summary>
+        public void Terraform(Vector3 worldPosition, float radiusMeters, float strength, bool build,
+            byte materialId)
         {
             if (Layers == null)
             {
@@ -1385,7 +1397,8 @@ namespace reromanlee.Transvoxel
 
             Vector3 centerVoxel = transform.InverseTransformPoint(worldPosition) / settings.voxelSize;
             float radiusVoxels = radiusMeters / settings.voxelSize;
-            BoundsInt changed = Layers.ApplySphereBrush(centerVoxel, radiusVoxels, strength, build);
+            BoundsInt changed = Layers.ApplySphereBrush(centerVoxel, radiusVoxels, strength, build,
+                settings.isoLevel, Materials, materialId);
             InvalidateRegion(changed);
         }
 

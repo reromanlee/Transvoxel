@@ -60,6 +60,20 @@ namespace reromanlee.Transvoxel
         public int LayerCount => Mathf.Min(layers.Count, MaxLayers);
 
         /// <summary>
+        /// Appends a layer from code (runtime-built palettes, tools); its material id is
+        /// the returned index. Editing existing <see cref="Layers"/> entries is fine too —
+        /// call <see cref="NotifyChanged"/> once after a batch of changes.
+        /// </summary>
+        public int AddLayer(Layer layer)
+        {
+            if (layers.Count >= MaxLayers)
+                throw new InvalidOperationException($"A palette holds at most {MaxLayers} layers.");
+            layers.Add(layer);
+            NotifyChanged();
+            return layers.Count - 1;
+        }
+
+        /// <summary>
         /// Raised whenever the palette changes so a running terrain can rebake the texture
         /// array and refresh the shader uniforms live — no chunk is ever rebuilt for it.
         /// Fired by <see cref="OnValidate"/> on Inspector edits; call
