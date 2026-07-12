@@ -594,11 +594,14 @@ namespace reromanlee.Transvoxel
 
         /// <summary>
         /// A fingerprint of every setting that requires rebuilding the octree/density/meshing
-        /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/> and
-        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> are deliberately excluded — they only
-        /// feed shader globals and the fade LUT, so editing them refreshes those in place
-        /// instead of tearing down the whole scene. Keep this in sync when adding settings that
-        /// affect geometry.
+        /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/>,
+        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> and
+        /// <see cref="TransvoxelSettings.materialBlendSharpness"/> are deliberately excluded —
+        /// they only feed shader globals and the fade LUT, so editing them refreshes those in
+        /// place instead of tearing down the whole scene. The material palette counts only by
+        /// identity: swapping the asset re-meshes (vertices carry blend data), while edits
+        /// inside it just re-bind textures and uniforms. Keep this in sync when adding
+        /// settings that affect geometry.
         /// </summary>
         string ComputeStructuralKey()
         {
@@ -607,6 +610,7 @@ namespace reromanlee.Transvoxel
                 settings.lodSplitFactor, settings.isoLevel, settings.smoothShading,
                 settings.material != null ? settings.material.GetEntityId().ToString() : "0", settings.uvScale,
                 settings.colorizeLods, settings.chunkFadeInSeconds,
+                settings.materialPalette != null ? settings.materialPalette.GetEntityId().ToString() : "0",
                 JsonUtility.ToJson(settings.noise),
                 (int)settings.meshingBackend,
                 settings.gpuComputeOverride != null ? settings.gpuComputeOverride.GetEntityId().ToString() : "0",
