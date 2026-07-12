@@ -262,23 +262,25 @@ namespace reromanlee.Transvoxel.Meshing
                 (samples.MinVoxel.x + position.x) * voxelSize * uvScale,
                 (samples.MinVoxel.z + position.z) * voxelSize * uvScale));
             if (materials != null)
-                output.MaterialIds.Add(SolidLocationMaterial(cx, cy, l0, l1, d0));
+                output.MaterialIds.Add(VertexMaterial(cx, cy, l0, l1, d0, d1));
             return index;
         }
 
         /// <summary>
-        /// Material id of the sample location inside solid ground (d &lt; 0; zero counts as
-        /// air) — the same solid-corner rule as <see cref="TransvoxelMesher"/>, evaluated on
-        /// the face lattice. Every location, half-res corners included, sits on an integer
-        /// voxel, and coincident vertices across the seam resolve to the same voxel, so
-        /// material ids line up across LOD borders exactly like positions do.
+        /// Material id shown at this vertex — the same anchor rule as
+        /// <see cref="TransvoxelMesher.VertexMaterial"/>, evaluated on the face lattice:
+        /// the solid sample location (d &lt; 0; zero counts as air), except a vertex exactly
+        /// on a location (d == 0) anchors to that location itself. Every location, half-res
+        /// corners included, sits on an integer voxel, and coincident vertices across the
+        /// seam resolve to the same voxel, so material ids line up across LOD borders
+        /// exactly like positions do.
         /// </summary>
-        byte SolidLocationMaterial(int cx, int cy, int l0, int l1, float d0)
+        byte VertexMaterial(int cx, int cy, int l0, int l1, float d0, float d1)
         {
-            int solid = d0 < 0f ? l0 : l1;
+            int anchor = d0 == 0f ? l0 : d1 == 0f ? l1 : d0 < 0f ? l0 : l1;
             var voxel = Vector3Int.zero;
-            voxel[axisU] = (2 * cx + LocU[solid]) * fineStep;
-            voxel[axisV] = (2 * cy + LocV[solid]) * fineStep;
+            voxel[axisU] = (2 * cx + LocU[anchor]) * fineStep;
+            voxel[axisV] = (2 * cy + LocV[anchor]) * fineStep;
             voxel[axisN] = planeLocal;
             voxel += samples.MinVoxel;
             return materials.SampleMaterial(voxel.x, voxel.y, voxel.z);

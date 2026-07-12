@@ -429,9 +429,12 @@ TVertex MakeRegularVertex(int3 cell, int v0, int v1, float d0, float d1)
 
     float material = 0.0;
 #if defined(TRANSVOXEL_MATERIALS)
-    // Material of the solid endpoint (d < 0; zero counts as air) — the voxel this vertex
-    // is the surface of, exactly like TransvoxelMesher.SolidCornerMaterial.
-    material = (float)SampleMaterialId(MinVoxel() + (cell + (d0 < 0.0 ? c0 : c1)) * _LodStep);
+    // TransvoxelMesher.VertexMaterial: the solid endpoint (d < 0; zero counts as air),
+    // except an exactly-on-corner vertex (d == 0) anchors to that corner itself — the
+    // choice must be a pure function of the vertex's lattice position, or coincident
+    // vertices from other cells, meshers or chunks could disagree on the id.
+    int3 anchor = d0 == 0.0 ? c0 : (d1 == 0.0 ? c1 : (d0 < 0.0 ? c0 : c1));
+    material = (float)SampleMaterialId(MinVoxel() + (cell + anchor) * _LodStep);
 #endif
 
     position = ApplySecondaryShift(position, normal);
@@ -557,10 +560,12 @@ TVertex MakeTransitionVertex(int cx, int cy, int l0, int l1, float d0, float d1)
 
     float material = 0.0;
 #if defined(TRANSVOXEL_MATERIALS)
-    // Solid endpoint on the face lattice — every location sits on an integer voxel, so
-    // ids match the finer neighbour's across the seam (TransvoxelTransitionMesher rule).
+    // TransvoxelTransitionMesher.VertexMaterial on the face lattice: solid endpoint,
+    // except exactly-on-location vertices (d == 0) anchor to that location itself. Every
+    // location sits on an integer voxel, so ids match the finer neighbour's across seams.
+    bool useFirst = d0 == 0.0 || (d1 != 0.0 && d0 < 0.0);
     material = (float)SampleMaterialId(MinVoxel()
-        + FineLocal(d0 < 0.0 ? fu0 : fu1, d0 < 0.0 ? fv0 : fv1));
+        + FineLocal(useFirst ? fu0 : fu1, useFirst ? fv0 : fv1));
 #endif
 
     if (halfRes)

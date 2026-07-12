@@ -194,26 +194,29 @@ namespace reromanlee.Transvoxel.Meshing
             position = TransvoxelGeometry.ApplySecondaryShift(position, normal, samples.TransitionMask,
                 samples.ChunkCells, step);
 
-            return EmitVertex(position, normal, SolidCornerMaterial(x, y, z, v0, v1, d0));
+            return EmitVertex(position, normal, VertexMaterial(x, y, z, v0, v1, d0, d1));
         }
 
         /// <summary>
-        /// Material id of the edge endpoint inside solid ground — the voxel this vertex is
-        /// the surface of. Exactly one endpoint of an active edge is solid (d &lt; 0; zero
-        /// counts as air, matching the case-code classification), so the vertex, and with
-        /// it the surface, always shows the material of the ground it wraps.
+        /// Material id shown at this vertex. Normally the edge endpoint inside solid ground
+        /// (d &lt; 0; zero counts as air, matching the case-code classification) — the voxel
+        /// the vertex is the surface of. A vertex sitting EXACTLY on a corner (d == 0) is
+        /// shared by several converging edges whose solid endpoints are different voxels,
+        /// so it anchors to that corner voxel instead: a rule both meshers, every chunk and
+        /// the GPU kernels derive identically from the vertex's own lattice position —
+        /// otherwise material ids could disagree at shared positions and tear color seams.
         /// </summary>
-        byte SolidCornerMaterial(int x, int y, int z, int v0, int v1, float d0)
+        byte VertexMaterial(int x, int y, int z, int v0, int v1, float d0, float d1)
         {
             if (materials == null)
                 return 0;
-            int solid = d0 < 0f ? v0 : v1;
+            int anchor = d0 == 0f ? v0 : d1 == 0f ? v1 : d0 < 0f ? v0 : v1;
             int step = samples.LodStep;
             Vector3Int min = samples.MinVoxel;
             return materials.SampleMaterial(
-                min.x + (x + (solid & 1)) * step,
-                min.y + (y + ((solid >> 1) & 1)) * step,
-                min.z + (z + ((solid >> 2) & 1)) * step);
+                min.x + (x + (anchor & 1)) * step,
+                min.y + (y + ((anchor >> 1) & 1)) * step,
+                min.z + (z + ((anchor >> 2) & 1)) * step);
         }
 
         int EmitVertex(Vector3 positionVoxels, Vector3 normal, byte materialId)
