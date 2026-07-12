@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using reromanlee.Transvoxel.Density;
 using UnityEngine;
 
 namespace reromanlee.Transvoxel.Meshing
@@ -27,14 +28,16 @@ namespace reromanlee.Transvoxel.Meshing
 
         ChunkSamples samples;
         MeshBuffers output;
+        IVoxelMaterialSource materials;
         float voxelSize;
         float uvScale;
 
         public void GenerateRegularMesh(ChunkSamples chunkSamples, float voxelSizeMeters, float uvScaleFactor,
-            MeshBuffers meshOutput)
+            MeshBuffers meshOutput, IVoxelMaterialSource materialSource = null)
         {
             samples = chunkSamples;
             output = meshOutput;
+            materials = materialSource;
             voxelSize = voxelSizeMeters;
             uvScale = uvScaleFactor;
 
@@ -58,6 +61,7 @@ namespace reromanlee.Transvoxel.Meshing
 
             samples = null;
             output = null;
+            materials = null;
         }
 
         void ProcessCell(int x, int y, int z)
@@ -190,10 +194,29 @@ namespace reromanlee.Transvoxel.Meshing
             position = TransvoxelGeometry.ApplySecondaryShift(position, normal, samples.TransitionMask,
                 samples.ChunkCells, step);
 
-            return EmitVertex(position, normal);
+            return EmitVertex(position, normal, SolidCornerMaterial(x, y, z, v0, v1, d0));
         }
 
-        int EmitVertex(Vector3 positionVoxels, Vector3 normal)
+        /// <summary>
+        /// Material id of the edge endpoint inside solid ground — the voxel this vertex is
+        /// the surface of. Exactly one endpoint of an active edge is solid (d &lt; 0; zero
+        /// counts as air, matching the case-code classification), so the vertex, and with
+        /// it the surface, always shows the material of the ground it wraps.
+        /// </summary>
+        byte SolidCornerMaterial(int x, int y, int z, int v0, int v1, float d0)
+        {
+            if (materials == null)
+                return 0;
+            int solid = d0 < 0f ? v0 : v1;
+            int step = samples.LodStep;
+            Vector3Int min = samples.MinVoxel;
+            return materials.SampleMaterial(
+                min.x + (x + (solid & 1)) * step,
+                min.y + (y + ((solid >> 1) & 1)) * step,
+                min.z + (z + ((solid >> 2) & 1)) * step);
+        }
+
+        int EmitVertex(Vector3 positionVoxels, Vector3 normal, byte materialId)
         {
             int index = output.Vertices.Count;
             output.Vertices.Add(positionVoxels * voxelSize);
@@ -201,6 +224,8 @@ namespace reromanlee.Transvoxel.Meshing
             output.Uvs.Add(new Vector2(
                 (samples.MinVoxel.x + positionVoxels.x) * voxelSize * uvScale,
                 (samples.MinVoxel.z + positionVoxels.z) * voxelSize * uvScale));
+            if (materials != null)
+                output.MaterialIds.Add(materialId);
             return index;
         }
     }

@@ -47,6 +47,15 @@ namespace reromanlee.Transvoxel
         /// <summary>The default two-layer density stack (edits over procedural). Null if overridden.</summary>
         public LayeredDensitySource Layers { get; private set; }
 
+        /// <summary>
+        /// Which palette material each voxel is made of (id 0 everywhere until something
+        /// paints it). Written by <see cref="Terraform(Vector3, float, float, bool, byte)"/>;
+        /// custom painting code may write it directly — call <see cref="InvalidateRegion"/>
+        /// afterwards. Only sampled while <see cref="TransvoxelSettings.materialPalette"/>
+        /// is assigned, but the data survives palette swaps and settings rebuilds.
+        /// </summary>
+        public VoxelMaterialLayer Materials { get; private set; } = new VoxelMaterialLayer();
+
         /// <summary>The backend actually in use (GPU requests fall back to CPU when unsupported).</summary>
         public MeshingBackend ActiveBackend { get; private set; }
 
@@ -67,6 +76,7 @@ namespace reromanlee.Transvoxel
         {
             public BuildQueue Queue;
             public IDensitySource Density;
+            public IVoxelMaterialSource Materials; // null = no palette, meshes carry no blend data
             public SampleCache Cache;
             public int Cells;
             public float Iso;
@@ -345,6 +355,10 @@ namespace reromanlee.Transvoxel
             return settings.meshingBackend;
         }
 
+        /// <summary>Materials are meshed only with a non-empty palette to blend them with.</summary>
+        bool MaterialsActive =>
+            settings.materialPalette != null && settings.materialPalette.LayerCount > 0;
+
         void StartCpuWorkers()
         {
             workerCancellation = new CancellationTokenSource();
@@ -352,6 +366,7 @@ namespace reromanlee.Transvoxel
             {
                 Queue = buildQueue,
                 Density = density,
+                Materials = MaterialsActive ? Materials : null,
                 Cache = cache,
                 Cells = settings.chunkCells,
                 Iso = settings.isoLevel,
@@ -398,12 +413,13 @@ namespace reromanlee.Transvoxel
                         meshers = new MesherPair();
                     try
                     {
-                        meshers.Regular.GenerateRegularMesh(samples, context.VoxelSize, context.UvScale, buffers);
+                        meshers.Regular.GenerateRegularMesh(samples, context.VoxelSize, context.UvScale, buffers,
+                            context.Materials);
                         for (int f = 0; f < 6; f++)
                         {
                             if ((job.Mask & (1 << f)) != 0)
                                 meshers.Transition.GenerateTransitionMesh(samples, (CubeFace)f, context.Density,
-                                    context.VoxelSize, context.UvScale, buffers);
+                                    context.VoxelSize, context.UvScale, buffers, context.Materials);
                         }
                         if (!job.SmoothShading)
                             buffers.ConvertToFlatShaded();
