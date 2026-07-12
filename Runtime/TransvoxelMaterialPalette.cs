@@ -169,6 +169,10 @@ namespace reromanlee.Transvoxel
             Texture2D first = sources[0];
             foreach (Texture2D source in sources)
             {
+                // Crunched formats are CPU-side containers Graphics.CopyTexture cannot
+                // read — those palettes go through the blit path instead.
+                if (GraphicsFormatUtility.IsCrunchFormat(source.format))
+                    return false;
                 if (source.width != first.width || source.height != first.height
                     || source.graphicsFormat != first.graphicsFormat
                     || source.mipmapCount != first.mipmapCount)
@@ -181,8 +185,14 @@ namespace reromanlee.Transvoxel
         static Texture2DArray BakeByCopy(Texture2D[] sources)
         {
             Texture2D first = sources[0];
+            // The MipChain flag is what allocates the mip levels — without it the mipCount
+            // argument is ignored, the array gets a single level, and every CopyTexture of
+            // a mipmapped source is rejected ("mismatching mip counts").
+            TextureCreationFlags flags = first.mipmapCount > 1
+                ? TextureCreationFlags.MipChain
+                : TextureCreationFlags.None;
             var array = new Texture2DArray(first.width, first.height, sources.Length,
-                first.graphicsFormat, TextureCreationFlags.None, first.mipmapCount);
+                first.graphicsFormat, flags, first.mipmapCount);
             for (int i = 0; i < sources.Length; i++)
                 Graphics.CopyTexture(sources[i], 0, array, i);
             return array;
