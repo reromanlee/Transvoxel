@@ -41,6 +41,7 @@ namespace reromanlee.Transvoxel.Meshing
         ChunkSamples samples;
         MeshBuffers output;
         IDensitySource source;
+        IVoxelMaterialSource materials;
         float voxelSize;
         float uvScale;
         float[] sheet;
@@ -55,7 +56,8 @@ namespace reromanlee.Transvoxel.Meshing
         int cellsPerRow;
 
         public void GenerateTransitionMesh(ChunkSamples chunkSamples, CubeFace face, IDensitySource densitySource,
-            float voxelSizeMeters, float uvScaleFactor, MeshBuffers meshOutput)
+            float voxelSizeMeters, float uvScaleFactor, MeshBuffers meshOutput,
+            IVoxelMaterialSource materialSource = null)
         {
             sheet = chunkSamples.FaceSheets[(int)face];
             if (sheet == null || chunkSamples.Key.Lod == 0)
@@ -64,6 +66,7 @@ namespace reromanlee.Transvoxel.Meshing
             samples = chunkSamples;
             source = densitySource;
             output = meshOutput;
+            materials = materialSource;
             voxelSize = voxelSizeMeters;
             uvScale = uvScaleFactor;
 
@@ -110,6 +113,7 @@ namespace reromanlee.Transvoxel.Meshing
             samples = null;
             output = null;
             source = null;
+            materials = null;
             sheet = null;
         }
 
@@ -257,7 +261,29 @@ namespace reromanlee.Transvoxel.Meshing
             output.Uvs.Add(new Vector2(
                 (samples.MinVoxel.x + position.x) * voxelSize * uvScale,
                 (samples.MinVoxel.z + position.z) * voxelSize * uvScale));
+            if (materials != null)
+                output.MaterialIds.Add(VertexMaterial(cx, cy, l0, l1, d0, d1));
             return index;
+        }
+
+        /// <summary>
+        /// Material id shown at this vertex — the same anchor rule as
+        /// <see cref="TransvoxelMesher.VertexMaterial"/>, evaluated on the face lattice:
+        /// the solid sample location (d &lt; 0; zero counts as air), except a vertex exactly
+        /// on a location (d == 0) anchors to that location itself. Every location, half-res
+        /// corners included, sits on an integer voxel, and coincident vertices across the
+        /// seam resolve to the same voxel, so material ids line up across LOD borders
+        /// exactly like positions do.
+        /// </summary>
+        byte VertexMaterial(int cx, int cy, int l0, int l1, float d0, float d1)
+        {
+            int anchor = d0 == 0f ? l0 : d1 == 0f ? l1 : d0 < 0f ? l0 : l1;
+            var voxel = Vector3Int.zero;
+            voxel[axisU] = (2 * cx + LocU[anchor]) * fineStep;
+            voxel[axisV] = (2 * cy + LocV[anchor]) * fineStep;
+            voxel[axisN] = planeLocal;
+            voxel += samples.MinVoxel;
+            return materials.SampleMaterial(voxel.x, voxel.y, voxel.z);
         }
 
         /// <summary>Chunk-local position of a sample location, in voxel units.</summary>

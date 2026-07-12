@@ -114,6 +114,10 @@ namespace reromanlee.Transvoxel
                 mesh.SetVertices(buffers.Vertices);
                 mesh.SetNormals(buffers.Normals);
                 mesh.SetUVs(0, buffers.Uvs);
+                // Material blend rides the color channel (present only with a palette);
+                // like the fade UV2 it is mesh data, so it reaches every render path.
+                if (buffers.MaterialBlend.Count > 0)
+                    mesh.SetColors(buffers.MaterialBlend);
                 if (fadeSeconds > 0f)
                     WriteFadeData(fadeSeconds);
                 mesh.SetTriangles(buffers.Indices, 0, calculateBounds: true);

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace reromanlee.Transvoxel.Density
@@ -30,8 +31,16 @@ namespace reromanlee.Transvoxel.Density
         /// sphere, blending softly at the rim. Coordinates are in LOD0 voxel units.
         /// Returns the axis-aligned voxel region that changed so callers can rebuild
         /// exactly the chunks that overlap it.
+        ///
+        /// With a <paramref name="materials"/> layer, build strokes also stamp
+        /// <paramref name="materialId"/> onto every voxel inside the brush that ends up
+        /// solid (above <paramref name="isoLevel"/>) — new ground is made of the selected
+        /// material, and overlapping existing ground repaints it, so the whole blob reads
+        /// as one substance. Dig strokes never touch materials: ids under a crater stay
+        /// stored, invisible until something solid shows them again.
         /// </summary>
-        public BoundsInt ApplySphereBrush(Vector3 centerVoxel, float radiusVoxels, float strength, bool build)
+        public BoundsInt ApplySphereBrush(Vector3 centerVoxel, float radiusVoxels, float strength, bool build,
+            float isoLevel = 0.5f, VoxelMaterialLayer materials = null, byte materialId = 0)
         {
             int min = Mathf.FloorToInt(-radiusVoxels) - 1;
             int max = Mathf.CeilToInt(radiusVoxels) + 1;
@@ -43,6 +52,7 @@ namespace reromanlee.Transvoxel.Density
 
             // Soft rim: full effect inside (radius - blend), fading to zero at the surface.
             float blend = Mathf.Max(1.5f, radiusVoxels * 0.4f);
+            List<Vector3Int> painted = materials != null && build ? new List<Vector3Int>() : null;
 
             Edits.WriteBatch(set =>
             {
@@ -59,9 +69,21 @@ namespace reromanlee.Transvoxel.Density
                     float target = build
                         ? current + strength * influence
                         : current - strength * influence;
-                    set(vx, vy, vz, Mathf.Clamp01(target));
+                    target = Mathf.Clamp01(target);
+                    set(vx, vy, vz, target);
+                    if (painted != null && target > isoLevel)
+                        painted.Add(new Vector3Int(vx, vy, vz));
                 }
             });
+
+            if (painted != null && painted.Count > 0)
+            {
+                materials.WriteBatch(set =>
+                {
+                    foreach (Vector3Int voxel in painted)
+                        set(voxel.x, voxel.y, voxel.z, materialId);
+                });
+            }
 
             return new BoundsInt(minVoxel, size);
         }

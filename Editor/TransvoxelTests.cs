@@ -535,5 +535,281 @@ namespace reromanlee.Transvoxel.Editor.Tests
             Assert.AreEqual(1, results.Count);
             Assert.AreEqual(value, results[0].data[0], 1e-6f, "voxel (0,0,0) is brick index 0");
         }
+
+        // ------------------------------------------------------------------ voxel materials
+
+        static void PaintBall(VoxelMaterialLayer materials, Vector3 center, float radius, byte id)
+        {
+            materials.WriteBatch(set =>
+            {
+                for (int z = Mathf.FloorToInt(center.z - radius); z <= Mathf.CeilToInt(center.z + radius); z++)
+                for (int y = Mathf.FloorToInt(center.y - radius); y <= Mathf.CeilToInt(center.y + radius); y++)
+                for (int x = Mathf.FloorToInt(center.x - radius); x <= Mathf.CeilToInt(center.x + radius); x++)
+                {
+                    if (Vector3.Distance(new Vector3(x, y, z), center) <= radius)
+                        set(x, y, z, id);
+                }
+            });
+        }
+
+        static MeshBuffers BuildChunkWithMaterials(IDensitySource source, IVoxelMaterialSource materials,
+            NodeKey key, byte mask)
+        {
+            const int cells = 16;
+            var samples = ChunkSamples.Sample(source, key, cells, 0.5f, mask);
+            var buffers = new MeshBuffers();
+            new TransvoxelMesher().GenerateRegularMesh(samples, 1f, 0.1f, buffers, materials);
+            var transition = new TransvoxelTransitionMesher();
+            for (int f = 0; f < 6; f++)
+                if ((mask & (1 << f)) != 0)
+                    transition.GenerateTransitionMesh(samples, (CubeFace)f, source, 1f, 0.1f, buffers, materials);
+            var encoder = MaterialBlendEncoder.Rent();
+            encoder.Encode(buffers);
+            MaterialBlendEncoder.Return(encoder);
+            return buffers;
+        }
+
+        /// <summary>
+        /// Every structural invariant of the blend attribute: one entry per vertex, all
+        /// three vertices of a triangle carry the same SORTED id triple, the alpha corner
+        /// points at this vertex's own id inside it, and the triple really is the sorted
+        /// multiset of the triangle's corner ids.
+        /// </summary>
+        static void AssertBlendEncoding(MeshBuffers buffers)
+        {
+            Assert.AreEqual(buffers.Vertices.Count, buffers.MaterialIds.Count, "id per vertex");
+            Assert.AreEqual(buffers.Vertices.Count, buffers.MaterialBlend.Count, "blend per vertex");
+
+            for (int t = 0; t < buffers.Indices.Count; t += 3)
+            {
+                int i0 = buffers.Indices[t], i1 = buffers.Indices[t + 1], i2 = buffers.Indices[t + 2];
+                Color32 b0 = buffers.MaterialBlend[i0];
+                Color32 b1 = buffers.MaterialBlend[i1];
+                Color32 b2 = buffers.MaterialBlend[i2];
+
+                Assert.IsTrue(b0.r == b1.r && b1.r == b2.r
+                           && b0.g == b1.g && b1.g == b2.g
+                           && b0.b == b1.b && b1.b == b2.b, "triangle vertices disagree on the id triple");
+                Assert.IsTrue(b0.r <= b0.g && b0.g <= b0.b, "id triple not sorted");
+
+                var sorted = new List<byte>
+                {
+                    buffers.MaterialIds[i0], buffers.MaterialIds[i1], buffers.MaterialIds[i2],
+                };
+                sorted.Sort();
+                Assert.IsTrue(sorted[0] == b0.r && sorted[1] == b0.g && sorted[2] == b0.b,
+                    "triple is not the sorted corner ids");
+
+                foreach (int index in new[] { i0, i1, i2 })
+                {
+                    Color32 blend = buffers.MaterialBlend[index];
+                    Assert.Less(blend.a, 3, "corner index out of range");
+                    byte slotId = blend.a == 0 ? blend.r : blend.a == 1 ? blend.g : blend.b;
+                    Assert.AreEqual(buffers.MaterialIds[index], slotId,
+                        "corner does not point at the vertex's own id");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Coincident vertices — across chunk borders, LOD seams and both meshers — must
+        /// carry the same material id: the id is a pure function of the voxel lattice, so
+        /// any disagreement would show as a color seam exactly on a chunk border.
+        /// </summary>
+        static void AssertMaterialSeamConsistency(MeshBuffers buffers, Vector3 offset,
+            Dictionary<(long, long, long), byte> seen)
+        {
+            const float quantum = 16384f;
+            for (int i = 0; i < buffers.Vertices.Count; i++)
+            {
+                Vector3 w = offset + buffers.Vertices[i];
+                var key = ((long)Math.Round(w.x * quantum), (long)Math.Round(w.y * quantum),
+                    (long)Math.Round(w.z * quantum));
+                byte id = buffers.MaterialIds[i];
+                if (seen.TryGetValue(key, out byte existing))
+                    Assert.AreEqual(existing, id, $"material id differs at shared position {w}");
+                else
+                    seen.Add(key, id);
+            }
+        }
+
+        [Test]
+        public void MaterialLayer_SparseDefaultsAndCopyOnWrite()
+        {
+            var materials = new VoxelMaterialLayer();
+            Assert.AreEqual(0, materials.SampleMaterial(5, -3, 900), "unpainted voxel not default");
+            Assert.AreEqual(0, materials.BrickCount);
+
+            materials.WriteBatch(set => set(1, 2, 3, 7));
+            Assert.AreEqual(7, materials.SampleMaterial(1, 2, 3));
+            Assert.AreEqual(0, materials.SampleMaterial(1, 2, 4), "neighbour voxel leaked the id");
+            Assert.AreEqual(1, materials.BrickCount);
+
+            // Writing the default id into untracked space must not allocate bricks.
+            materials.WriteBatch(set => set(400, 400, 400, 0));
+            Assert.AreEqual(1, materials.BrickCount, "a default-id write allocated a brick");
+
+            // Negative coordinates land in their own brick, not a mirrored one.
+            materials.WriteBatch(set => set(-1, 0, 0, 9));
+            Assert.AreEqual(9, materials.SampleMaterial(-1, 0, 0));
+            Assert.AreEqual(0, materials.SampleMaterial(15, 0, 0));
+        }
+
+        [Test]
+        public void PaintedSphere_MaterialSeamsConsistentAndWatertight()
+        {
+            var sphere = new SphereDensity { Center = new Vector3(16, 16, 16), Radius = 9f };
+            var materials = new VoxelMaterialLayer();
+            // A painted cap crossing the surface and all four upper chunk borders.
+            PaintBall(materials, new Vector3(16, 25, 16), 6f, 3);
+
+            var union = new MeshUnion();
+            var seen = new Dictionary<(long, long, long), byte>();
+            bool sawPainted = false, sawDefault = false, sawMixedTriangle = false;
+
+            for (int z = 0; z < 2; z++)
+            for (int y = 0; y < 2; y++)
+            for (int x = 0; x < 2; x++)
+            {
+                var key = new NodeKey(0, new Vector3Int(x, y, z));
+                MeshBuffers buffers = BuildChunkWithMaterials(sphere, materials, key, 0);
+                AssertBlendEncoding(buffers);
+                AssertMaterialSeamConsistency(buffers, WorldOffset(key), seen);
+                union.Add(buffers, WorldOffset(key));
+
+                foreach (byte id in buffers.MaterialIds)
+                {
+                    sawPainted |= id == 3;
+                    sawDefault |= id == 0;
+                }
+                foreach (Color32 blend in buffers.MaterialBlend)
+                    sawMixedTriangle |= blend.r != blend.b;
+            }
+
+            Assert.IsTrue(sawPainted && sawDefault, "paint did not cross the surface");
+            Assert.IsTrue(sawMixedTriangle, "no triangle blends the two materials");
+
+            // Splits duplicate vertices only along the paint boundary; the quantized union
+            // merges them back, so watertightness proves the encoder broke no geometry.
+            int bad = union.UnmatchedEdges(out int total);
+            Assert.AreEqual(0, bad, $"encoded mesh leaks ({bad}/{total} bad edges)");
+            double volume = union.SignedVolume6() / 6.0;
+            double expected = 4.0 / 3.0 * Math.PI * Math.Pow(9, 3);
+            Assert.Less(Math.Abs(volume - expected) / expected, 0.1, "volume off");
+        }
+
+        [TestCase(CubeFace.NegX)]
+        [TestCase(CubeFace.PosX)]
+        [TestCase(CubeFace.NegY)]
+        [TestCase(CubeFace.PosY)]
+        [TestCase(CubeFace.NegZ)]
+        [TestCase(CubeFace.PosZ)]
+        public void TransitionSeam_MaterialIdsMatchAcrossLod(CubeFace face)
+        {
+            int axis = face.Axis();
+            var coarseKey = new NodeKey(1, Vector3Int.zero);
+            byte coarseMask = (byte)face.Bit();
+
+            float plane = face.IsPositive() ? 32f : 0f;
+            int fineAxisCoord = face.IsPositive() ? 2 : -1;
+
+            var center = new Vector3(16, 16, 16);
+            center[axis] = plane;
+            var sphere = new SphereDensity { Center = center, Radius = 10f };
+
+            // Paint one hemisphere-sized ball straddling the seam plane, so both the coarse
+            // chunk (regular + transition meshers) and the fine chunks sample it.
+            var materials = new VoxelMaterialLayer();
+            PaintBall(materials, center + new Vector3(2f, 3f, 1f), 7f, 5);
+
+            var union = new MeshUnion();
+            var seen = new Dictionary<(long, long, long), byte>();
+
+            MeshBuffers coarse = BuildChunkWithMaterials(sphere, materials, coarseKey, coarseMask);
+            AssertBlendEncoding(coarse);
+            AssertMaterialSeamConsistency(coarse, WorldOffset(coarseKey), seen);
+            union.Add(coarse, WorldOffset(coarseKey));
+
+            for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++)
+            {
+                var coord = Vector3Int.zero;
+                coord[axis] = fineAxisCoord;
+                coord[(axis + 1) % 3] = i;
+                coord[(axis + 2) % 3] = j;
+                var key = new NodeKey(0, coord);
+                MeshBuffers fine = BuildChunkWithMaterials(sphere, materials, key, 0);
+                AssertBlendEncoding(fine);
+                AssertMaterialSeamConsistency(fine, WorldOffset(key), seen);
+                union.Add(fine, WorldOffset(key));
+            }
+
+            int bad = union.UnmatchedEdges(out int total);
+            Assert.AreEqual(0, bad, $"LOD seam leaks with materials ({bad}/{total} bad edges)");
+        }
+
+        [Test]
+        public void BlendEncoder_UniformChunkSharesEveryVertex()
+        {
+            var sphere = new SphereDensity { Center = new Vector3(8, 8, 8), Radius = 5.5f };
+            var key = new NodeKey(0, Vector3Int.zero);
+
+            MeshBuffers plain = BuildChunk(sphere, key, 0);
+            MeshBuffers painted = BuildChunkWithMaterials(sphere, new VoxelMaterialLayer(), key, 0);
+
+            // An unpainted chunk (every id 0) must not split a single vertex.
+            Assert.AreEqual(plain.Vertices.Count, painted.Vertices.Count,
+                "uniform material chunk grew extra vertices");
+            AssertBlendEncoding(painted);
+            foreach (Color32 blend in painted.MaterialBlend)
+                Assert.IsTrue(blend.r == 0 && blend.g == 0 && blend.b == 0, "uniform triple not id 0");
+        }
+
+        [Test]
+        public void SphereBrush_PaintsOnlySolidVoxelsOnBuild()
+        {
+            var edits = new VoxelEditLayer();
+            var materials = new VoxelMaterialLayer();
+            var layered = new LayeredDensitySource(new FlatGround(), edits);
+
+            layered.ApplySphereBrush(new Vector3(0, 2, 0), 4f, 1f, build: true,
+                isoLevel: 0.5f, materials: materials, materialId: 2);
+
+            Assert.Greater(layered.SampleVoxel(0, 2, 0), 0.5f, "build stroke left the center airy");
+            Assert.AreEqual(2, materials.SampleMaterial(0, 2, 0), "solid center not painted");
+            Assert.AreEqual(0, materials.SampleMaterial(0, 8, 0), "air above the blob painted");
+
+            // Digging must not erase paint: ids stay stored under the crater.
+            layered.ApplySphereBrush(new Vector3(0, 2, 0), 3f, 1f, build: false,
+                isoLevel: 0.5f, materials: materials, materialId: 0);
+            Assert.AreEqual(2, materials.SampleMaterial(0, 2, 0), "dig stroke erased stored paint");
+        }
+
+        /// <summary>
+        /// The C# packing in GpuChunkBuilder (4 ids per uint, little-endian bytes) must
+        /// invert exactly through the kernel's unpack expression
+        /// <c>(packed &gt;&gt; ((idx &amp; 3) * 8)) &amp; 0xFF</c>.
+        /// </summary>
+        [Test]
+        public void GpuMaterialBrickPacking_RoundTrips()
+        {
+            var random = new System.Random(1234);
+            var ids = new byte[VoxelEditLayer.BrickVolume];
+            for (int i = 0; i < ids.Length; i++)
+                ids[i] = (byte)random.Next(0, 256);
+
+            var packed = new uint[VoxelEditLayer.BrickVolume / 4];
+            for (int i = 0; i < packed.Length; i++)
+            {
+                int b = i * 4;
+                packed[i] = (uint)(ids[b] | (ids[b + 1] << 8) | (ids[b + 2] << 16) | (ids[b + 3] << 24));
+            }
+
+            for (int idx = 0; idx < VoxelEditLayer.BrickVolume; idx++)
+            {
+                uint value = (packed[idx >> 2] >> ((idx & 3) * 8)) & 0xFF;
+                Assert.AreEqual(ids[idx], (byte)value, $"packing mismatch at voxel {idx}");
+            }
+        }
     }
 }

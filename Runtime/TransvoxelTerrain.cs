@@ -47,6 +47,15 @@ namespace reromanlee.Transvoxel
         /// <summary>The default two-layer density stack (edits over procedural). Null if overridden.</summary>
         public LayeredDensitySource Layers { get; private set; }
 
+        /// <summary>
+        /// Which palette material each voxel is made of (id 0 everywhere until something
+        /// paints it). Written by <see cref="Terraform(Vector3, float, float, bool, byte)"/>;
+        /// custom painting code may write it directly — call <see cref="InvalidateRegion"/>
+        /// afterwards. Only sampled while <see cref="TransvoxelSettings.materialPalette"/>
+        /// is assigned, but the data survives palette swaps and settings rebuilds.
+        /// </summary>
+        public VoxelMaterialLayer Materials { get; private set; } = new VoxelMaterialLayer();
+
         /// <summary>The backend actually in use (GPU requests fall back to CPU when unsupported).</summary>
         public MeshingBackend ActiveBackend { get; private set; }
 
@@ -67,6 +76,7 @@ namespace reromanlee.Transvoxel
         {
             public BuildQueue Queue;
             public IDensitySource Density;
+            public IVoxelMaterialSource Materials; // null = no palette, meshes carry no blend data
             public SampleCache Cache;
             public int Cells;
             public float Iso;
@@ -159,6 +169,30 @@ namespace reromanlee.Transvoxel
         static readonly int FadeAwareMarkerId = Shader.PropertyToID("_TransvoxelFadeAware");
         static readonly int EdgeFadeCurveId = Shader.PropertyToID("_TransvoxelEdgeFadeCurve");
 
+        // Material palette globals (like the fade inputs, never material properties — see
+        // the shader). One palette drives the whole scene; the keyword switches the shader
+        // between the palette blend and the classic _BaseMap path.
+        const string PaletteKeyword = "TRANSVOXEL_PALETTE";
+        static readonly int PaletteAwareMarkerId = Shader.PropertyToID("_TransvoxelPaletteAware");
+        static readonly int AlbedoArrayId = Shader.PropertyToID("_TransvoxelAlbedoArray");
+        static readonly int LayerColorsId = Shader.PropertyToID("_TransvoxelLayerColors");
+        static readonly int LayerScalesId = Shader.PropertyToID("_TransvoxelLayerScales");
+        static readonly int BlendSharpnessId = Shader.PropertyToID("_TransvoxelBlendSharpness");
+        static readonly int PaletteLayerCountId = Shader.PropertyToID("_TransvoxelPaletteLayerCount");
+
+        // Uniform arrays must always be uploaded at the full declared size: Unity fixes a
+        // shader array's length the first time it is set. Main thread only.
+        static readonly Vector4[] LayerColorScratch = new Vector4[TransvoxelMaterialPalette.MaxLayers];
+        static readonly Vector4[] LayerScaleScratch = new Vector4[TransvoxelMaterialPalette.MaxLayers];
+
+        // Whether chunks are built with material blend data: a non-empty palette is
+        // assigned AND the terrain material's shader can render it. Palette content edits
+        // only re-push the bindings; assigning/clearing the palette re-meshes the world
+        // (via the structural key) so every mesh matches the shader variant.
+        bool paletteActive;
+        TransvoxelMaterialPalette subscribedPalette;
+        bool paletteDirty;
+
         // The edgeFadeCurve is baked into a small LUT texture (curve.Evaluate can't run per
         // pixel) and pushed as a global so it reaches every render path, like the other fade
         // inputs. Rebaked on pipeline (re)build and on a fade-only settings edit.
@@ -191,6 +225,10 @@ namespace reromanlee.Transvoxel
             if (subscribedSettings != null)
                 subscribedSettings.Changed -= OnSettingsChanged;
             subscribedSettings = null;
+            if (subscribedPalette != null)
+                subscribedPalette.Changed -= OnPaletteChanged;
+            subscribedPalette = null;
+            Shader.DisableKeyword(PaletteKeyword);
             ClearScene();
             while (chunkViewPool.Count > 0)
                 chunkViewPool.Pop().Destroy();
@@ -271,11 +309,13 @@ namespace reromanlee.Transvoxel
                                  "the material to 'Transvoxel/Lit Dithered' or add the fade snippet from " +
                                  "the README to your shader.", this);
             WarnIfGpuResidentDrawerActive();
+            BindMaterialPalette();
 
             pipelineGeneration++;
             ActiveBackend = ResolveBackend(out ComputeShader gpuShader);
             if (ActiveBackend != MeshingBackend.CpuThreads)
-                gpuBuilder = new GpuChunkBuilder(gpuShader, settings, Layers.Edits);
+                gpuBuilder = new GpuChunkBuilder(gpuShader, settings, Layers.Edits,
+                    paletteActive ? Materials : null);
             if (ActiveBackend != MeshingBackend.GpuCompute)
                 StartCpuWorkers(); // CpuThreads and Hybrid: CPU workers pull the same queue
 
@@ -345,6 +385,56 @@ namespace reromanlee.Transvoxel
             return settings.meshingBackend;
         }
 
+        /// <summary>
+        /// Resolves whether the palette renders this pipeline, subscribes to its changes,
+        /// and pushes the shader bindings (texture array, per-layer uniforms, keyword).
+        /// Runs on every pipeline build; palette content edits re-run only the binding part
+        /// via <see cref="OnPaletteChanged"/> — no chunk is rebuilt for a texture tweak.
+        /// </summary>
+        void BindMaterialPalette()
+        {
+            TransvoxelMaterialPalette palette = settings.materialPalette;
+            if (!ReferenceEquals(subscribedPalette, palette))
+            {
+                if (subscribedPalette != null)
+                    subscribedPalette.Changed -= OnPaletteChanged;
+                if (palette != null)
+                    palette.Changed += OnPaletteChanged;
+                subscribedPalette = palette;
+            }
+
+            bool wantsPalette = palette != null && palette.LayerCount > 0;
+            paletteActive = wantsPalette && runtimeMaterial.HasProperty(PaletteAwareMarkerId);
+            if (wantsPalette && !paletteActive)
+                Debug.LogWarning("[Transvoxel] A material palette is assigned, but the terrain " +
+                                 $"material's shader ('{runtimeMaterial.shader.name}') has no " +
+                                 "_TransvoxelPaletteAware support — voxel materials are disabled. " +
+                                 "Switch the material to 'Transvoxel/Lit Dithered' (or leave the " +
+                                 "material empty to get it by default).", this);
+
+            if (paletteActive)
+            {
+                Shader.EnableKeyword(PaletteKeyword);
+                PushPaletteBindings();
+            }
+            else
+            {
+                Shader.DisableKeyword(PaletteKeyword);
+            }
+        }
+
+        void OnPaletteChanged() => paletteDirty = true;
+
+        void PushPaletteBindings()
+        {
+            TransvoxelMaterialPalette palette = settings.materialPalette;
+            Shader.SetGlobalTexture(AlbedoArrayId, palette.GetAlbedoArray());
+            palette.FillLayerUniforms(LayerColorScratch, LayerScaleScratch);
+            Shader.SetGlobalVectorArray(LayerColorsId, LayerColorScratch);
+            Shader.SetGlobalVectorArray(LayerScalesId, LayerScaleScratch);
+            Shader.SetGlobalFloat(PaletteLayerCountId, palette.LayerCount);
+        }
+
         void StartCpuWorkers()
         {
             workerCancellation = new CancellationTokenSource();
@@ -352,6 +442,7 @@ namespace reromanlee.Transvoxel
             {
                 Queue = buildQueue,
                 Density = density,
+                Materials = paletteActive ? Materials : null,
                 Cache = cache,
                 Cells = settings.chunkCells,
                 Iso = settings.isoLevel,
@@ -398,15 +489,28 @@ namespace reromanlee.Transvoxel
                         meshers = new MesherPair();
                     try
                     {
-                        meshers.Regular.GenerateRegularMesh(samples, context.VoxelSize, context.UvScale, buffers);
+                        meshers.Regular.GenerateRegularMesh(samples, context.VoxelSize, context.UvScale, buffers,
+                            context.Materials);
                         for (int f = 0; f < 6; f++)
                         {
                             if ((job.Mask & (1 << f)) != 0)
                                 meshers.Transition.GenerateTransitionMesh(samples, (CubeFace)f, context.Density,
-                                    context.VoxelSize, context.UvScale, buffers);
+                                    context.VoxelSize, context.UvScale, buffers, context.Materials);
                         }
                         if (!job.SmoothShading)
                             buffers.ConvertToFlatShaded();
+                        if (context.Materials != null)
+                        {
+                            var encoder = MaterialBlendEncoder.Rent();
+                            try
+                            {
+                                encoder.Encode(buffers);
+                            }
+                            finally
+                            {
+                                MaterialBlendEncoder.Return(encoder);
+                            }
+                        }
                     }
                     finally
                     {
@@ -528,6 +632,21 @@ namespace reromanlee.Transvoxel
                     ApplySettings();
             }
 
+            if (paletteDirty)
+            {
+                paletteDirty = false;
+                // Content edits (textures, tints) re-push the bindings live. Only an edit
+                // that empties or fills the whole palette changes whether meshes need blend
+                // data at all — that one rebuilds, like assigning a different palette would.
+                bool wantsPalette = settings.materialPalette != null
+                                    && settings.materialPalette.LayerCount > 0;
+                bool shouldBeActive = wantsPalette && runtimeMaterial.HasProperty(PaletteAwareMarkerId);
+                if (shouldBeActive != paletteActive)
+                    ApplySettings();
+                else if (paletteActive)
+                    PushPaletteBindings();
+            }
+
             DrainBakedColliders();
             DrainCompletedBuilds();
             ReleaseEditGroups();
@@ -556,6 +675,12 @@ namespace reromanlee.Transvoxel
             {
                 Shader.SetGlobalVector(ViewerPosId, viewer.position);
                 Shader.SetGlobalFloat(ViewDistanceId, settings.viewDistance);
+            }
+            if (paletteActive)
+            {
+                // Pushed every frame like the fade globals, so dragging the slider in the
+                // Inspector reshapes every material transition live — no rebuild, no remesh.
+                Shader.SetGlobalFloat(BlendSharpnessId, settings.materialBlendSharpness);
             }
 
             UpdateDyingChunks(Time.time, Mathf.Max(effectiveFadeSeconds, 1e-3f));
@@ -594,11 +719,14 @@ namespace reromanlee.Transvoxel
 
         /// <summary>
         /// A fingerprint of every setting that requires rebuilding the octree/density/meshing
-        /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/> and
-        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> are deliberately excluded — they only
-        /// feed shader globals and the fade LUT, so editing them refreshes those in place
-        /// instead of tearing down the whole scene. Keep this in sync when adding settings that
-        /// affect geometry.
+        /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/>,
+        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> and
+        /// <see cref="TransvoxelSettings.materialBlendSharpness"/> are deliberately excluded —
+        /// they only feed shader globals and the fade LUT, so editing them refreshes those in
+        /// place instead of tearing down the whole scene. The material palette counts only by
+        /// identity: swapping the asset re-meshes (vertices carry blend data), while edits
+        /// inside it just re-bind textures and uniforms. Keep this in sync when adding
+        /// settings that affect geometry.
         /// </summary>
         string ComputeStructuralKey()
         {
@@ -607,6 +735,7 @@ namespace reromanlee.Transvoxel
                 settings.lodSplitFactor, settings.isoLevel, settings.smoothShading,
                 settings.material != null ? settings.material.GetEntityId().ToString() : "0", settings.uvScale,
                 settings.colorizeLods, settings.chunkFadeInSeconds,
+                settings.materialPalette != null ? settings.materialPalette.GetEntityId().ToString() : "0",
                 JsonUtility.ToJson(settings.noise),
                 (int)settings.meshingBackend,
                 settings.gpuComputeOverride != null ? settings.gpuComputeOverride.GetEntityId().ToString() : "0",
@@ -1246,8 +1375,20 @@ namespace reromanlee.Transvoxel
         /// Digs (or with <paramref name="build"/> raises) a soft-edged sphere of terrain.
         /// Writes go to the player-edit layer; every affected chunk re-meshes in the
         /// background (at rush priority) and the whole set hot-swaps in a single frame.
+        /// Built ground is made of palette material 0.
         /// </summary>
         public void Terraform(Vector3 worldPosition, float radiusMeters, float strength, bool build)
+            => Terraform(worldPosition, radiusMeters, strength, build, 0);
+
+        /// <summary>
+        /// <see cref="Terraform(Vector3, float, float, bool)"/> with a palette material:
+        /// build strokes stamp <paramref name="materialId"/> onto every solid voxel the
+        /// brush touches, so new ground is made of — and existing ground inside the brush
+        /// repaints to — the selected material. Ids persist even while no palette is
+        /// assigned (they just render once one is). Dig strokes ignore the id.
+        /// </summary>
+        public void Terraform(Vector3 worldPosition, float radiusMeters, float strength, bool build,
+            byte materialId)
         {
             if (Layers == null)
             {
@@ -1257,7 +1398,8 @@ namespace reromanlee.Transvoxel
 
             Vector3 centerVoxel = transform.InverseTransformPoint(worldPosition) / settings.voxelSize;
             float radiusVoxels = radiusMeters / settings.voxelSize;
-            BoundsInt changed = Layers.ApplySphereBrush(centerVoxel, radiusVoxels, strength, build);
+            BoundsInt changed = Layers.ApplySphereBrush(centerVoxel, radiusVoxels, strength, build,
+                settings.isoLevel, Materials, materialId);
             InvalidateRegion(changed);
         }
 

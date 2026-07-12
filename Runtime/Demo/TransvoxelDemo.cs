@@ -22,6 +22,8 @@ namespace reromanlee.Transvoxel.Demo
 
         TransvoxelTerrain terrain;
         Camera demoCamera;
+        string[] materialNames;
+        int buildMaterial;
         float fps;
 #if ENABLE_LEGACY_INPUT_MANAGER
         float nextBrushTime;
@@ -87,6 +89,7 @@ namespace reromanlee.Transvoxel.Demo
             demoSettings.viewDistance = 500f;
             demoSettings.maxLodLevels = 4;
             demoSettings.lodSplitFactor = 1.4f;
+            demoSettings.materialPalette = CreateDemoPalette();
             demoSettings.noise = new NoiseSettings
             {
                 seed = 1337,
@@ -100,6 +103,31 @@ namespace reromanlee.Transvoxel.Demo
                 caveThreshold = 0.5f,
             };
             return demoSettings;
+        }
+
+        /// <summary>
+        /// A small tint-only palette (no textures needed) so the demo can show building
+        /// with different materials and the per-pixel blending between them out of the box.
+        /// </summary>
+        static TransvoxelMaterialPalette CreateDemoPalette()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            palette.name = "Demo Palette";
+            palette.Layers[0].name = "Grass";
+            palette.Layers[0].tint = new Color(0.42f, 0.55f, 0.3f);
+            palette.AddLayer(new TransvoxelMaterialPalette.Layer
+            {
+                name = "Rock", tint = new Color(0.45f, 0.44f, 0.42f), smoothness = 0.05f,
+            });
+            palette.AddLayer(new TransvoxelMaterialPalette.Layer
+            {
+                name = "Sand", tint = new Color(0.76f, 0.68f, 0.45f), smoothness = 0.15f,
+            });
+            palette.AddLayer(new TransvoxelMaterialPalette.Layer
+            {
+                name = "Snow", tint = new Color(0.92f, 0.94f, 0.97f), smoothness = 0.35f,
+            });
+            return palette;
         }
 
         void Update()
@@ -116,14 +144,14 @@ namespace reromanlee.Transvoxel.Demo
             if (terrain == null || !Input.GetMouseButton(0) || Time.time < nextBrushTime)
                 return;
             // Ignore clicks on the GUI overlay.
-            if (Input.mousePosition.x < 300f && Input.mousePosition.y > Screen.height - 390f)
+            if (Input.mousePosition.x < 300f && Input.mousePosition.y > Screen.height - 480f)
                 return;
 
             var ray = demoCamera.ScreenPointToRay(Input.mousePosition);
             if (terrain.RaycastDensity(ray, 400f, out Vector3 hit))
             {
                 bool build = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
-                terrain.Terraform(hit, brushRadius, brushStrength, build);
+                terrain.Terraform(hit, brushRadius, brushStrength, build, (byte)buildMaterial);
                 nextBrushTime = Time.time + 0.07f;
             }
         }
@@ -132,7 +160,7 @@ namespace reromanlee.Transvoxel.Demo
         void OnGUI()
         {
             const int width = 290;
-            GUILayout.BeginArea(new Rect(10, 10, width, 380), GUI.skin.box);
+            GUILayout.BeginArea(new Rect(10, 10, width, 470), GUI.skin.box);
             GUILayout.Label("<b>Transvoxel Demo</b>", RichLabel());
 
 #if ENABLE_LEGACY_INPUT_MANAGER
@@ -154,6 +182,26 @@ namespace reromanlee.Transvoxel.Demo
             GUILayout.Label($"Brush radius: {brushRadius:0.0} m");
             brushRadius = GUILayout.HorizontalSlider(brushRadius, 1f, 24f);
             GUILayout.Space(6);
+
+            var palette = settings.materialPalette;
+            if (palette != null && palette.LayerCount > 1)
+            {
+                if (materialNames == null || materialNames.Length != palette.LayerCount)
+                {
+                    materialNames = new string[palette.LayerCount];
+                    for (int i = 0; i < materialNames.Length; i++)
+                        materialNames[i] = palette.Layers[i].name;
+                }
+                GUILayout.Label("Build material");
+                buildMaterial = GUILayout.Toolbar(Mathf.Min(buildMaterial, palette.LayerCount - 1),
+                    materialNames);
+
+                GUILayout.Label($"Blend sharpness: {settings.materialBlendSharpness:0.0}");
+                // Read live by the terrain every frame — no rebuild, tune while brushing.
+                settings.materialBlendSharpness =
+                    GUILayout.HorizontalSlider(settings.materialBlendSharpness, 1f, 16f);
+                GUILayout.Space(6);
+            }
 
             bool smooth = GUILayout.Toggle(settings.smoothShading, " Smooth shading");
             if (smooth != settings.smoothShading)

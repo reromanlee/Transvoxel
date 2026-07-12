@@ -94,6 +94,18 @@ namespace reromanlee.Transvoxel
                  "when Edge Fade Fraction > 0; needs a fade-aware shader.")]
         public AnimationCurve edgeFadeCurve = AnimationCurve.Linear(0f, 0f, 1f, 1f);
 
+        [Header("Materials")]
+        [Tooltip("Optional set of terrain materials. Layer 0 fills the world by default; " +
+                 "terraforming can build with any other layer, and the shader blends " +
+                 "neighbouring materials per pixel. Requires a palette-aware shader (the " +
+                 "built-in Transvoxel/Lit Dithered). Empty = classic single-material terrain.")]
+        public TransvoxelMaterialPalette materialPalette;
+
+        [Tooltip("How sharply neighbouring voxel materials cut into each other. 1 blends " +
+                 "smoothly across the whole boundary cell; higher values tighten the " +
+                 "transition toward a hard edge. Live-tunable — no rebuild.")]
+        [Range(1f, 16f)] public float materialBlendSharpness = 4f;
+
         [Header("Landscape (density layer B)")]
         public NoiseSettings noise = new NoiseSettings();
 

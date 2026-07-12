@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using reromanlee.Transvoxel.Density;
 using UnityEngine;
 
 namespace reromanlee.Transvoxel.Meshing
@@ -27,14 +28,16 @@ namespace reromanlee.Transvoxel.Meshing
 
         ChunkSamples samples;
         MeshBuffers output;
+        IVoxelMaterialSource materials;
         float voxelSize;
         float uvScale;
 
         public void GenerateRegularMesh(ChunkSamples chunkSamples, float voxelSizeMeters, float uvScaleFactor,
-            MeshBuffers meshOutput)
+            MeshBuffers meshOutput, IVoxelMaterialSource materialSource = null)
         {
             samples = chunkSamples;
             output = meshOutput;
+            materials = materialSource;
             voxelSize = voxelSizeMeters;
             uvScale = uvScaleFactor;
 
@@ -58,6 +61,7 @@ namespace reromanlee.Transvoxel.Meshing
 
             samples = null;
             output = null;
+            materials = null;
         }
 
         void ProcessCell(int x, int y, int z)
@@ -190,10 +194,32 @@ namespace reromanlee.Transvoxel.Meshing
             position = TransvoxelGeometry.ApplySecondaryShift(position, normal, samples.TransitionMask,
                 samples.ChunkCells, step);
 
-            return EmitVertex(position, normal);
+            return EmitVertex(position, normal, VertexMaterial(x, y, z, v0, v1, d0, d1));
         }
 
-        int EmitVertex(Vector3 positionVoxels, Vector3 normal)
+        /// <summary>
+        /// Material id shown at this vertex. Normally the edge endpoint inside solid ground
+        /// (d &lt; 0; zero counts as air, matching the case-code classification) — the voxel
+        /// the vertex is the surface of. A vertex sitting EXACTLY on a corner (d == 0) is
+        /// shared by several converging edges whose solid endpoints are different voxels,
+        /// so it anchors to that corner voxel instead: a rule both meshers, every chunk and
+        /// the GPU kernels derive identically from the vertex's own lattice position —
+        /// otherwise material ids could disagree at shared positions and tear color seams.
+        /// </summary>
+        byte VertexMaterial(int x, int y, int z, int v0, int v1, float d0, float d1)
+        {
+            if (materials == null)
+                return 0;
+            int anchor = d0 == 0f ? v0 : d1 == 0f ? v1 : d0 < 0f ? v0 : v1;
+            int step = samples.LodStep;
+            Vector3Int min = samples.MinVoxel;
+            return materials.SampleMaterial(
+                min.x + (x + (anchor & 1)) * step,
+                min.y + (y + ((anchor >> 1) & 1)) * step,
+                min.z + (z + ((anchor >> 2) & 1)) * step);
+        }
+
+        int EmitVertex(Vector3 positionVoxels, Vector3 normal, byte materialId)
         {
             int index = output.Vertices.Count;
             output.Vertices.Add(positionVoxels * voxelSize);
@@ -201,6 +227,8 @@ namespace reromanlee.Transvoxel.Meshing
             output.Uvs.Add(new Vector2(
                 (samples.MinVoxel.x + positionVoxels.x) * voxelSize * uvScale,
                 (samples.MinVoxel.z + positionVoxels.z) * voxelSize * uvScale));
+            if (materials != null)
+                output.MaterialIds.Add(materialId);
             return index;
         }
     }
