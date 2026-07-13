@@ -25,6 +25,11 @@ namespace reromanlee.Transvoxel.Demo
         string[] materialNames;
         int buildMaterial;
         float fps;
+
+        // Resource stats are recomputed on an interval, not every OnGUI event: CollectStats
+        // walks the live chunks, and OnGUI runs at least twice a frame (Layout + Repaint).
+        TransvoxelResourceStats stats;
+        float nextStatsTime;
 #if ENABLE_LEGACY_INPUT_MANAGER
         float nextBrushTime;
 #endif
@@ -133,6 +138,11 @@ namespace reromanlee.Transvoxel.Demo
         void Update()
         {
             fps = Mathf.Lerp(fps, 1f / Mathf.Max(Time.unscaledDeltaTime, 1e-5f), 0.05f);
+            if (terrain != null && Time.unscaledTime >= nextStatsTime)
+            {
+                stats = terrain.CollectStats();
+                nextStatsTime = Time.unscaledTime + 0.25f;
+            }
 #if ENABLE_LEGACY_INPUT_MANAGER
             HandleTerraforming();
 #endif
@@ -144,7 +154,7 @@ namespace reromanlee.Transvoxel.Demo
             if (terrain == null || !Input.GetMouseButton(0) || Time.time < nextBrushTime)
                 return;
             // Ignore clicks on the GUI overlay.
-            if (Input.mousePosition.x < 300f && Input.mousePosition.y > Screen.height - 480f)
+            if (Input.mousePosition.x < 300f && Input.mousePosition.y > Screen.height - 600f)
                 return;
 
             var ray = demoCamera.ScreenPointToRay(Input.mousePosition);
@@ -160,7 +170,7 @@ namespace reromanlee.Transvoxel.Demo
         void OnGUI()
         {
             const int width = 290;
-            GUILayout.BeginArea(new Rect(10, 10, width, 470), GUI.skin.box);
+            GUILayout.BeginArea(new Rect(10, 10, width, 590), GUI.skin.box);
             GUILayout.Label("<b>Transvoxel Demo</b>", RichLabel());
 
 #if ENABLE_LEGACY_INPUT_MANAGER
@@ -176,6 +186,17 @@ namespace reromanlee.Transvoxel.Demo
                     $"FPS: {fps:0}   Backend: {BackendNames[(int)terrain.ActiveBackend]}\n" +
                     $"Chunks: {terrain.LiveChunkCount}   Building: {terrain.PendingBuildCount}\n" +
                     $"Vertices: {terrain.TotalVertices:n0}");
+
+                // Package-only resource approximation (see TransvoxelTerrain.CollectStats).
+                string gpuTime = stats.GpuComputeMsPerSecond > 0f || stats.GpuJobsInFlight > 0
+                    ? $"{stats.GpuComputeMsPerSecond:0.0} ms/s"
+                    : "—";
+                GUILayout.Label(
+                    $"<b>Resources (this package)</b>\n" +
+                    $"CPU main: {stats.MainThreadMsPerFrame:0.00} ms/frame\n" +
+                    $"CPU workers: {stats.WorkerCpuMsPerSecond:0.0} ms/s   GPU: {gpuTime}\n" +
+                    $"RAM: {FormatBytes(stats.RamTotalBytes)}   VRAM: {FormatBytes(stats.GpuTotalBytes)}",
+                    RichLabel());
             }
             GUILayout.Space(6);
 
@@ -233,6 +254,14 @@ namespace reromanlee.Transvoxel.Demo
         {
             var style = new GUIStyle(GUI.skin.label) { richText = true };
             return style;
+        }
+
+        static string FormatBytes(long bytes)
+        {
+            if (bytes <= 0) return "0";
+            if (bytes < 1024) return $"{bytes} B";
+            if (bytes < 1024 * 1024) return $"{bytes / 1024.0:0.0} KB";
+            return $"{bytes / (1024.0 * 1024.0):0.00} MB";
         }
     }
 }

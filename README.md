@@ -304,6 +304,35 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
   Only the debug LOD tint uses a property block.
 - Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
+## Resource stats (debug)
+
+The terrain measures its own footprint — just this package's work, excluding rendering,
+materials/textures and PhysX collider cooking — so you can see, right now, what all the live
+chunks and their computation cost:
+
+```csharp
+TransvoxelResourceStats s = terrain.CollectStats();
+Debug.Log($"CPU main {s.MainThreadMsPerFrame:0.00} ms/frame, workers {s.WorkerCpuMsPerSecond:0.0} ms/s, "
+        + $"GPU {s.GpuComputeMsPerSecond:0.0} ms/s, RAM {s.RamTotalBytes >> 20} MB, VRAM {s.GpuTotalBytes >> 20} MB");
+```
+
+- **CPU ms** — main-thread cost of the terrain's `Update` (smoothed + a peak), and worker
+  ms/second across all background threads (sampling, meshing, GPU-soup welding, blend
+  encoding, octree selection, collider bakes), plus builds/second and average build ms.
+- **GPU ms** — compute-kernel ms/second, *sampled*: a tiny readback brackets each job's
+  dispatches on the GPU timeline. Any single sample is quantized to a frame boundary, but the
+  average converges on the true cost over many jobs (Unity exposes no per-dispatch GPU timer
+  at runtime). 0 on the CPU backend.
+- **RAM** — computed exactly from the structures the package owns: density-cache grids, edit
+  and material bricks, pooled + in-flight meshing buffers, and the CPU copies of the chunk
+  meshes.
+- **GPU memory** — the chunk meshes' vertex/index buffers plus every compute buffer (per-job
+  volume/append sets, the resident brick pool, the lookup tables).
+
+Open **Window ▸ Transvoxel ▸ Terrain Stats** for a live UI Toolkit readout of all of it
+(auto-picks the scene terrain; most useful in Play mode). The bundled demo overlay also shows
+a compact CPU/GPU/RAM/VRAM summary, so the numbers appear in standalone builds too.
+
 ## Tests
 
 EditMode tests live in `Editor/` (Window ▸ General ▸ Test Runner ▸ EditMode). They prove the
@@ -311,8 +340,8 @@ core invariant — the union of all chunk meshes is a closed, consistently wound
 for single chunks, same-LOD borders, every LOD-transition face, and after a transition-mask
 change (the stale-cache regression); plus, for voxel materials: watertightness of encoded
 (split) meshes, blend-attribute structure, and material-id agreement at every shared vertex
-across chunk borders, LOD seams and both meshers. Requires the `com.unity.test-framework`
-package.
+across chunk borders, LOD seams and both meshers; and the resource-stat memory estimators
+against known structure sizes. Requires the `com.unity.test-framework` package.
 
 ## Requirements
 

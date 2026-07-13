@@ -27,6 +27,9 @@ namespace reromanlee.Transvoxel.Density
 
         public int BrickCount => bricks.Count;
 
+        /// <summary>Payload bytes of the stored bricks (one byte per voxel), for stats.</summary>
+        public long EstimateBytes() => (long)bricks.Count * BrickVolume;
+
         /// <summary>Material id of a voxel; 0 (the default material) anywhere unpainted.</summary>
         public byte SampleMaterial(int x, int y, int z)
         {

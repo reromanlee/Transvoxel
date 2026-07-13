@@ -83,6 +83,7 @@ namespace reromanlee.Transvoxel
             public float VoxelSize;
             public float UvScale;
             public ConcurrentQueue<ChunkBuildResult> Results;
+            public TransvoxelWorkStats Stats;
         }
 
         /// <summary>Chunks invalidated by one terraform stroke, swapped atomically (one frame).</summary>
@@ -136,6 +137,11 @@ namespace reromanlee.Transvoxel
         ConcurrentQueue<ChunkBuildResult> completedBuilds = new ConcurrentQueue<ChunkBuildResult>();
         List<ChunkBuildResult> deferredApplies = new List<ChunkBuildResult>();
         readonly System.Diagnostics.Stopwatch applyStopwatch = new System.Diagnostics.Stopwatch();
+
+        // Resource accounting behind CollectStats — always on, costs one stopwatch read
+        // per frame plus a few atomic adds per chunk build.
+        readonly TransvoxelWorkStats workStats = new TransvoxelWorkStats();
+        readonly System.Diagnostics.Stopwatch frameStopwatch = new System.Diagnostics.Stopwatch();
 
         // ---- terraform edit groups (task: no one-frame holes while brushing) ----
         readonly Dictionary<int, EditGroup> editGroups = new Dictionary<int, EditGroup>();
@@ -315,7 +321,7 @@ namespace reromanlee.Transvoxel
             ActiveBackend = ResolveBackend(out ComputeShader gpuShader);
             if (ActiveBackend != MeshingBackend.CpuThreads)
                 gpuBuilder = new GpuChunkBuilder(gpuShader, settings, Layers.Edits,
-                    paletteActive ? Materials : null);
+                    paletteActive ? Materials : null, workStats);
             if (ActiveBackend != MeshingBackend.GpuCompute)
                 StartCpuWorkers(); // CpuThreads and Hybrid: CPU workers pull the same queue
 
@@ -449,6 +455,7 @@ namespace reromanlee.Transvoxel
                 VoxelSize = settings.voxelSize,
                 UvScale = settings.uvScale,
                 Results = completedBuilds,
+                Stats = workStats,
             };
             CancellationToken token = workerCancellation.Token;
             int workers = settings.EffectiveMaxConcurrentBuilds;
@@ -476,6 +483,7 @@ namespace reromanlee.Transvoxel
                 if (job.Superseded)
                     continue;
 
+                long buildStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 MeshBuffers buffers = null;
                 try
                 {
@@ -525,6 +533,7 @@ namespace reromanlee.Transvoxel
                         Buffers = buffers,
                     });
                     buffers = null; // ownership transferred
+                    context.Stats.AddBuild(System.Diagnostics.Stopwatch.GetTimestamp() - buildStart);
                 }
                 catch (Exception exception)
                 {
@@ -612,6 +621,8 @@ namespace reromanlee.Transvoxel
                 viewer = mainCamera.transform;
             }
 
+            frameStopwatch.Restart();
+
             // The settings field may have been assigned or swapped after OnEnable ran; rebind
             // to the new asset and rebuild from it.
             if (!ReferenceEquals(settings, subscribedSettings))
@@ -655,6 +666,9 @@ namespace reromanlee.Transvoxel
             UpdateChunkFades(); // before cleanup: retirement checks replacements' fade state
             CleanupObsoleteChunks();
             UpdateStats();
+
+            workStats.EndFrame((float)frameStopwatch.Elapsed.TotalMilliseconds,
+                Time.realtimeSinceStartupAsDouble);
         }
 
         /// <summary>
@@ -831,8 +845,14 @@ namespace reromanlee.Transvoxel
 
             TerrainOctree tree = octree;
             List<ChunkDrawCommand> output = selectionOutput;
+            TransvoxelWorkStats stats = workStats;
             output.Clear();
-            selectionTask = Task.Run(() => tree.SelectChunks(viewerLocal, output));
+            selectionTask = Task.Run(() =>
+            {
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+                tree.SelectChunks(viewerLocal, output);
+                stats.AddWorkerTicks(System.Diagnostics.Stopwatch.GetTimestamp() - started);
+            });
         }
 
         void IntegrateSelection()
@@ -1193,8 +1213,10 @@ namespace reromanlee.Transvoxel
                 return;
 
             var queue = bakedColliders;
+            TransvoxelWorkStats stats = workStats;
             Task.Run(() =>
             {
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
                 try
                 {
                     Physics.BakeMesh(meshId, false);
@@ -1203,6 +1225,7 @@ namespace reromanlee.Transvoxel
                 {
                     Debug.LogException(exception);
                 }
+                stats.AddWorkerTicks(System.Diagnostics.Stopwatch.GetTimestamp() - started);
                 queue.Enqueue((chunk, meshId));
             });
         }
@@ -1479,6 +1502,75 @@ namespace reromanlee.Transvoxel
             return min.x - pad < voxelBounds.xMax && min.x + size + pad > voxelBounds.xMin
                 && min.y - pad < voxelBounds.yMax && min.y + size + pad > voxelBounds.yMin
                 && min.z - pad < voxelBounds.zMax && min.z + size + pad > voxelBounds.zMin;
+        }
+
+        /// <summary>
+        /// Approximates what the terrain currently costs — main-thread and worker CPU ms,
+        /// sampled GPU compute ms, and RAM / GPU memory of every structure this package
+        /// allocates (density cache, edit and material bricks, meshing buffers, chunk
+        /// meshes, compute buffers). Rendering, materials/textures and PhysX cooked
+        /// collider data are out of scope. Main thread only; cheap enough to call every
+        /// frame, though a debug display typically polls a few times per second.
+        /// </summary>
+        public TransvoxelResourceStats CollectStats()
+        {
+            var stats = new TransvoxelResourceStats();
+            workStats.FillTimings(ref stats);
+            stats.GpuJobsInFlight = gpuBuilder?.InFlight ?? 0;
+
+            stats.DensityCacheBytes = cache?.EstimateBytes() ?? 0;
+            stats.EditLayerBytes = Layers?.Edits.EstimateBytes() ?? 0;
+            stats.MaterialLayerBytes = Materials.EstimateBytes();
+            stats.MeshBufferBytes = MeshBuffers.EstimatePooledBytes(out int pooledBuffers)
+                                    + InFlightBufferBytes();
+            stats.PooledMeshBuffers = pooledBuffers;
+
+            long meshBytes = 0, vertices = 0, indices = 0;
+            foreach (TerrainChunk chunk in live.Values)
+            {
+                meshBytes += chunk.MeshBytes;
+                vertices += chunk.VertexCount;
+                indices += chunk.IndexCount;
+            }
+            foreach (DyingChunk entry in dying)
+                meshBytes += entry.View.MeshBytes;
+            foreach (Mesh parked in parkedMeshes.Values)
+                meshBytes += TerrainChunk.EstimateMeshBytes(parked);
+
+            // Chunk meshes are readable: one copy in RAM, one in GPU vertex/index buffers.
+            stats.ChunkMeshCpuBytes = meshBytes;
+            stats.ChunkMeshGpuBytes = meshBytes;
+            stats.TotalVertices = vertices;
+            stats.TotalIndices = indices;
+            stats.ComputeBufferBytes = gpuBuilder?.EstimateGpuBufferBytes() ?? 0;
+
+            stats.RamTotalBytes = stats.DensityCacheBytes + stats.EditLayerBytes
+                                  + stats.MaterialLayerBytes + stats.MeshBufferBytes
+                                  + stats.ChunkMeshCpuBytes;
+            stats.GpuTotalBytes = stats.ChunkMeshGpuBytes + stats.ComputeBufferBytes;
+
+            stats.LiveChunks = live.Count;
+            stats.GhostChunks = dying.Count;
+            stats.PendingBuilds = pending.Count;
+            stats.CachedGrids = cache?.Count ?? 0;
+            stats.PooledChunkViews = chunkViewPool.Count;
+            return stats;
+        }
+
+        /// <summary>Meshing buffers of finished builds waiting to be applied or dropped.</summary>
+        long InFlightBufferBytes()
+        {
+            long bytes = 0;
+            foreach (ChunkBuildResult result in completedBuilds)
+                bytes += result.Buffers?.EstimateBytes() ?? 0;
+            foreach (ChunkBuildResult result in deferredApplies)
+                bytes += result.Buffers?.EstimateBytes() ?? 0;
+            foreach (EditGroup group in editGroups.Values)
+            {
+                foreach (ChunkBuildResult result in group.Ready)
+                    bytes += result.Buffers?.EstimateBytes() ?? 0;
+            }
+            return bytes;
         }
 
         /// <summary>Rebuild everything (used when toggling smooth shading and similar global switches).</summary>

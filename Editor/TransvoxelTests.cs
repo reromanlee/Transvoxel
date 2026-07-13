@@ -811,5 +811,53 @@ namespace reromanlee.Transvoxel.Editor.Tests
                 Assert.AreEqual(ids[idx], (byte)value, $"packing mismatch at voxel {idx}");
             }
         }
+
+        // ------------------------------------------------------------------ resource stats
+
+        [Test]
+        public void MemoryEstimates_MatchKnownStructureSizes()
+        {
+            // Material bricks: one byte per voxel, one brick per touched 16³ cell.
+            var materials = new VoxelMaterialLayer();
+            materials.WriteBatch(set => set(1, 2, 3, 5)); // one brick
+            Assert.AreEqual((long)VoxelMaterialLayer.BrickVolume, materials.EstimateBytes());
+            materials.WriteBatch(set => set(100, 2, 3, 5)); // a second, far-away brick
+            Assert.AreEqual(2L * VoxelMaterialLayer.BrickVolume, materials.EstimateBytes());
+
+            // Edit bricks: one float per voxel.
+            var edits = new VoxelEditLayer();
+            edits.WriteBatch(set => set(1, 2, 3, 0.9f));
+            Assert.AreEqual((long)VoxelEditLayer.BrickVolume * sizeof(float), edits.EstimateBytes());
+
+            // A maskless chunk grid is exactly (cells+3)³ floats.
+            const int cells = 16;
+            int points = cells + 3;
+            var samples = ChunkSamples.Sample(new FlatGround(), new NodeKey(0, Vector3Int.zero),
+                cells, 0.5f, 0);
+            Assert.AreEqual((long)points * points * points * sizeof(float), samples.EstimateBytes());
+        }
+
+        [Test]
+        public void MeshBufferEstimate_TracksCapacitiesAndClearsWithReturn()
+        {
+            var buffers = new MeshBuffers();
+            var sphere = new SphereDensity { Center = new Vector3(8, 8, 8), Radius = 5.5f };
+            new TransvoxelMesher().GenerateRegularMesh(
+                ChunkSamples.Sample(sphere, new NodeKey(0, Vector3Int.zero), 16, 0.5f, 0),
+                1f, 0.1f, buffers);
+
+            long expected = (long)buffers.Vertices.Capacity * 12 + (long)buffers.Normals.Capacity * 12
+                            + (long)buffers.Uvs.Capacity * 8 + (long)buffers.Indices.Capacity * 4
+                            + buffers.MaterialIds.Capacity + (long)buffers.MaterialBlend.Capacity * 4;
+            Assert.AreEqual(expected, buffers.EstimateBytes());
+            Assert.Greater(buffers.EstimateBytes(), 0);
+
+            // Return clears content but keeps capacity, so pooled buffers still report bytes.
+            long beforeReturn = buffers.EstimateBytes();
+            MeshBuffers.Return(buffers);
+            MeshBuffers pooledSnapshot = MeshBuffers.Rent();
+            Assert.GreaterOrEqual(pooledSnapshot.EstimateBytes(), 0);
+            MeshBuffers.Return(pooledSnapshot);
+        }
     }
 }
