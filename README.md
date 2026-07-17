@@ -270,16 +270,46 @@ terrain.Terraform(worldPoint, radius: 5f, strength: 0.9f, build: true, materialI
   Hybrid backends produce identical ids (the `TRANSVOXEL_MATERIALS` kernel variant adds one
   float per soup vertex, welded and encoded exactly like the CPU path).
 
-Like fading, this needs shader support (`_TransvoxelPaletteAware` marker; palette inputs are
-global uniforms + the `TRANSVOXEL_PALETTE` / `TRANSVOXEL_PALETTE_MAPS` keywords — custom
-palette-aware shaders should list both in one
-`multi_compile _ TRANSVOXEL_PALETTE TRANSVOXEL_PALETTE_MAPS` set). The bundled
-`Transvoxel/Lit Dithered` shader implements it in both pipelines; with a palette assigned
-but a non-palette-aware material, voxel materials are cleanly disabled with a console
-warning. Palette *content* edits (textures, tints, sharpness) re-bind live without
-rebuilding chunks — including flipping between the albedo-only and detail-map variants;
-assigning or swapping the palette asset re-meshes the world once so every vertex carries
-blend data.
+Like fading, this needs shader support: the `_TransvoxelPaletteAware` marker property is
+what tags a material as palette-aware, and the palette inputs are global uniforms. The
+blend itself lives in the reusable module
+[`Runtime/Resources/TransvoxelPalette.hlsl`](Runtime/Resources/TransvoxelPalette.hlsl)
+(SRP contexts; the Built-in path is inline in the bundled shader). The terrain binds
+**every** map array whenever a palette is active — kinds the palette doesn't use hold tiny
+neutral fallbacks — so module users sample unconditionally; only the bundled shader plays
+the `TRANSVOXEL_PALETTE` / `TRANSVOXEL_PALETTE_MAPS` keyword game to keep map-free
+palettes on the cheaper path (custom shaders wanting the same should list both in one
+`multi_compile` set). With a palette assigned but a non-palette-aware material, voxel
+materials are cleanly disabled with a console warning. Palette *content* edits (textures,
+tints, sharpness) re-bind live without rebuilding chunks — including flipping between the
+albedo-only and detail-map variants; assigning or swapping the palette asset re-meshes the
+world once so every vertex carries blend data.
+
+### Shader Graph (URP)
+
+A graph needs three things: the marker, the corner weights interpolated across the
+triangle, and one sampling node. (This composes freely with the dithering node from
+*Dithered fading* — most graphs want both.)
+
+1. Blackboard: **Float** property, reference name **`_TransvoxelPaletteAware`**, default
+   **1**, exposed.
+2. **Vertex stage** — the one-hot corner weights must rasterize into barycentric weights,
+   so they have to be computed per vertex: add a **Custom Interpolator** block (Vector2)
+   to the Vertex context and feed it a **Custom Function** node — Type **File**, Source
+   **`TransvoxelPalette.hlsl`**, Name **`TransvoxelBlendCorner`**, input `VertexColor`
+   (Vector4) ← **Vertex Color** node, output `CornerWeights` (Vector2).
+3. **Fragment stage** — a Custom Function node from the same file:
+   - **`TransvoxelPaletteAlbedo`** for albedo/tint palettes. Inputs: `UV` (Vector2 ← UV
+     node on **UV0**), `VertexColor` (← Vertex Color node), `CornerWeights` (← **Custom
+     Interpolator** node). Outputs: `Albedo` → Base Color, `Smoothness` → Smoothness.
+   - **`TransvoxelPaletteMaps`** to add the normal/occlusion/height maps. Extra inputs:
+     `PositionWS` (← Position node, World), `NormalWS` (← Normal Vector node, World);
+     extra outputs: `Occlusion` → Ambient Occlusion, and `Normal` → the Normal block
+     **after setting Graph Settings ▸ Fragment Normal Space to World** (the module
+     outputs a world-space normal — terrain meshes have no tangents).
+
+Pick the function to match your palette: `TransvoxelPaletteMaps` always pays the full
+12-sample path, there is no automatic variant switching inside a graph.
 
 ## How the seamless LOD works (the interesting part)
 

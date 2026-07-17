@@ -425,7 +425,9 @@ namespace reromanlee.Transvoxel
                                  $"material's shader ('{runtimeMaterial.shader.name}') has no " +
                                  "_TransvoxelPaletteAware support — voxel materials are disabled. " +
                                  "Switch the material to 'Transvoxel/Lit Dithered' (or leave the " +
-                                 "material empty to get it by default).", this);
+                                 "material empty to get it by default), or make your own " +
+                                 "shader/graph palette-aware with TransvoxelPalette.hlsl — see " +
+                                 "the README's Voxel materials section.", this);
 
             if (paletteActive)
             {
@@ -452,14 +454,16 @@ namespace reromanlee.Transvoxel
             Shader.EnableKeyword(detailMaps ? PaletteMapsKeyword : PaletteKeyword);
             Shader.DisableKeyword(detailMaps ? PaletteKeyword : PaletteMapsKeyword);
 
+            // Every array is bound whenever a palette is active — the keyword only decides
+            // which of them the BUNDLED shader samples. Custom shaders and Shader Graphs
+            // using TransvoxelPalette.hlsl sample unconditionally (they have no keyword
+            // machinery), so the detail arrays must always hold at least the baked neutral
+            // fallbacks (tiny 4x4 slices when the palette carries no such maps).
             Shader.SetGlobalTexture(AlbedoArrayId, palette.GetAlbedoArray());
-            if (detailMaps)
-            {
-                Shader.SetGlobalTexture(NormalArrayId, palette.GetNormalArray());
-                Shader.SetGlobalTexture(OcclusionArrayId, palette.GetOcclusionArray());
-                Shader.SetGlobalTexture(HeightArrayId, palette.GetHeightArray());
-                Shader.SetGlobalFloat(HeightBlendId, palette.heightBlend);
-            }
+            Shader.SetGlobalTexture(NormalArrayId, palette.GetNormalArray());
+            Shader.SetGlobalTexture(OcclusionArrayId, palette.GetOcclusionArray());
+            Shader.SetGlobalTexture(HeightArrayId, palette.GetHeightArray());
+            Shader.SetGlobalFloat(HeightBlendId, palette.heightBlend);
             palette.FillLayerUniforms(LayerColorScratch, LayerScaleScratch);
             Shader.SetGlobalVectorArray(LayerColorsId, LayerColorScratch);
             Shader.SetGlobalVectorArray(LayerScalesId, LayerScaleScratch);
