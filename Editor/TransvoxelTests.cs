@@ -859,5 +859,90 @@ namespace reromanlee.Transvoxel.Editor.Tests
             Assert.GreaterOrEqual(pooledSnapshot.EstimateBytes(), 0);
             MeshBuffers.Return(pooledSnapshot);
         }
+
+        // ------------------------------------------------------------------ material palette
+
+        [Test]
+        public void PaletteUniforms_PackTintSmoothnessAndMapStrengths()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            try
+            {
+                TransvoxelMaterialPalette.Layer layer = palette.Layers[0];
+                layer.tint = new Color(0.1f, 0.2f, 0.3f);
+                layer.smoothness = 0.7f;
+                layer.uvScaleMultiplier = 2f;
+                layer.normalStrength = 0.5f;
+                layer.occlusionStrength = 0.25f;
+
+                var colors = new Vector4[TransvoxelMaterialPalette.MaxLayers];
+                var scales = new Vector4[TransvoxelMaterialPalette.MaxLayers];
+                palette.FillLayerUniforms(colors, scales);
+
+                Assert.AreEqual(new Vector4(0.1f, 0.2f, 0.3f, 0.7f), colors[0]);
+                Assert.AreEqual(new Vector4(2f, 0.5f, 0.25f, 0f), scales[0]);
+                // Slots past the layer count are never indexed (the shader clamps ids to
+                // the layer count) but must still hold harmless neutral values.
+                Assert.AreEqual(new Vector4(1f, 1f, 1f, 0f), scales[1]);
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+            }
+        }
+
+        [Test]
+        public void PaletteDetailMaps_DetectedOnAnyLayer()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            try
+            {
+                Assert.IsFalse(palette.HasDetailMaps, "map-free palette reports detail maps");
+
+                int id = palette.AddLayer(new TransvoxelMaterialPalette.Layer
+                {
+                    name = "Rock",
+                    height = Texture2D.linearGrayTexture,
+                });
+                Assert.AreEqual(1, id);
+                Assert.IsTrue(palette.HasDetailMaps, "height map on layer 1 not detected");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+            }
+        }
+
+        [Test]
+        public void PaletteMapArrays_BakeFallbacksAndMixedSizes()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            var normalMap = new Texture2D(8, 8, TextureFormat.RGBA32, mipChain: true, linear: true);
+            try
+            {
+                palette.AddLayer(new TransvoxelMaterialPalette.Layer
+                {
+                    name = "Rock",
+                    normal = normalMap,
+                });
+
+                // Every map kind bakes one slice per layer; empty slots hold the neutral
+                // fallback (white albedo/occlusion, mid-gray height).
+                Assert.AreEqual(2, palette.GetAlbedoArray().depth);
+                Assert.AreEqual(2, palette.GetOcclusionArray().depth);
+                Assert.AreEqual(2, palette.GetHeightArray().depth);
+
+                // The 8x8 normal map mixes with the 4x4 flat-normal fallback slice, so the
+                // bake takes the blit path and resizes onto the largest source.
+                Texture2DArray normals = palette.GetNormalArray();
+                Assert.AreEqual(2, normals.depth);
+                Assert.AreEqual(8, normals.width);
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+                UnityEngine.Object.DestroyImmediate(normalMap);
+            }
+        }
     }
 }

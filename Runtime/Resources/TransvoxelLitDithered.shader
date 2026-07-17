@@ -21,6 +21,11 @@
 // Meshes without UV2 read (0,0): with the default _TransvoxelFade of 1 and start time 0
 // they render solid, so the shader is safe on any mesh.
 //
+// The fade/dither core itself lives in TransvoxelDither.hlsl (same folder) — a reusable
+// module both subshaders include, and the same file a Shader Graph Custom Function node
+// or any custom shader pulls in to become fade-aware (see the README's Dithered fading
+// section).
+//
 // SubShader 1 targets URP (skipped automatically when URP is absent), SubShader 2 is the
 // Built-in pipeline fallback. HDRP is not supported — keep the HDRP/Lit default there.
 
@@ -50,6 +55,22 @@ Shader "Transvoxel/Lit Dithered"
 
         HLSLINCLUDE
         #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+        #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl"
+
+        // The whole fade/dither core (globals, Bayer matrix, TransvoxelVertexFade,
+        // TransvoxelDitherClip) lives in the reusable module — the same file a Shader
+        // Graph Custom Function node or any custom shader includes. All fade inputs are
+        // GLOBAL uniforms (never in UnityPerMaterial): the SRP Batcher sources
+        // per-material cbuffer values from the material and ignores Shader.SetGlobal*
+        // for them, so a fade value trapped there would be locked at the inspector value
+        // for batched draws. The per-chunk time fade uses only Unity's built-in _Time.
+        #include "TransvoxelDither.hlsl"
+
+        // Either palette variant: albedo-only, or with the detail-map arrays. The two
+        // keywords are one multi_compile set, so exactly one (or neither) is active.
+        #if defined(TRANSVOXEL_PALETTE) || defined(TRANSVOXEL_PALETTE_MAPS)
+            #define TRANSVOXEL_ANY_PALETTE 1
+        #endif
 
         TEXTURE2D(_BaseMap);
         SAMPLER(sampler_BaseMap);
@@ -60,32 +81,27 @@ Shader "Transvoxel/Lit Dithered"
         half _Smoothness;
         CBUFFER_END
 
-        // Globals driven by TransvoxelTerrain every frame. All fade inputs live in global
-        // scope (never in UnityPerMaterial): the SRP Batcher sources per-material cbuffer
-        // values from the material and ignores Shader.SetGlobalFloat for them, so a fade
-        // value trapped there would be locked at the inspector value for batched draws.
-        // The per-chunk time fade additionally uses only Unity's built-in _Time.
-        float4 _TransvoxelViewerPos;
-        float _TransvoxelViewDistance;
-        float _TransvoxelEdgeFadeBand;  // 0 = edge dissolve off
-        float _TransvoxelFade;          // master fade, set globally (1 = normal)
-
-        // 256x1 LUT baked from the edgeFadeCurve: input = raw edge fade (0 at the draw
-        // distance, 1 at the viewer), output = kept opacity. Identity ramp by default, so a
-        // missing/unbound texture just needs the branch below skipped (band 0) to stay safe.
-        TEXTURE2D(_TransvoxelEdgeFadeCurve);
-        SAMPLER(sampler_TransvoxelEdgeFadeCurve);
-
-        // Material palette (TRANSVOXEL_PALETTE variants; all globals, driven by the
-        // terrain): one texture array holds every layer's albedo — the material id indexes
-        // it per pixel, so nothing here grows with the palette. The fixed 64 is the
-        // declared capacity of TransvoxelMaterialPalette.MaxLayers, not a per-slot cost.
+        // Material palette (TRANSVOXEL_PALETTE / TRANSVOXEL_PALETTE_MAPS variants; all
+        // globals, driven by the terrain): one texture array per map kind holds every
+        // layer's texture — the material id indexes it per pixel, so nothing here grows
+        // with the palette. The fixed 64 is the declared capacity of
+        // TransvoxelMaterialPalette.MaxLayers, not a per-slot cost.
         TEXTURE2D_ARRAY(_TransvoxelAlbedoArray);
         SAMPLER(sampler_TransvoxelAlbedoArray);
         float4 _TransvoxelLayerColors[64];    // rgb = tint, a = smoothness
-        float4 _TransvoxelLayerScales[64];    // x = uv scale multiplier
+        float4 _TransvoxelLayerScales[64];    // x = uv scale, y = normal str, z = occlusion str
         float _TransvoxelBlendSharpness;      // live materialBlendSharpness setting
         float _TransvoxelPaletteLayerCount;
+
+        // Detail-map arrays (TRANSVOXEL_PALETTE_MAPS only; bound by the terrain only for
+        // palettes that contain such maps — empty slots hold baked neutral fallbacks:
+        // flat normal, white occlusion, mid height). All share the albedo sampler. Height
+        // does not displace anything: it steers the blend weights so the higher material
+        // (rock, cobbles) cuts through the lower one (sand) at boundaries.
+        TEXTURE2D_ARRAY(_TransvoxelNormalArray);
+        TEXTURE2D_ARRAY(_TransvoxelOcclusionArray);
+        TEXTURE2D_ARRAY(_TransvoxelHeightArray);
+        float _TransvoxelHeightBlend;         // 0 = plain crossfade, 1 = full height cut
 
         // Decodes the MaterialBlendEncoder vertex attribute: rgb = the triangle's sorted
         // material id triple (identical on all three vertices, so plain interpolation is
@@ -106,74 +122,116 @@ Shader "Transvoxel/Lit Dithered"
             return half4(albedo * layerColor.rgb, layerColor.a); // a carries smoothness
         }
 
-        // Blends the (up to) three palette layers of the triangle. The barycentric weights
-        // are sharpened by pow(): 1 blends across the whole boundary cell, higher values
-        // tighten the transition toward a hard cut — the materialBlendSharpness setting.
+        // Shared weight setup for both palette variants: clamp the id triple and sharpen
+        // the barycentric corner weights by pow() — 1 blends across the whole boundary
+        // cell, higher values tighten the transition toward a hard cut (the
+        // materialBlendSharpness setting).
+        void TransvoxelPaletteSetup(float3 idsRaw, float2 w01, out int3 ids, out float3 w)
+        {
+            int maxLayer = max((int)_TransvoxelPaletteLayerCount - 1, 0);
+            ids = clamp((int3)round(idsRaw), 0, maxLayer);
+
+            w = float3(w01, saturate(1.0 - w01.x - w01.y));
+            w = pow(max(w, 0.0), _TransvoxelBlendSharpness);
+            w /= max(w.x + w.y + w.z, 1e-5);
+        }
+
+        // Blends the (up to) three palette layers of the triangle (albedo-only variant).
         // All three layers are sampled unconditionally so texture gradients stay uniform
         // (uniform triangles fetch the same texel thrice — cache-free).
         half4 TransvoxelPaletteBlend(float2 uv, float3 idsRaw, float2 w01)
         {
-            int maxLayer = max((int)_TransvoxelPaletteLayerCount - 1, 0);
-            int3 ids = clamp((int3)round(idsRaw), 0, maxLayer);
-
-            float3 w = float3(w01, saturate(1.0 - w01.x - w01.y));
-            w = pow(max(w, 0.0), _TransvoxelBlendSharpness);
-            w /= max(w.x + w.y + w.z, 1e-5);
+            int3 ids;
+            float3 w;
+            TransvoxelPaletteSetup(idsRaw, w01, ids, w);
 
             return w.x * TransvoxelSampleLayer(uv, ids.x)
                  + w.y * TransvoxelSampleLayer(uv, ids.y)
                  + w.z * TransvoxelSampleLayer(uv, ids.z);
         }
 
-        // 4x4 Bayer matrix, thresholds centered so fade 1 keeps every pixel.
-        static const float TransvoxelDither[16] =
+        // ---------------------------------------------------- palette detail maps (MAPS)
+
+        struct TransvoxelSurface
         {
-             0.5 / 16.0,  8.5 / 16.0,  2.5 / 16.0, 10.5 / 16.0,
-            12.5 / 16.0,  4.5 / 16.0, 14.5 / 16.0,  6.5 / 16.0,
-             3.5 / 16.0, 11.5 / 16.0,  1.5 / 16.0,  9.5 / 16.0,
-            15.5 / 16.0,  7.5 / 16.0, 13.5 / 16.0,  5.5 / 16.0
+            half3 albedo;
+            half3 normalTS;
+            half occlusion;
+            half smoothness;
         };
 
-        // Per-vertex fade from UV2 = (startTime, signedDuration): duration's sign marks a
-        // ghost, its magnitude is the fade length in seconds, 0 = solid (meshes without
-        // UV2 read zero). Time base: Unity's built-in _Time.y (time since level load) —
-        // the C# side writes start times on the same clock. Positive result = fading in,
-        // negative = ghost fading out with visibility -result (complementary clip below).
-        float TransvoxelVertexFade(float2 fadeData)
+        float TransvoxelLayerHeight(float2 uv, int id)
         {
-            float duration = abs(fadeData.y);
-            if (duration <= 0.0)
-                return 1.0;
-            float t = saturate((_Time.y - fadeData.x) / duration);
-            return fadeData.y < 0.0 ? -(1.0 - t) : t;
+            return SAMPLE_TEXTURE2D_ARRAY(_TransvoxelHeightArray, sampler_TransvoxelAlbedoArray,
+                                          uv * _TransvoxelLayerScales[id].x, id).r;
         }
 
-        void TransvoxelDitherClip(float4 positionCS, float3 positionWS, float vertexFade)
+        void TransvoxelAccumulateLayer(inout TransvoxelSurface s, float2 uv, int id, float weight)
         {
-            float fade = vertexFade * _TransvoxelFade;
-            float edge = 1.0;
-            if (_TransvoxelEdgeFadeBand > 0.0)
-            {
-                float viewerDistance = distance(positionWS, _TransvoxelViewerPos.xyz);
-                float rawEdge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
-                edge = SAMPLE_TEXTURE2D_LOD(_TransvoxelEdgeFadeCurve, sampler_TransvoxelEdgeFadeCurve,
-                                            float2(rawEdge, 0.5), 0).r;
-            }
-            if (fade >= 1.0 && edge >= 1.0)
-                return;
+            float4 layerColor = _TransvoxelLayerColors[id];
+            float4 scales = _TransvoxelLayerScales[id];
+            float2 layerUv = uv * scales.x;
 
-            uint2 pixel = uint2(positionCS.xy) & 3;
-            float threshold = TransvoxelDither[pixel.y * 4 + pixel.x];
+            half3 albedo = SAMPLE_TEXTURE2D_ARRAY(_TransvoxelAlbedoArray,
+                sampler_TransvoxelAlbedoArray, layerUv, id).rgb;
+            half3 normalTS = UnpackNormalScale(SAMPLE_TEXTURE2D_ARRAY(_TransvoxelNormalArray,
+                sampler_TransvoxelAlbedoArray, layerUv, id), scales.y);
+            half occlusion = SAMPLE_TEXTURE2D_ARRAY(_TransvoxelOcclusionArray,
+                sampler_TransvoxelAlbedoArray, layerUv, id).r;
 
-            if (fade < 0.0)
-            {
-                // Ghost visibility g = -fade (1 -> 0): keep thresholds in [1 - g, edge] —
-                // exactly the pixels the successor's window [0, min(fade, edge)] omits.
-                clip(min(threshold - (1.0 + fade), edge - threshold));
-                return;
-            }
-            clip(min(fade, edge) - threshold);
+            s.albedo += weight * albedo * layerColor.rgb;
+            s.normalTS += weight * normalTS;
+            s.occlusion += weight * (1.0 + scales.z * (occlusion - 1.0)); // occlusion strength
+            s.smoothness += weight * layerColor.a;
         }
+
+        // Full surface blend of the triangle's palette layers: albedo, tangent-space
+        // normal, occlusion and smoothness. The pow-sharpened weights are additionally
+        // steered by the height maps: multiplying by exp2(k·height) is an exact identity
+        // for equal heights (so map-less layers keep the plain crossfade) and lets the
+        // higher material win the boundary in proportion to _TransvoxelHeightBlend.
+        TransvoxelSurface TransvoxelPaletteBlendFull(float2 uv, float3 idsRaw, float2 w01)
+        {
+            int3 ids;
+            float3 w;
+            TransvoxelPaletteSetup(idsRaw, w01, ids, w);
+
+            float3 heights = float3(TransvoxelLayerHeight(uv, ids.x),
+                                    TransvoxelLayerHeight(uv, ids.y),
+                                    TransvoxelLayerHeight(uv, ids.z));
+            w *= exp2(heights * (_TransvoxelHeightBlend * 8.0));
+            w /= max(w.x + w.y + w.z, 1e-5);
+
+            TransvoxelSurface s = (TransvoxelSurface)0;
+            TransvoxelAccumulateLayer(s, uv, ids.x, w.x);
+            TransvoxelAccumulateLayer(s, uv, ids.y, w.y);
+            TransvoxelAccumulateLayer(s, uv, ids.z, w.z);
+            return s;
+        }
+
+        // Applies the blended tangent-space normal without precomputed tangents (the
+        // meshes carry none): the frame is rebuilt from screen-space derivatives of the
+        // world position and UV (Schüler's cotangent-frame construction), so it matches
+        // whatever the UV mapping does at any surface orientation. Degenerate UV areas
+        // fall back to the geometric normal. Fragment stage only (ddx/ddy).
+        float3 TransvoxelPerturbNormal(float3 normalWS, half3 normalTS, float3 positionWS, float2 uv)
+        {
+            float3 dpx = ddx(positionWS);
+            float3 dpy = ddy(positionWS);
+            float2 duvx = ddx(uv);
+            float2 duvy = ddy(uv);
+
+            float3 dpyPerp = cross(dpy, normalWS);
+            float3 dpxPerp = cross(normalWS, dpx);
+            float3 tangent = dpyPerp * duvx.x + dpxPerp * duvy.x;
+            float3 bitangent = dpyPerp * duvx.y + dpxPerp * duvy.y;
+            float invMax = rsqrt(max(max(dot(tangent, tangent), dot(bitangent, bitangent)), 1e-12));
+
+            return normalize(normalTS.x * (tangent * invMax)
+                           + normalTS.y * (bitangent * invMax)
+                           + normalTS.z * normalWS);
+        }
+
         ENDHLSL
 
         Pass
@@ -187,7 +245,7 @@ Shader "Transvoxel/Lit Dithered"
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
             #pragma multi_compile_fragment _ _SHADOWS_SOFT
             #pragma multi_compile_fog
-            #pragma multi_compile _ TRANSVOXEL_PALETTE
+            #pragma multi_compile _ TRANSVOXEL_PALETTE TRANSVOXEL_PALETTE_MAPS
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
 
@@ -197,7 +255,7 @@ Shader "Transvoxel/Lit Dithered"
                 float3 normalOS : NORMAL;
                 float2 uv : TEXCOORD0;
                 float2 fadeData : TEXCOORD1;
-#if defined(TRANSVOXEL_PALETTE)
+#if defined(TRANSVOXEL_ANY_PALETTE)
                 float4 color : COLOR; // material blend data (MaterialBlendEncoder)
 #endif
             };
@@ -212,7 +270,7 @@ Shader "Transvoxel/Lit Dithered"
                 // x = time fade; yz = material corner weights (barycentric after
                 // interpolation; the third weight is 1 - y - z).
                 float3 fadeAndWeights : TEXCOORD4;
-#if defined(TRANSVOXEL_PALETTE)
+#if defined(TRANSVOXEL_ANY_PALETTE)
                 float3 materialIds : TEXCOORD5;
 #endif
             };
@@ -228,7 +286,7 @@ Shader "Transvoxel/Lit Dithered"
                 output.uv = TRANSFORM_TEX(input.uv, _BaseMap);
                 output.fogFactor = ComputeFogFactor(position.positionCS.z);
                 output.fadeAndWeights = float3(TransvoxelVertexFade(input.fadeData), 0.0, 0.0);
-#if defined(TRANSVOXEL_PALETTE)
+#if defined(TRANSVOXEL_ANY_PALETTE)
                 float2 cornerWeights;
                 TransvoxelDecodeBlend(input.color, output.materialIds, cornerWeights);
                 output.fadeAndWeights.yz = cornerWeights;
@@ -240,17 +298,27 @@ Shader "Transvoxel/Lit Dithered"
             {
                 TransvoxelDitherClip(input.positionCS, input.positionWS, input.fadeAndWeights.x);
 
-#if defined(TRANSVOXEL_PALETTE)
+                float3 normalWS = normalize(input.normalWS);
+                half occlusion = 1.0;
+#if defined(TRANSVOXEL_PALETTE_MAPS)
+                TransvoxelSurface surface = TransvoxelPaletteBlendFull(input.uv, input.materialIds,
+                                                                       input.fadeAndWeights.yz);
+                half3 albedo = surface.albedo;
+                normalWS = TransvoxelPerturbNormal(normalWS, surface.normalTS,
+                                                   input.positionWS, input.uv);
+                occlusion = surface.occlusion;
+#elif defined(TRANSVOXEL_PALETTE)
                 half3 albedo = TransvoxelPaletteBlend(input.uv, input.materialIds,
                                                       input.fadeAndWeights.yz).rgb;
 #else
                 half3 albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv).rgb * _BaseColor.rgb;
 #endif
-                float3 normalWS = normalize(input.normalWS);
 
                 float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS);
                 Light mainLight = GetMainLight(shadowCoord);
-                half3 lighting = SampleSH(normalWS);
+                // Occlusion attenuates the ambient/indirect term only, like Unity's Lit
+                // shaders (it folds to ×1 outside the MAPS variant).
+                half3 lighting = SampleSH(normalWS) * occlusion;
                 lighting += mainLight.color
                             * (mainLight.shadowAttenuation * saturate(dot(normalWS, mainLight.direction)));
 
@@ -368,34 +436,65 @@ Shader "Transvoxel/Lit Dithered"
         // addshadow regenerates the shadow pass from surf, so the dither clip also
         // dissolves the chunk's shadow while it fades.
         #pragma surface surf Standard fullforwardshadows addshadow vertex:vert
-        #pragma multi_compile _ TRANSVOXEL_PALETTE
+        #pragma multi_compile _ TRANSVOXEL_PALETTE TRANSVOXEL_PALETTE_MAPS
         #pragma target 3.5
 
         sampler2D _BaseMap;
         fixed4 _BaseColor;
         half _Smoothness;
 
-        // Globals (see the URP subshader note: fade inputs are never material properties).
-        float4 _TransvoxelViewerPos;
-        float _TransvoxelViewDistance;
-        float _TransvoxelEdgeFadeBand;
-        float _TransvoxelFade; // master fade, set globally (1 = normal)
-        sampler2D _TransvoxelEdgeFadeCurve; // edgeFadeCurve LUT: raw edge fade -> kept opacity
+        // The shared fade/dither module (see the URP subshader note: fade inputs are
+        // never material properties). Without an SRP core include it declares classic
+        // sampler2D resources, so it compiles cleanly in CGPROGRAM.
+        #include "TransvoxelDither.hlsl"
 
-        // Material palette globals — same contract as the URP subshader.
+        // Material palette globals — same contract as the URP subshader. The detail-map
+        // arrays share the albedo array's sampler.
         UNITY_DECLARE_TEX2DARRAY(_TransvoxelAlbedoArray);
+        UNITY_DECLARE_TEX2DARRAY_NOSAMPLER(_TransvoxelNormalArray);
+        UNITY_DECLARE_TEX2DARRAY_NOSAMPLER(_TransvoxelOcclusionArray);
+        UNITY_DECLARE_TEX2DARRAY_NOSAMPLER(_TransvoxelHeightArray);
         float4 _TransvoxelLayerColors[64];    // rgb = tint, a = smoothness
-        float4 _TransvoxelLayerScales[64];    // x = uv scale multiplier
+        float4 _TransvoxelLayerScales[64];    // x = uv scale, y = normal str, z = occlusion str
         float _TransvoxelBlendSharpness;
         float _TransvoxelPaletteLayerCount;
+        float _TransvoxelHeightBlend;
 
-        static const float TransvoxelDither[16] =
+#if defined(TRANSVOXEL_PALETTE_MAPS)
+        // Full surface blend — same math as the URP subshader's TransvoxelPaletteBlendFull.
+        struct TransvoxelSurface
         {
-             0.5 / 16.0,  8.5 / 16.0,  2.5 / 16.0, 10.5 / 16.0,
-            12.5 / 16.0,  4.5 / 16.0, 14.5 / 16.0,  6.5 / 16.0,
-             3.5 / 16.0, 11.5 / 16.0,  1.5 / 16.0,  9.5 / 16.0,
-            15.5 / 16.0,  7.5 / 16.0, 13.5 / 16.0,  5.5 / 16.0
+            float3 albedo;
+            float3 normalTS;
+            float occlusion;
+            float smoothness;
         };
+
+        float TransvoxelLayerHeight(float2 uv, int id)
+        {
+            return UNITY_SAMPLE_TEX2DARRAY_SAMPLER(_TransvoxelHeightArray, _TransvoxelAlbedoArray,
+                float3(uv * _TransvoxelLayerScales[id].x, id)).r;
+        }
+
+        void TransvoxelAccumulateLayer(inout TransvoxelSurface s, float2 uv, int id, float weight)
+        {
+            float4 layerColor = _TransvoxelLayerColors[id];
+            float4 scales = _TransvoxelLayerScales[id];
+            float3 layerUv = float3(uv * scales.x, id);
+
+            float3 albedo = UNITY_SAMPLE_TEX2DARRAY(_TransvoxelAlbedoArray, layerUv).rgb;
+            float3 normalTS = UnpackScaleNormal(
+                UNITY_SAMPLE_TEX2DARRAY_SAMPLER(_TransvoxelNormalArray, _TransvoxelAlbedoArray, layerUv),
+                scales.y);
+            float occlusion = UNITY_SAMPLE_TEX2DARRAY_SAMPLER(_TransvoxelOcclusionArray,
+                _TransvoxelAlbedoArray, layerUv).r;
+
+            s.albedo += weight * albedo * layerColor.rgb;
+            s.normalTS += weight * normalTS;
+            s.occlusion += weight * (1.0 + scales.z * (occlusion - 1.0)); // occlusion strength
+            s.smoothness += weight * layerColor.a;
+        }
+#endif
 
         struct Input
         {
@@ -403,8 +502,8 @@ Shader "Transvoxel/Lit Dithered"
             float4 screenPos;
             float3 worldPos;
             float tvFade;
-            // Material blend (used by TRANSVOXEL_PALETTE variants only): the triangle's
-            // id triple and this pixel's first two barycentric corner weights.
+            // Material blend (palette variants only): the triangle's id triple and this
+            // pixel's first two barycentric corner weights.
             float3 tvIds;
             float2 tvWeights;
         };
@@ -412,53 +511,57 @@ Shader "Transvoxel/Lit Dithered"
         void vert(inout appdata_full v, out Input o)
         {
             UNITY_INITIALIZE_OUTPUT(Input, o);
-            float fade = 1.0;
-            float duration = abs(v.texcoord1.y);
-            if (duration > 0.0)
-            {
-                float t = saturate((_Time.y - v.texcoord1.x) / duration);
-                fade = v.texcoord1.y < 0.0 ? -(1.0 - t) : t;
-            }
-            o.tvFade = fade;
-#if defined(TRANSVOXEL_PALETTE)
+            o.tvFade = TransvoxelVertexFade(v.texcoord1.xy);
+#if defined(TRANSVOXEL_PALETTE) || defined(TRANSVOXEL_PALETTE_MAPS)
             o.tvIds = v.color.rgb * 255.0;
             int corner = (int)round(v.color.a * 255.0);
             o.tvWeights = float2(corner == 0 ? 1.0 : 0.0, corner == 1 ? 1.0 : 0.0);
+#endif
+#if defined(TRANSVOXEL_PALETTE_MAPS)
+            // The meshes carry no tangents, and UV0 is the world-space XZ planar map —
+            // so the tangent frame is the fixed terrain one (+X tangent; w = -1 makes
+            // cross(normal, tangent) the +Z bitangent, matching v = z). Chunks are
+            // axis-aligned, so object axes are world axes.
+            v.tangent = float4(1.0, 0.0, 0.0, -1.0);
 #endif
         }
 
         void surf(Input IN, inout SurfaceOutputStandard o)
         {
-            // Same clip rules as the URP subshader: positive fade dithers in, negative fade
-            // is a ghost keeping the complementary pixel set, both capped by the edge dissolve.
-            float fade = IN.tvFade * _TransvoxelFade;
-            float edge = 1.0;
-            if (_TransvoxelEdgeFadeBand > 0.0)
-            {
-                float viewerDistance = distance(IN.worldPos, _TransvoxelViewerPos.xyz);
-                float rawEdge = saturate((_TransvoxelViewDistance - viewerDistance) / _TransvoxelEdgeFadeBand);
-                edge = tex2D(_TransvoxelEdgeFadeCurve, float2(rawEdge, 0.5)).r;
-            }
-            if (fade < 1.0 || edge < 1.0)
-            {
-                float2 pixel = IN.screenPos.xy / max(IN.screenPos.w, 1e-4) * _ScreenParams.xy;
-                uint2 p = (uint2)pixel & 3;
-                float threshold = TransvoxelDither[p.y * 4 + p.x];
-                if (fade < 0.0)
-                    clip(min(threshold - (1.0 + fade), edge - threshold));
-                else
-                    clip(min(fade, edge) - threshold);
-            }
+            // Same clip rules as the URP subshader (shared module): positive fade dithers
+            // in, a negative fade is a ghost keeping the complementary pixel set, both
+            // capped by the edge dissolve.
+            TransvoxelDitherClipScreenPos(IN.screenPos, IN.worldPos, IN.tvFade);
 
-#if defined(TRANSVOXEL_PALETTE)
+#if defined(TRANSVOXEL_PALETTE) || defined(TRANSVOXEL_PALETTE_MAPS)
             // Blend the triangle's palette layers with sharpened barycentric weights —
-            // the same math as the URP subshader's TransvoxelPaletteBlend.
+            // the same math as the URP subshader's TransvoxelPaletteSetup.
             int maxLayer = max((int)_TransvoxelPaletteLayerCount - 1, 0);
             int3 ids = clamp((int3)round(IN.tvIds), 0, maxLayer);
             float3 w = float3(IN.tvWeights, saturate(1.0 - IN.tvWeights.x - IN.tvWeights.y));
             w = pow(max(w, 0.0), _TransvoxelBlendSharpness);
             w /= max(w.x + w.y + w.z, 1e-5);
+#endif
 
+#if defined(TRANSVOXEL_PALETTE_MAPS)
+            // Height-steered weights, then the full surface blend — same math as the URP
+            // subshader's TransvoxelPaletteBlendFull.
+            float3 heights = float3(TransvoxelLayerHeight(IN.uv_BaseMap, ids.x),
+                                    TransvoxelLayerHeight(IN.uv_BaseMap, ids.y),
+                                    TransvoxelLayerHeight(IN.uv_BaseMap, ids.z));
+            w *= exp2(heights * (_TransvoxelHeightBlend * 8.0));
+            w /= max(w.x + w.y + w.z, 1e-5);
+
+            TransvoxelSurface s = (TransvoxelSurface)0;
+            TransvoxelAccumulateLayer(s, IN.uv_BaseMap, ids.x, w.x);
+            TransvoxelAccumulateLayer(s, IN.uv_BaseMap, ids.y, w.y);
+            TransvoxelAccumulateLayer(s, IN.uv_BaseMap, ids.z, w.z);
+
+            o.Albedo = s.albedo;
+            o.Normal = normalize(s.normalTS);
+            o.Occlusion = s.occlusion;
+            o.Smoothness = s.smoothness;
+#elif defined(TRANSVOXEL_PALETTE)
             float4 blended = 0;
             blended += w.x * float4(UNITY_SAMPLE_TEX2DARRAY(_TransvoxelAlbedoArray,
                 float3(IN.uv_BaseMap * _TransvoxelLayerScales[ids.x].x, ids.x)).rgb

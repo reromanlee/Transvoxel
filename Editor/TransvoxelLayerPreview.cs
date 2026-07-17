@@ -7,8 +7,11 @@ namespace reromanlee.Transvoxel.Editor
 {
     /// <summary>
     /// Renders one palette layer as a lit sphere into an offscreen texture, for the
-    /// palette window's rotatable preview. Owns a single <see cref="PreviewRenderUtility"/>
-    /// and preview material; dispose with the view that uses it.
+    /// palette window's rotatable preview. Shows albedo, tint, smoothness and the
+    /// normal/occlusion maps; the height map is not shown — it only steers the blend
+    /// BETWEEN layers, which a single-layer sphere cannot display. Owns a single
+    /// <see cref="PreviewRenderUtility"/> and preview material; dispose with the view
+    /// that uses it.
     /// </summary>
     sealed class TransvoxelLayerPreview : IDisposable
     {
@@ -18,6 +21,10 @@ namespace reromanlee.Transvoxel.Editor
         static readonly int ColorId = Shader.PropertyToID("_Color");
         static readonly int SmoothnessId = Shader.PropertyToID("_Smoothness");
         static readonly int GlossinessId = Shader.PropertyToID("_Glossiness");
+        static readonly int BumpMapId = Shader.PropertyToID("_BumpMap");
+        static readonly int BumpScaleId = Shader.PropertyToID("_BumpScale");
+        static readonly int OcclusionMapId = Shader.PropertyToID("_OcclusionMap");
+        static readonly int OcclusionStrengthId = Shader.PropertyToID("_OcclusionStrength");
 
         PreviewRenderUtility utility;
         Mesh sphereMesh;
@@ -28,17 +35,34 @@ namespace reromanlee.Transvoxel.Editor
         /// utility and stays valid until the next Render call — assign it to the target
         /// image, don't cache it.
         /// </summary>
-        public Texture Render(Texture2D albedo, Color tint, float smoothness, Vector2 angles,
+        public Texture Render(TransvoxelMaterialPalette.Layer layer, Vector2 angles,
             int width, int height)
         {
             EnsureResources();
 
-            if (material.HasProperty(BaseMapId)) material.SetTexture(BaseMapId, albedo);
-            if (material.HasProperty(MainTexId)) material.SetTexture(MainTexId, albedo);
-            if (material.HasProperty(BaseColorId)) material.SetColor(BaseColorId, tint);
-            if (material.HasProperty(ColorId)) material.SetColor(ColorId, tint);
-            if (material.HasProperty(SmoothnessId)) material.SetFloat(SmoothnessId, smoothness);
-            if (material.HasProperty(GlossinessId)) material.SetFloat(GlossinessId, smoothness);
+            if (material.HasProperty(BaseMapId)) material.SetTexture(BaseMapId, layer.albedo);
+            if (material.HasProperty(MainTexId)) material.SetTexture(MainTexId, layer.albedo);
+            if (material.HasProperty(BaseColorId)) material.SetColor(BaseColorId, layer.tint);
+            if (material.HasProperty(ColorId)) material.SetColor(ColorId, layer.tint);
+            if (material.HasProperty(SmoothnessId)) material.SetFloat(SmoothnessId, layer.smoothness);
+            if (material.HasProperty(GlossinessId)) material.SetFloat(GlossinessId, layer.smoothness);
+
+            // Map keywords are shader_features on the pipeline Lit shaders; editor-only
+            // use compiles the needed variant on demand (a keyword unknown to the shader
+            // is simply ignored, e.g. _OCCLUSIONMAP on Standard).
+            if (material.HasProperty(BumpMapId))
+            {
+                material.SetTexture(BumpMapId, layer.normal);
+                SetKeyword("_NORMALMAP", layer.normal != null);
+            }
+            if (material.HasProperty(BumpScaleId)) material.SetFloat(BumpScaleId, layer.normalStrength);
+            if (material.HasProperty(OcclusionMapId))
+            {
+                material.SetTexture(OcclusionMapId, layer.occlusion);
+                SetKeyword("_OCCLUSIONMAP", layer.occlusion != null);
+            }
+            if (material.HasProperty(OcclusionStrengthId))
+                material.SetFloat(OcclusionStrengthId, layer.occlusionStrength);
 
             utility.BeginPreview(new Rect(0f, 0f, width, height), GUIStyle.none);
 
@@ -61,6 +85,14 @@ namespace reromanlee.Transvoxel.Editor
             utility.DrawMesh(sphereMesh, Matrix4x4.TRS(Vector3.zero, rotation, Vector3.one), material, 0);
             camera.Render();
             return utility.EndPreview();
+        }
+
+        void SetKeyword(string keyword, bool enabled)
+        {
+            if (enabled)
+                material.EnableKeyword(keyword);
+            else
+                material.DisableKeyword(keyword);
         }
 
         void EnsureResources()

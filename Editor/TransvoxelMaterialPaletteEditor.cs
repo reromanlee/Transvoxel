@@ -25,6 +25,7 @@ namespace reromanlee.Transvoxel.Editor
                 TransvoxelPaletteWindow.Open((TransvoxelMaterialPalette)target);
             EditorGUILayout.Space(4f);
 
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("heightBlend"));
             EditorGUILayout.PropertyField(serializedObject.FindProperty("layers"), true);
 
             serializedObject.ApplyModifiedProperties();

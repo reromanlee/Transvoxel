@@ -176,11 +176,19 @@ namespace reromanlee.Transvoxel
         static readonly int EdgeFadeCurveId = Shader.PropertyToID("_TransvoxelEdgeFadeCurve");
 
         // Material palette globals (like the fade inputs, never material properties — see
-        // the shader). One palette drives the whole scene; the keyword switches the shader
-        // between the palette blend and the classic _BaseMap path.
+        // the shader). One palette drives the whole scene; the keywords switch the shader
+        // between the classic _BaseMap path, the albedo-only palette blend, and the full
+        // detail-map blend (normal/occlusion/height). The maps variant is picked by palette
+        // CONTENT — a palette whose map slots are all empty keeps the exact albedo-only
+        // shader cost.
         const string PaletteKeyword = "TRANSVOXEL_PALETTE";
+        const string PaletteMapsKeyword = "TRANSVOXEL_PALETTE_MAPS";
         static readonly int PaletteAwareMarkerId = Shader.PropertyToID("_TransvoxelPaletteAware");
         static readonly int AlbedoArrayId = Shader.PropertyToID("_TransvoxelAlbedoArray");
+        static readonly int NormalArrayId = Shader.PropertyToID("_TransvoxelNormalArray");
+        static readonly int OcclusionArrayId = Shader.PropertyToID("_TransvoxelOcclusionArray");
+        static readonly int HeightArrayId = Shader.PropertyToID("_TransvoxelHeightArray");
+        static readonly int HeightBlendId = Shader.PropertyToID("_TransvoxelHeightBlend");
         static readonly int LayerColorsId = Shader.PropertyToID("_TransvoxelLayerColors");
         static readonly int LayerScalesId = Shader.PropertyToID("_TransvoxelLayerScales");
         static readonly int BlendSharpnessId = Shader.PropertyToID("_TransvoxelBlendSharpness");
@@ -235,6 +243,7 @@ namespace reromanlee.Transvoxel
                 subscribedPalette.Changed -= OnPaletteChanged;
             subscribedPalette = null;
             Shader.DisableKeyword(PaletteKeyword);
+            Shader.DisableKeyword(PaletteMapsKeyword);
             ClearScene();
             while (chunkViewPool.Count > 0)
                 chunkViewPool.Pop().Destroy();
@@ -420,12 +429,12 @@ namespace reromanlee.Transvoxel
 
             if (paletteActive)
             {
-                Shader.EnableKeyword(PaletteKeyword);
                 PushPaletteBindings();
             }
             else
             {
                 Shader.DisableKeyword(PaletteKeyword);
+                Shader.DisableKeyword(PaletteMapsKeyword);
             }
         }
 
@@ -434,7 +443,23 @@ namespace reromanlee.Transvoxel
         void PushPaletteBindings()
         {
             TransvoxelMaterialPalette palette = settings.materialPalette;
+
+            // The maps variant is opt-in by content: only a palette that actually carries a
+            // normal/occlusion/height map pays for sampling the detail arrays. Re-picked on
+            // every push, so dropping the first normal map in during Play upgrades the
+            // variant live — the mesh blend data is identical, nothing rebuilds.
+            bool detailMaps = palette.HasDetailMaps;
+            Shader.EnableKeyword(detailMaps ? PaletteMapsKeyword : PaletteKeyword);
+            Shader.DisableKeyword(detailMaps ? PaletteKeyword : PaletteMapsKeyword);
+
             Shader.SetGlobalTexture(AlbedoArrayId, palette.GetAlbedoArray());
+            if (detailMaps)
+            {
+                Shader.SetGlobalTexture(NormalArrayId, palette.GetNormalArray());
+                Shader.SetGlobalTexture(OcclusionArrayId, palette.GetOcclusionArray());
+                Shader.SetGlobalTexture(HeightArrayId, palette.GetHeightArray());
+                Shader.SetGlobalFloat(HeightBlendId, palette.heightBlend);
+            }
             palette.FillLayerUniforms(LayerColorScratch, LayerScaleScratch);
             Shader.SetGlobalVectorArray(LayerColorsId, LayerColorScratch);
             Shader.SetGlobalVectorArray(LayerScalesId, LayerScaleScratch);

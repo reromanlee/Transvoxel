@@ -18,6 +18,14 @@ namespace reromanlee.Transvoxel.Editor
     {
         const int PreviewSize = 280;
 
+        // Layer fields shown in the detail pane, in display order — keep in sync with
+        // TransvoxelMaterialPalette.Layer.
+        static readonly string[] LayerFieldPaths =
+        {
+            "name", "albedo", "tint", "smoothness", "normal", "normalStrength",
+            "occlusion", "occlusionStrength", "height", "uvScaleMultiplier",
+        };
+
         [SerializeField] TransvoxelMaterialPalette palette; // survives domain reloads
 
         SerializedObject serializedPalette;
@@ -160,6 +168,15 @@ namespace reromanlee.Transvoxel.Editor
             layerList.itemIndexChanged += (_, _) => layerList.RefreshItems();
             pane.Add(layerList);
 
+            // Palette-wide (not per layer): how strongly the layers' height maps steer
+            // the material transitions.
+            var heightBlendField = new PropertyField
+            {
+                style = { marginLeft = 4f, marginRight = 4f, marginTop = 4f },
+            };
+            heightBlendField.BindProperty(serializedPalette.FindProperty("heightBlend"));
+            pane.Add(heightBlendField);
+
             pane.Add(new Label("The list index is the material id stored in voxels —\n" +
                                "reordering re-labels already-painted terrain.")
             {
@@ -246,13 +263,15 @@ namespace reromanlee.Transvoxel.Editor
                 },
             });
 
-            detailFields = new[]
+            // The field list outgrew small windows — scroll it under the pinned preview.
+            var fieldScroll = new ScrollView { style = { flexGrow = 1f } };
+            detailFields = new PropertyField[LayerFieldPaths.Length];
+            for (int i = 0; i < detailFields.Length; i++)
             {
-                new PropertyField(), new PropertyField(), new PropertyField(),
-                new PropertyField(), new PropertyField(),
-            };
-            foreach (PropertyField field in detailFields)
-                detailPane.Add(field);
+                detailFields[i] = new PropertyField();
+                fieldScroll.Add(detailFields[i]);
+            }
+            detailPane.Add(fieldScroll);
 
             return detailPane;
         }
@@ -277,25 +296,22 @@ namespace reromanlee.Transvoxel.Editor
 
             SerializedProperty layer = LayersProperty.GetArrayElementAtIndex(index);
             detailHeader.text = $"ID {index} — {layer.FindPropertyRelative("name").stringValue}";
-            string[] fields = { "name", "albedo", "tint", "smoothness", "uvScaleMultiplier" };
-            for (int i = 0; i < fields.Length; i++)
-                detailFields[i].BindProperty(layer.FindPropertyRelative(fields[i]));
+            for (int i = 0; i < LayerFieldPaths.Length; i++)
+                detailFields[i].BindProperty(layer.FindPropertyRelative(LayerFieldPaths[i]));
             RefreshPreview();
         }
 
         void RefreshPreview()
         {
             int index = SelectedLayer;
-            if (index < 0 || preview == null)
+            // Bindings apply to the palette object before TrackSerializedObjectValue fires,
+            // so reading the live layer here always sees the current values.
+            if (index < 0 || preview == null || palette == null || index >= palette.Layers.Count)
                 return;
 
-            SerializedProperty layer = LayersProperty.GetArrayElementAtIndex(index);
             previewAngles.TryGetValue(index, out Vector2 angles);
-            previewImage.image = preview.Render(
-                layer.FindPropertyRelative("albedo").objectReferenceValue as Texture2D,
-                layer.FindPropertyRelative("tint").colorValue,
-                layer.FindPropertyRelative("smoothness").floatValue,
-                angles, PreviewSize, PreviewSize);
+            previewImage.image = preview.Render(palette.Layers[index], angles,
+                PreviewSize, PreviewSize);
             previewImage.MarkDirtyRepaint();
         }
 
