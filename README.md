@@ -271,6 +271,13 @@ terrain.Terraform(worldPoint, radius: 5f, strength: 0.9f, build: true, materialI
   Hybrid backends produce identical ids (the `TRANSVOXEL_MATERIALS` kernel variant adds one
   float per soup vertex, welded and encoded exactly like the CPU path).
 
+**One palette per scene.** The palette bindings — texture arrays, per-layer uniforms, blend
+sharpness, the triplanar and parallax switches — are *global* shader state, for the same
+reason the fade inputs are: batched render paths bypass per-renderer state, and the SRP
+Batcher would lock per-material values. Two `TransvoxelTerrain` instances therefore share
+whichever palette was bound last, and the terrain warns once if it catches two with
+different palettes. One terrain per scene is the supported setup.
+
 Like fading, this needs shader support: the `_TransvoxelPaletteAware` marker property is
 what tags a material as palette-aware, and the palette inputs are global uniforms. The
 blend itself lives in the reusable module
