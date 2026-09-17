@@ -40,6 +40,13 @@ namespace reromanlee.Transvoxel.Samples
         /// <summary>True while the camera has captured the cursor (UI must ignore input).</summary>
         public bool IsLooking { get; private set; }
 
+        /// <summary>
+        /// Set by the demo controller while a UI text field has keyboard focus, so typing a
+        /// value into the panel does not also fly the camera. Movement and look are frozen;
+        /// the cursor is released so the field stays clickable.
+        /// </summary>
+        public bool InputSuppressed { get; set; }
+
         void OnEnable()
         {
             Vector3 euler = transform.eulerAngles;
@@ -97,6 +104,13 @@ namespace reromanlee.Transvoxel.Samples
 
         void Update()
         {
+            if (InputSuppressed)
+            {
+                if (IsLooking)
+                    ReleaseCursor();
+                return;
+            }
+
             bool holding = lookHold.IsPressed();
             if (holding != IsLooking)
             {

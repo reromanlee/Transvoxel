@@ -134,6 +134,8 @@ namespace reromanlee.Transvoxel.Samples
             body = root.Q<VisualElement>("body");
             collapse = root.Q<Button>("collapse");
 
+            SuppressKeyboardShortcuts(root);
+
             if (collapse != null)
             {
                 collapse.clicked += () =>
@@ -150,7 +152,12 @@ namespace reromanlee.Transvoxel.Samples
                     "Right mouse drag — look\n" +
                     "W A S D — fly, Q / E — down / up, Shift — faster\n" +
                     "Left mouse — dig, Shift + left mouse — build\n" +
-                    "Gamepad: sticks fly and look, triggers sculpt, bumpers pick material";
+                    "Gamepad: sticks fly and look, triggers sculpt, bumpers pick material
+" +
+                    "
+The panel is mouse-driven on purpose: it ignores keyboard and gamepad " +
+                    "navigation so flying the camera cannot nudge its controls. Click a " +
+                    "slider's number to type an exact value.";
             }
 
             TransvoxelSettings settings = Settings;
@@ -216,6 +223,55 @@ namespace reromanlee.Transvoxel.Samples
             }
 
             RefreshMaterialPicker();
+        }
+
+        /// <summary>
+        /// Stops the panel from reacting to the keyboard and gamepad on its own.
+        ///
+        /// A runtime UI Toolkit panel has built-in NAVIGATION: the Input System's default UI
+        /// map binds WASD and the arrow keys to Navigate and Space/Enter to Submit. While you
+        /// are flying the camera that silently walks focus through the panel (the ScrollView
+        /// scrolling to follow, so the panel appears to move on its own), changes whichever
+        /// Slider happens to hold focus, and flips Toggles on Submit.
+        ///
+        /// Swallowing the navigation events at the root — before they ever reach a control —
+        /// leaves the panel mouse-driven, while typing into the sliders' numeric fields still
+        /// works because text entry arrives as KeyDownEvent on a focused text field, which is
+        /// explicitly let through.
+        /// </summary>
+        void SuppressKeyboardShortcuts(VisualElement root)
+        {
+            root.RegisterCallback<NavigationMoveEvent>(Swallow, TrickleDown.TrickleDown);
+            root.RegisterCallback<NavigationSubmitEvent>(Swallow, TrickleDown.TrickleDown);
+            root.RegisterCallback<NavigationCancelEvent>(Swallow, TrickleDown.TrickleDown);
+
+            // Belt and braces for any control that reads raw keys rather than navigation.
+            root.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (IsTypingInUI())
+                    return;
+                Swallow(e);
+            }, TrickleDown.TrickleDown);
+        }
+
+        static void Swallow(EventBase e)
+        {
+            e.StopImmediatePropagation();
+            e.PreventDefault();
+        }
+
+        /// <summary>
+        /// True while a text field inside the panel holds keyboard focus — the one case where
+        /// keystrokes belong to the UI, so the camera and the brush must keep their hands off
+        /// them or typing "120" into a field would also fly you forward.
+        /// </summary>
+        public bool IsTypingInUI()
+        {
+            VisualElement root = document != null ? document.rootVisualElement : null;
+            var focused = root?.panel?.focusController?.focusedElement as VisualElement;
+            if (focused == null)
+                return false;
+            return focused is TextField || focused.GetFirstAncestorOfType<TextField>() != null;
         }
 
         /// <summary>Wires one widget to an initial value and a setter, ignoring echo changes.</summary>
@@ -301,8 +357,17 @@ namespace reromanlee.Transvoxel.Samples
         void Update()
         {
             fps = Mathf.Lerp(fps, 1f / Mathf.Max(Time.unscaledDeltaTime, 1e-5f), 0.05f);
-            HandleMaterialCycling();
-            HandleSculpting();
+
+            // Typing a value into one of the numeric fields must not also fly the camera or
+            // cycle the build material.
+            bool typing = IsTypingInUI();
+            if (flyCamera != null)
+                flyCamera.InputSuppressed = typing;
+            if (!typing)
+            {
+                HandleMaterialCycling();
+                HandleSculpting();
+            }
             RefreshStats();
         }
 

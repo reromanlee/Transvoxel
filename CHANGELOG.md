@@ -75,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The sphere brush stored an edit for every voxel it touched, including those at the clamp
   (digging air already empty, building ground already solid) and at the rim where influence
   fades out, pinning them into the sparse edit layer forever for an invisible change.
+- **The sample's overlay drove itself while the player flew the camera.** A runtime UI
+  Toolkit panel has built-in navigation, and the Input System's default UI map binds
+  WASD/arrows to Navigate and Space/Enter to Submit — so focus walked through the panel
+  (the ScrollView scrolling to follow it, making the panel appear to move on its own),
+  sliders under focus changed value, and toggles flipped. The panel now swallows navigation
+  events at its root and is mouse-driven; typing into the sliders' numeric fields still
+  works, and while a field has focus the camera and brush stand down so typing a value does
+  not also fly you forward.
 
 ### Changed
 
