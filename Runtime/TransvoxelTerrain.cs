@@ -1801,16 +1801,31 @@ namespace reromanlee.Transvoxel
             TotalVertices = total;
         }
 
+        static bool warnedAboutNonUrp;
+
         static Material CreateDefaultMaterial()
         {
-            // Prefer the package's stipple-fading shader (URP + Built-in subshaders inside);
-            // HDRP is not covered by it, so HDRP keeps its own Lit (no fading there).
+            // The package's shader is URP-only (its single SubShader declares the URP
+            // package requirement). The mesher itself is pipeline-agnostic, so a Built-in
+            // or HDRP project still gets working terrain — just on that pipeline's own lit
+            // shader, without the stipple fades or voxel materials.
             var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
-            bool isHdrp = pipeline != null && pipeline.GetType().Name.Contains("HD");
-            Shader shader = isHdrp ? null : Shader.Find("Transvoxel/Lit Dithered");
-            if (shader == null) shader = Shader.Find("Universal Render Pipeline/Lit");
-            if (shader == null) shader = Shader.Find("HDRP/Lit");
-            if (shader == null) shader = Shader.Find("Standard");
+            bool isUniversal = pipeline != null && pipeline.GetType().Name.Contains("Universal");
+            Shader shader = isUniversal ? Shader.Find("Transvoxel/Lit Dithered") : null;
+            if (shader == null)
+            {
+                if (!warnedAboutNonUrp)
+                {
+                    warnedAboutNonUrp = true;
+                    Debug.LogWarning("[Transvoxel] The active render pipeline is not URP, so the " +
+                                     "bundled 'Transvoxel/Lit Dithered' shader cannot be used. The " +
+                                     "terrain renders on the pipeline's default lit shader instead: " +
+                                     "meshing, LODs, colliders and terraforming all work, but the " +
+                                     "stipple fades, voxel materials, triplanar and parallax need URP.");
+                }
+                shader = pipeline != null ? pipeline.defaultShader : null;
+                if (shader == null) shader = Shader.Find("Standard");
+            }
             var material = new Material(shader) { name = "Transvoxel Default" };
             var grass = new Color(0.42f, 0.55f, 0.3f);
             if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", grass);

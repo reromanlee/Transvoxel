@@ -1,7 +1,6 @@
 // Reusable Transvoxel material-palette module — the blend of the terrain's per-layer
 // texture arrays behind Transvoxel/Lit Dithered, packaged so URP shaders and Shader
-// Graphs can render voxel materials too. (SRP contexts only: the Built-in pipeline
-// palette path lives in TransvoxelLitDithered.shader's CG subshader.)
+// Graphs can render voxel materials too. (URP only — this package depends on URP.)
 //
 // Shader Graph usage (full walkthrough in the README's Voxel materials section):
 //
@@ -39,7 +38,7 @@
 #define TRANSVOXEL_PALETTE_INCLUDED
 
 #if !defined(UNITY_COMMON_INCLUDED)
-#error TransvoxelPalette.hlsl needs an SRP include context (a URP shader or Shader Graph); the Built-in pipeline palette path is implemented directly in TransvoxelLitDithered.shader.
+#error TransvoxelPalette.hlsl needs an SRP include context (a URP shader or Shader Graph); this package is URP-only.
 #endif
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl"

@@ -3,6 +3,9 @@
   "version": "1.2.1",
   "displayName": "Transvoxel",
   "unity": "6000.0",
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.0.0"
+  },
   "license": "MIT",
   "documentationUrl": "https://github.com/reromanlee/Transvoxel#readme",
   "changelogUrl": "https://github.com/reromanlee/Transvoxel/blob/main/CHANGELOG.md",
@@ -13,5 +16,5 @@
     "url": "https://github.com/reromanlee",
     "email": "contact@reromanlee.com"
   },
-  "description": "Clean, modular implementation of Eric Lengyel's Transvoxel algorithm for Unity with seamless LOD triangulation of a density field managed by an octree for large, editable, real-time landscapes."
+  "description": "Clean, modular implementation of Eric Lengyel's Transvoxel algorithm for Unity (URP) with seamless LOD triangulation of a density field managed by an octree for large, editable, real-time landscapes."
 }

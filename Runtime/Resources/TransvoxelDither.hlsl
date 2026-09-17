@@ -18,9 +18,9 @@
 //     pass that draws the mesh (forward, ShadowCaster, DepthOnly) or shadows/depth will
 //     not dissolve with the surface. Declare the _TransvoxelFadeAware marker property.
 //
-//   * Built-in pipeline (CGPROGRAM): same include and calls. Surface shaders have no
-//     SV_POSITION input — use TransvoxelDitherClipScreenPos(IN.screenPos, IN.worldPos,
-//     fade) instead. TransvoxelLitDithered.shader's second subshader is the reference.
+//   * A URP shader whose fragment stage has no SV_POSITION input: call
+//     TransvoxelDitherClipScreenPos(screenPos, positionWS, fade) instead — it derives the
+//     pixel coordinate from a ComputeScreenPos-style raw screen position.
 //
 // Everything here is driven by mesh UV1 (TEXCOORD1 — what Mesh.uv2 stores) plus GLOBAL
 // uniforms only. Never redeclare these uniforms as material properties, Properties-block
@@ -41,20 +41,19 @@ float _TransvoxelFade;          // master fade (1 = normal; terrain writes it ev
 
 // 256x1 LUT baked from the edgeFadeCurve setting: input = raw edge fade (0 at the draw
 // distance, 1 at the viewer), output = kept opacity. Only sampled while the band is > 0,
-// so an unbound texture is never read. SRP texture macros when an SRP core include
-// preceded us (URP shaders, every Shader Graph target); classic sampler2D otherwise
-// (Built-in pipeline).
-#if defined(UNITY_COMMON_INCLUDED)
+// so an unbound texture is never read.
+#if !defined(UNITY_COMMON_INCLUDED)
+#error TransvoxelDither.hlsl needs an SRP include context (a URP shader or Shader Graph); this package is URP-only.
+#endif
+
 TEXTURE2D(_TransvoxelEdgeFadeCurve);
 SAMPLER(sampler_TransvoxelEdgeFadeCurve);
-#define TransvoxelSampleEdgeCurve(rawEdge) \
-    SAMPLE_TEXTURE2D_LOD(_TransvoxelEdgeFadeCurve, sampler_TransvoxelEdgeFadeCurve, \
-                         float2(rawEdge, 0.5), 0).r
-#else
-sampler2D _TransvoxelEdgeFadeCurve;
-#define TransvoxelSampleEdgeCurve(rawEdge) \
-    tex2Dlod(_TransvoxelEdgeFadeCurve, float4(rawEdge, 0.5, 0, 0)).r
-#endif
+
+float TransvoxelSampleEdgeCurve(float rawEdge)
+{
+    return SAMPLE_TEXTURE2D_LOD(_TransvoxelEdgeFadeCurve, sampler_TransvoxelEdgeFadeCurve,
+                                float2(rawEdge, 0.5), 0).r;
+}
 
 // 4x4 Bayer matrix, thresholds centered so fade 1 keeps every pixel.
 static const float TransvoxelDither[16] =
@@ -113,8 +112,8 @@ void TransvoxelDitherClip(float4 positionCS, float3 positionWS, float vertexFade
     clip(TransvoxelDitherKeepValue(uint2(positionCS.xy), fade, edge));
 }
 
-// The same clip from a ComputeScreenPos-style raw screen position — for Built-in surface
-// shaders (Input.screenPos) and anywhere SV_POSITION is not available.
+// The same clip from a ComputeScreenPos-style raw screen position, for URP shaders and
+// graphs whose fragment stage has no SV_POSITION input.
 void TransvoxelDitherClipScreenPos(float4 screenPos, float3 positionWS, float vertexFade)
 {
     float fade = vertexFade * _TransvoxelFade;
