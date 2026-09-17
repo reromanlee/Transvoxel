@@ -60,7 +60,8 @@ Notes worth knowing:
 ### From a release tarball
 
 Every [release](https://github.com/reromanlee/Transvoxel/releases) attaches
-`com.reromanlee.transvoxel-<version>.tgz`. No Git needed, and the version is frozen.
+`com.reromanlee.transvoxel-<version>.tgz` (about 0.8 MB). No Git needed, and the version is
+frozen.
 
 1. Download the `.tgz` from the release.
 2. Put it **inside your project** — a `Packages/` folder next to `manifest.json` works well —

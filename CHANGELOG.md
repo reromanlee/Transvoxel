@@ -95,6 +95,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The published tarball is 0.8 MB instead of 72 MB.** `.npmignore` now excludes `Sources/`
+  (58 MB of reference PDFs and the original C++ tables) and `.github/` (13 MB of README
+  artwork) — neither is needed at runtime or in the editor, and both stay in the repository.
+  Consequence: README images do not resolve from an installed copy; `documentationUrl`
+  points at GitHub, where the README is actually read.
 - The material palette inspector is now UI Toolkit, the last IMGUI in the editor assembly.
 - Height maps are documented as what they are: they steer material boundaries *and* feed the
   parallax ray march.
