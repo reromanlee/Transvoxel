@@ -1,0 +1,74 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 49826d88f3b477249875f5bf65334c49, type: 3}
+  m_Name: DemoSettings
+  m_EditorClassIdentifier: reromanlee.Transvoxel::reromanlee.Transvoxel.TransvoxelSettings
+  voxelSize: 1
+  chunkCells: 16
+  maxLodLevels: 4
+  viewDistance: 500
+  lodSplitFactor: 1.4
+  isoLevel: 0.5
+  smoothShading: 1
+  material: {fileID: 0}
+  uvScale: 0.25
+  colorizeLods: 0
+  chunkFadeInSeconds: 0.4
+  edgeFadeFraction: 0.1
+  edgeFadeCurve:
+    serializedVersion: 2
+    m_Curve:
+    - serializedVersion: 3
+      time: 0
+      value: 0
+      inSlope: 0
+      outSlope: 1
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 1
+      value: 1
+      inSlope: 1
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    m_PreInfinity: 2
+    m_PostInfinity: 2
+    m_RotationOrder: 4
+  materialPalette: {fileID: 11400000, guid: 5d18f211461300344be7e32c7b46628d, type: 2}
+  materialBlendSharpness: 4
+  noise:
+    seed: 1337
+    groundLevel: 0
+    heightAmplitude: 42
+    frequency: 0.005
+    octaves: 5
+    lacunarity: 2
+    persistence: 0.5
+    surfaceBlend: 8
+    caveStrength: 1.6
+    caveFrequency: 0.028
+    caveThreshold: 0.5
+  meshingBackend: 0
+  gpuComputeOverride: {fileID: 0}
+  gpuJobsInFlight: 8
+  meshApplyBudgetMs: 3
+  meshApplyBudgetPerFrame: 16
+  maxConcurrentBuilds: 0
+  colliderMaxLod: 0
+  viewerMoveThreshold: 0.5
+  lodSwapLinger: 0.5
+  densityCacheChunks: 512

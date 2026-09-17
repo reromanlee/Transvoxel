@@ -42,7 +42,11 @@ namespace reromanlee.Transvoxel.Octree
         readonly float viewDistanceVoxels;
         readonly float splitFactor;
 
-        // Scratch collections, reused between calls (main thread only).
+        // Scratch collections, reused between calls. SelectChunks runs on a worker task
+        // (TransvoxelTerrain.PumpSelection), so this state is NOT main-thread-only: what
+        // makes it safe is that the terrain keeps at most one selection in flight and
+        // never reads the results until that task has completed. Keep both invariants if
+        // you ever parallelize selection.
         readonly HashSet<NodeKey> leaves = new HashSet<NodeKey>();
         readonly Queue<NodeKey> balanceQueue = new Queue<NodeKey>();
 

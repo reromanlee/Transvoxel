@@ -1,5 +1,6 @@
 using UnityEditor;
-using UnityEngine;
+using UnityEditor.UIElements;
+using UnityEngine.UIElements;
 
 namespace reromanlee.Transvoxel.Editor
 {
@@ -12,22 +13,30 @@ namespace reromanlee.Transvoxel.Editor
     [CustomEditor(typeof(TransvoxelMaterialPalette))]
     public sealed class TransvoxelMaterialPaletteEditor : UnityEditor.Editor
     {
-        public override void OnInspectorGUI()
+        public override VisualElement CreateInspectorGUI()
         {
-            serializedObject.Update();
+            var root = new VisualElement();
 
-            EditorGUILayout.HelpBox(
+            root.Add(new HelpBox(
                 "The list index is the material id stored in voxels: layer 0 fills the " +
                 "whole world by default, terraforming assigns the other ids. Reordering " +
-                "re-labels already-painted terrain.", MessageType.Info);
+                "re-labels already-painted terrain.", HelpBoxMessageType.Info));
 
-            if (GUILayout.Button("Open Palette Editor", GUILayout.Height(28f)))
-                TransvoxelPaletteWindow.Open((TransvoxelMaterialPalette)target);
-            EditorGUILayout.Space(4f);
+            var openButton = new Button(() =>
+                TransvoxelPaletteWindow.Open((TransvoxelMaterialPalette)target))
+            {
+                text = "Open Palette Editor",
+                style = { height = 28f, marginTop = 4f, marginBottom = 6f },
+            };
+            root.Add(openButton);
 
-            EditorGUILayout.PropertyField(serializedObject.FindProperty("layers"), true);
+            // PropertyFields bind themselves to the inspector's SerializedObject, so edits
+            // support undo and fire the palette's OnValidate — a running terrain re-bakes
+            // its texture arrays and re-binds the shader uniforms live.
+            root.Add(new PropertyField(serializedObject.FindProperty("heightBlend")));
+            root.Add(new PropertyField(serializedObject.FindProperty("layers")));
 
-            serializedObject.ApplyModifiedProperties();
+            return root;
         }
     }
 }

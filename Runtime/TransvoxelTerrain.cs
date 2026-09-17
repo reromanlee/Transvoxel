@@ -95,6 +95,23 @@ namespace reromanlee.Transvoxel
 
         const int MaxPooledChunkViews = 512;
 
+        /// <summary>Debug tint per LOD level; the last entry covers every deeper level.</summary>
+        static readonly Color[] LodTints =
+        {
+            new Color(1f, 1f, 1f),        // LOD0 white
+            new Color(0.6f, 1f, 0.6f),    // LOD1 green
+            new Color(0.6f, 0.8f, 1f),    // LOD2 blue
+            new Color(1f, 1f, 0.5f),      // LOD3 yellow
+            new Color(1f, 0.7f, 0.4f),    // LOD4 orange
+            new Color(1f, 0.5f, 0.5f),    // LOD5 red
+            new Color(1f, 0.6f, 1f),      // LOD6 magenta
+            new Color(0.7f, 0.7f, 0.7f),  // LOD7+ grey
+        };
+
+        static readonly int LodTintId = Shader.PropertyToID("_TransvoxelLodTint");
+        static readonly int BaseColorId = Shader.PropertyToID("_BaseColor"); // URP/HDRP Lit
+        static readonly int ColorId = Shader.PropertyToID("_Color");         // Built-in Standard
+
         // ---- pipeline (rebuilt on any settings change) ----
         IDensitySource density;
         TerrainOctree octree;
@@ -176,15 +193,32 @@ namespace reromanlee.Transvoxel
         static readonly int EdgeFadeCurveId = Shader.PropertyToID("_TransvoxelEdgeFadeCurve");
 
         // Material palette globals (like the fade inputs, never material properties — see
-        // the shader). One palette drives the whole scene; the keyword switches the shader
-        // between the palette blend and the classic _BaseMap path.
+        // the shader). One palette drives the whole scene; the keywords switch the shader
+        // between the classic _BaseMap path, the albedo-only palette blend, and the full
+        // detail-map blend (normal/occlusion/height). The maps variant is picked by palette
+        // CONTENT — a palette whose map slots are all empty keeps the exact albedo-only
+        // shader cost.
         const string PaletteKeyword = "TRANSVOXEL_PALETTE";
+        const string PaletteMapsKeyword = "TRANSVOXEL_PALETTE_MAPS";
+        const string TriplanarKeyword = "TRANSVOXEL_TRIPLANAR";
+        const string ParallaxKeyword = "TRANSVOXEL_PARALLAX";
         static readonly int PaletteAwareMarkerId = Shader.PropertyToID("_TransvoxelPaletteAware");
         static readonly int AlbedoArrayId = Shader.PropertyToID("_TransvoxelAlbedoArray");
+        static readonly int NormalArrayId = Shader.PropertyToID("_TransvoxelNormalArray");
+        static readonly int OcclusionArrayId = Shader.PropertyToID("_TransvoxelOcclusionArray");
+        static readonly int HeightArrayId = Shader.PropertyToID("_TransvoxelHeightArray");
+        static readonly int HeightBlendId = Shader.PropertyToID("_TransvoxelHeightBlend");
         static readonly int LayerColorsId = Shader.PropertyToID("_TransvoxelLayerColors");
         static readonly int LayerScalesId = Shader.PropertyToID("_TransvoxelLayerScales");
         static readonly int BlendSharpnessId = Shader.PropertyToID("_TransvoxelBlendSharpness");
         static readonly int PaletteLayerCountId = Shader.PropertyToID("_TransvoxelPaletteLayerCount");
+        static readonly int UvScaleId = Shader.PropertyToID("_TransvoxelUvScale");
+        static readonly int TriplanarEnabledId = Shader.PropertyToID("_TransvoxelTriplanarEnabled");
+        static readonly int TriplanarSharpnessId = Shader.PropertyToID("_TransvoxelTriplanarSharpness");
+        static readonly int ParallaxEnabledId = Shader.PropertyToID("_TransvoxelParallaxEnabled");
+        static readonly int ParallaxMinStepsId = Shader.PropertyToID("_TransvoxelParallaxMinSteps");
+        static readonly int ParallaxMaxStepsId = Shader.PropertyToID("_TransvoxelParallaxMaxSteps");
+        static readonly int ParallaxDistanceId = Shader.PropertyToID("_TransvoxelParallaxDistance");
 
         // Uniform arrays must always be uploaded at the full declared size: Unity fixes a
         // shader array's length the first time it is set. Main thread only.
@@ -198,6 +232,20 @@ namespace reromanlee.Transvoxel
         bool paletteActive;
         TransvoxelMaterialPalette subscribedPalette;
         bool paletteDirty;
+
+        // The palette keywords are GLOBAL shader state shared by every terrain in the
+        // scene, so the last terrain to switch its palette off must not turn voxel
+        // materials off for the others. Refcounted across instances; see the README's
+        // note that one palette and one fade configuration drive the whole scene.
+        static int paletteKeywordUsers;
+        static bool warnedAboutMultipleTerrains;
+        static TransvoxelMaterialPalette boundPalette;
+        bool holdsPaletteKeywords;
+
+        // Lazily built per-LOD copies of the runtime material, used only while
+        // colorizeLods is on. Shared materials (not per-renderer overrides), so tinted
+        // chunks keep SRP batching and the tint survives batched render paths.
+        Material[] lodTintMaterials;
 
         // The edgeFadeCurve is baked into a small LUT texture (curve.Evaluate can't run per
         // pixel) and pushed as a global so it reaches every render path, like the other fade
@@ -234,8 +282,9 @@ namespace reromanlee.Transvoxel
             if (subscribedPalette != null)
                 subscribedPalette.Changed -= OnPaletteChanged;
             subscribedPalette = null;
-            Shader.DisableKeyword(PaletteKeyword);
+            SetPaletteKeywordsHeld(false);
             ClearScene();
+            DestroyLodTintMaterials();
             while (chunkViewPool.Count > 0)
                 chunkViewPool.Pop().Destroy();
             if (edgeFadeLut != null)
@@ -295,9 +344,12 @@ namespace reromanlee.Transvoxel
                 settings.viewDistance, settings.lodSplitFactor);
             cache = new SampleCache(settings.densityCacheChunks);
             buildQueue = new BuildQueue(settings.chunkCells);
+            Material previousMaterial = runtimeMaterial;
             runtimeMaterial = settings.material != null
                 ? settings.material
                 : generatedMaterial ??= CreateDefaultMaterial();
+            if (!ReferenceEquals(previousMaterial, runtimeMaterial))
+                DestroyLodTintMaterials(); // the tint copies are derived from it
 
             // Fading is implemented in the shader; a material without _TransvoxelFade can't
             // show it, so disable the whole fade/ghost machinery instead of producing
@@ -416,17 +468,45 @@ namespace reromanlee.Transvoxel
                                  $"material's shader ('{runtimeMaterial.shader.name}') has no " +
                                  "_TransvoxelPaletteAware support — voxel materials are disabled. " +
                                  "Switch the material to 'Transvoxel/Lit Dithered' (or leave the " +
-                                 "material empty to get it by default).", this);
+                                 "material empty to get it by default), or make your own " +
+                                 "shader/graph palette-aware with TransvoxelPalette.hlsl — see " +
+                                 "the README's Voxel materials section.", this);
 
+            SetPaletteKeywordsHeld(paletteActive);
             if (paletteActive)
-            {
-                Shader.EnableKeyword(PaletteKeyword);
                 PushPaletteBindings();
-            }
+        }
+
+        /// <summary>
+        /// Claims or releases this terrain's share of the global palette keywords. They are
+        /// only switched off once no terrain needs them — otherwise disabling one terrain
+        /// would strip voxel materials from every other terrain still rendering.
+        /// </summary>
+        static void SetKeyword(string keyword, bool enabled)
+        {
+            if (enabled)
+                Shader.EnableKeyword(keyword);
             else
+                Shader.DisableKeyword(keyword);
+        }
+
+        void SetPaletteKeywordsHeld(bool held)
+        {
+            if (held == holdsPaletteKeywords)
+                return;
+            holdsPaletteKeywords = held;
+            paletteKeywordUsers = Mathf.Max(0, paletteKeywordUsers + (held ? 1 : -1));
+            if (paletteKeywordUsers == 0)
             {
                 Shader.DisableKeyword(PaletteKeyword);
+                Shader.DisableKeyword(PaletteMapsKeyword);
+                Shader.DisableKeyword(TriplanarKeyword);
+                Shader.DisableKeyword(ParallaxKeyword);
+                Shader.SetGlobalFloat(TriplanarEnabledId, 0f);
+                Shader.SetGlobalFloat(ParallaxEnabledId, 0f);
+                boundPalette = null;
             }
+
         }
 
         void OnPaletteChanged() => paletteDirty = true;
@@ -434,11 +514,71 @@ namespace reromanlee.Transvoxel
         void PushPaletteBindings()
         {
             TransvoxelMaterialPalette palette = settings.materialPalette;
+
+            // The maps variant is opt-in by content: only a palette that actually carries a
+            // normal/occlusion/height map pays for sampling the detail arrays. Re-picked on
+            // every push, so dropping the first normal map in during Play upgrades the
+            // variant live — the mesh blend data is identical, nothing rebuilds.
+            bool detailMaps = palette.HasDetailMaps;
+            Shader.EnableKeyword(detailMaps ? PaletteMapsKeyword : PaletteKeyword);
+            Shader.DisableKeyword(detailMaps ? PaletteKeyword : PaletteMapsKeyword);
+
+            // Triplanar and parallax are opt-in per palette, and parallax additionally needs
+            // something to march: a palette with the box ticked but no height map anywhere
+            // stays on the cheaper variant instead of paying for a ray march through a
+            // constant field. Both re-evaluate on every push, so ticking a box (or dropping
+            // the first height map in) upgrades the variant live — no chunk is rebuilt, the
+            // mesh data is identical either way.
+            bool triplanar = palette.triplanar;
+            bool parallax = detailMaps && palette.ParallaxActive;
+            SetKeyword(TriplanarKeyword, triplanar);
+            SetKeyword(ParallaxKeyword, parallax);
+
+            // The same switches as dynamic globals, for Shader Graphs — they have no keyword
+            // machinery and branch on these instead.
+            Shader.SetGlobalFloat(TriplanarEnabledId, triplanar ? 1f : 0f);
+            Shader.SetGlobalFloat(ParallaxEnabledId, parallax ? 1f : 0f);
+            Shader.SetGlobalFloat(TriplanarSharpnessId, palette.triplanarSharpness);
+            Shader.SetGlobalFloat(ParallaxMinStepsId, Mathf.Min(palette.parallaxMinSteps,
+                palette.parallaxMaxSteps));
+            Shader.SetGlobalFloat(ParallaxMaxStepsId, Mathf.Max(palette.parallaxMinSteps,
+                palette.parallaxMaxSteps));
+            Shader.SetGlobalFloat(ParallaxDistanceId, palette.parallaxDistance);
+            // Triplanar derives its own UVs from world position, so it needs the scale the
+            // mesher baked into UV0 to match the planar mapping's density.
+            Shader.SetGlobalFloat(UvScaleId, settings.uvScale);
+
+            // Every array is bound whenever a palette is active — the keyword only decides
+            // which of them the BUNDLED shader samples. Custom shaders and Shader Graphs
+            // using TransvoxelPalette.hlsl sample unconditionally (they have no keyword
+            // machinery), so the detail arrays must always hold at least the baked neutral
+            // fallbacks (tiny 4x4 slices when the palette carries no such maps).
             Shader.SetGlobalTexture(AlbedoArrayId, palette.GetAlbedoArray());
+            Shader.SetGlobalTexture(NormalArrayId, palette.GetNormalArray());
+            Shader.SetGlobalTexture(OcclusionArrayId, palette.GetOcclusionArray());
+            Shader.SetGlobalTexture(HeightArrayId, palette.GetHeightArray());
+            Shader.SetGlobalFloat(HeightBlendId, palette.heightBlend);
             palette.FillLayerUniforms(LayerColorScratch, LayerScaleScratch);
             Shader.SetGlobalVectorArray(LayerColorsId, LayerColorScratch);
             Shader.SetGlobalVectorArray(LayerScalesId, LayerScaleScratch);
             Shader.SetGlobalFloat(PaletteLayerCountId, palette.LayerCount);
+
+            // Two terrains sharing the scene is only a problem when they want DIFFERENT
+            // palettes: the bindings are global, so the second one to push wins and both
+            // render with it. Counting active terrains would also fire while one is being
+            // torn down and replaced, which is harmless and common.
+            if (boundPalette != null && !ReferenceEquals(boundPalette, palette)
+                && !warnedAboutMultipleTerrains)
+            {
+                warnedAboutMultipleTerrains = true;
+                Debug.LogWarning("[Transvoxel] Two TransvoxelTerrains are active with different " +
+                                 $"material palettes ('{boundPalette.name}' and '{palette.name}'). " +
+                                 "The palette, fade and blend inputs are GLOBAL shader state, so " +
+                                 "both terrains render with whichever was bound last. One palette " +
+                                 "per scene is the supported setup — see the README's Voxel " +
+                                 "materials section.", this);
+            }
+            boundPalette = palette;
         }
 
         void StartCpuWorkers()
@@ -634,11 +774,11 @@ namespace reromanlee.Transvoxel
             if (settingsDirty)
             {
                 settingsDirty = false;
-                // A fade-only edit (edge fade fraction/curve) leaves the structural key intact:
-                // just rebake the LUT and let UpdateChunkFades push the band, keeping every live
-                // chunk on screen so the curve can be tuned without a full rebuild + re-fade.
+                // An edit that only touches live tunables (fade timings/curve, the LOD debug
+                // tint) leaves the structural key intact: refresh those in place and keep
+                // every live chunk on screen instead of re-sampling and re-meshing the world.
                 if (appliedStructuralKey != null && ComputeStructuralKey() == appliedStructuralKey)
-                    BakeEdgeFadeCurve();
+                    RefreshLiveTunables();
                 else
                     ApplySettings();
             }
@@ -701,6 +841,19 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>
+        /// Applies a settings edit that changed nothing structural: the fade timings, the
+        /// edge-fade curve and the LOD debug tint, all without touching a single chunk's
+        /// geometry.
+        /// </summary>
+        void RefreshLiveTunables()
+        {
+            effectiveFadeSeconds = fadeAwareMaterial ? settings.chunkFadeInSeconds : 0f;
+            BakeEdgeFadeCurve();
+            RefreshLodTint();
+            appliedStructuralKey = ComputeStructuralKey();
+        }
+
+        /// <summary>
         /// Bakes <see cref="TransvoxelSettings.edgeFadeCurve"/> into a 1D LUT texture and
         /// publishes it as the <c>_TransvoxelEdgeFadeCurve</c> global. The shader samples it by
         /// the raw edge fade (0 at the draw distance, 1 at the viewer) to reshape the dither
@@ -734,10 +887,14 @@ namespace reromanlee.Transvoxel
         /// <summary>
         /// A fingerprint of every setting that requires rebuilding the octree/density/meshing
         /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/>,
-        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> and
-        /// <see cref="TransvoxelSettings.materialBlendSharpness"/> are deliberately excluded —
-        /// they only feed shader globals and the fade LUT, so editing them refreshes those in
-        /// place instead of tearing down the whole scene. The material palette counts only by
+        /// <see cref="TransvoxelSettings.edgeFadeCurve"/>,
+        /// <see cref="TransvoxelSettings.materialBlendSharpness"/>,
+        /// <see cref="TransvoxelSettings.colorizeLods"/> and
+        /// <see cref="TransvoxelSettings.chunkFadeInSeconds"/> are deliberately excluded —
+        /// they only feed shader globals, the fade LUT and which material a renderer points
+        /// at, so editing them refreshes those in place instead of tearing down the whole
+        /// scene. (Chunks already on screen keep the fade duration baked into their mesh at
+        /// apply time; the new value applies to everything built from then on.) The material palette counts only by
         /// identity: swapping the asset re-meshes (vertices carry blend data), while edits
         /// inside it just re-bind textures and uniforms. Keep this in sync when adding
         /// settings that affect geometry.
@@ -748,7 +905,6 @@ namespace reromanlee.Transvoxel
                 settings.voxelSize, settings.chunkCells, settings.maxLodLevels, settings.viewDistance,
                 settings.lodSplitFactor, settings.isoLevel, settings.smoothShading,
                 settings.material != null ? settings.material.GetEntityId().ToString() : "0", settings.uvScale,
-                settings.colorizeLods, settings.chunkFadeInSeconds,
                 settings.materialPalette != null ? settings.materialPalette.GetEntityId().ToString() : "0",
                 JsonUtility.ToJson(settings.noise),
                 (int)settings.meshingBackend,
@@ -1103,7 +1259,6 @@ namespace reromanlee.Transvoxel
                     {
                         var ghost = RentChunkView(result.Key);
                         ghost.AttachGhostMesh(oldMesh);
-                        ghost.SetLodTintVisible(settings.colorizeLods);
                         AddDyingChunk(ghost);
                     }
                 }
@@ -1112,7 +1267,7 @@ namespace reromanlee.Transvoxel
 
             chunk.TransitionMask = result.Mask;
             bool empty = result.IsEmpty;
-            chunk.Apply(result.Buffers, settings.colorizeLods, effectiveFadeSeconds);
+            chunk.Apply(result.Buffers, effectiveFadeSeconds);
             result.ReleasePayload();
 
             bool wantCollider = settings.colliderMaxLod >= 0
@@ -1362,10 +1517,11 @@ namespace reromanlee.Transvoxel
             if (chunkViewPool.Count > 0)
             {
                 var pooled = chunkViewPool.Pop();
-                pooled.Activate(key, runtimeMaterial, settings.voxelSize, settings.chunkCells);
+                pooled.Activate(key, MaterialForLod(key.Lod), settings.voxelSize, settings.chunkCells);
                 return pooled;
             }
-            return new TerrainChunk(key, transform, runtimeMaterial, settings.voxelSize, settings.chunkCells);
+            return new TerrainChunk(key, transform, MaterialForLod(key.Lod), settings.voxelSize,
+                settings.chunkCells);
         }
 
         void DestroyChunkView(TerrainChunk chunk)
@@ -1580,11 +1736,71 @@ namespace reromanlee.Transvoxel
                 ScheduleBuild(entry.Key, entry.Value.TransitionMask);
         }
 
-        /// <summary>Re-applies the LOD debug tint to all live chunks.</summary>
+        /// <summary>
+        /// Re-applies the LOD debug tint to every chunk on screen (live and cross-fading).
+        /// Cheap: it only swaps which shared material each renderer points at, so toggling
+        /// the tint never rebuilds geometry.
+        /// </summary>
         public void RefreshLodTint()
         {
             foreach (var chunk in live.Values)
-                chunk.SetLodTintVisible(settings.colorizeLods);
+                chunk.SetMaterial(MaterialForLod(chunk.Key.Lod));
+            foreach (var entry in dying)
+                entry.View.SetMaterial(MaterialForLod(entry.View.Key.Lod));
+            // Released only after every renderer points somewhere else.
+            if (!settings.colorizeLods)
+                DestroyLodTintMaterials();
+        }
+
+        /// <summary>
+        /// The material a chunk at this LOD renders with: the plain runtime material, or —
+        /// while colorizeLods is on — a tinted copy of it, created on first use.
+        ///
+        /// A shared material per LOD rather than a MaterialPropertyBlock: a block excludes
+        /// its renderer from the SRP Batcher (so switching the debug view on would cost
+        /// frame rate), and batched paths such as URP's GPU Resident Drawer bypass
+        /// per-renderer state entirely, which is why the tint used to be invisible.
+        /// </summary>
+        Material MaterialForLod(int lod)
+        {
+            if (runtimeMaterial == null || !settings.colorizeLods)
+                return runtimeMaterial;
+
+            lodTintMaterials ??= new Material[LodTints.Length];
+            int index = Mathf.Clamp(lod, 0, LodTints.Length - 1);
+            Material variant = lodTintMaterials[index];
+            if (variant != null)
+                return variant;
+
+            variant = new Material(runtimeMaterial)
+            {
+                name = $"{runtimeMaterial.name} (LOD{index} tint)",
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+            Color tint = LodTints[index];
+            // The package shader multiplies _TransvoxelLodTint into the final albedo of
+            // every variant (including the palette ones, which never read _BaseColor).
+            // Other shaders get the tint through their own base colour instead.
+            if (variant.HasProperty(LodTintId))
+                variant.SetColor(LodTintId, tint);
+            else if (variant.HasProperty(BaseColorId))
+                variant.SetColor(BaseColorId, tint);
+            else if (variant.HasProperty(ColorId))
+                variant.SetColor(ColorId, tint);
+            lodTintMaterials[index] = variant;
+            return variant;
+        }
+
+        void DestroyLodTintMaterials()
+        {
+            if (lodTintMaterials == null)
+                return;
+            for (int i = 0; i < lodTintMaterials.Length; i++)
+            {
+                if (lodTintMaterials[i] != null)
+                    Destroy(lodTintMaterials[i]);
+                lodTintMaterials[i] = null;
+            }
         }
 
         /// <summary>
@@ -1642,16 +1858,31 @@ namespace reromanlee.Transvoxel
             TotalVertices = total;
         }
 
+        static bool warnedAboutNonUrp;
+
         static Material CreateDefaultMaterial()
         {
-            // Prefer the package's stipple-fading shader (URP + Built-in subshaders inside);
-            // HDRP is not covered by it, so HDRP keeps its own Lit (no fading there).
+            // The package's shader is URP-only (its single SubShader declares the URP
+            // package requirement). The mesher itself is pipeline-agnostic, so a Built-in
+            // or HDRP project still gets working terrain — just on that pipeline's own lit
+            // shader, without the stipple fades or voxel materials.
             var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
-            bool isHdrp = pipeline != null && pipeline.GetType().Name.Contains("HD");
-            Shader shader = isHdrp ? null : Shader.Find("Transvoxel/Lit Dithered");
-            if (shader == null) shader = Shader.Find("Universal Render Pipeline/Lit");
-            if (shader == null) shader = Shader.Find("HDRP/Lit");
-            if (shader == null) shader = Shader.Find("Standard");
+            bool isUniversal = pipeline != null && pipeline.GetType().Name.Contains("Universal");
+            Shader shader = isUniversal ? Shader.Find("Transvoxel/Lit Dithered") : null;
+            if (shader == null)
+            {
+                if (!warnedAboutNonUrp)
+                {
+                    warnedAboutNonUrp = true;
+                    Debug.LogWarning("[Transvoxel] The active render pipeline is not URP, so the " +
+                                     "bundled 'Transvoxel/Lit Dithered' shader cannot be used. The " +
+                                     "terrain renders on the pipeline's default lit shader instead: " +
+                                     "meshing, LODs, colliders and terraforming all work, but the " +
+                                     "stipple fades, voxel materials, triplanar and parallax need URP.");
+                }
+                shader = pipeline != null ? pipeline.defaultShader : null;
+                if (shader == null) shader = Shader.Find("Standard");
+            }
             var material = new Material(shader) { name = "Transvoxel Default" };
             var grass = new Color(0.42f, 0.55f, 0.3f);
             if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", grass);

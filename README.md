@@ -31,23 +31,32 @@ through a tiny interface, so you can replace any of them on its own.
 The raw lookup tables translated from Lengyel's C++ live in
 `Runtime/TransvoxelDataTables.cs` (Concept.txt #3).
 
-## Quick start — the demo
+## Quick start — the Interactive Demo sample
 
-1. Create an empty scene.
-2. Add an empty GameObject and put **`TransvoxelDemo`** (`Runtime/Demo/`) on it.
-3. Press **Play**.
+1. **Window ▸ Package Manager ▸ Transvoxel ▸ Samples ▸ Import** the *Interactive Demo*.
+2. Open `TransvoxelDemo.unity` from the imported folder and press **Play**.
 
-It spawns a camera, a light and the terrain, then lets you:
+The scene comes wired: camera, sun, terrain, a four-material palette with albedo and height
+maps, and the overlay. You can:
 
-- **RMB drag** to look, **WASD + Q/E** to fly (**Shift** = faster),
-- **LMB** to dig, **Shift + LMB** to build — with the material picked in the overlay
-  (the demo ships a small grass/rock/sand/snow palette),
-- toggle smooth/flat shading and LOD colorization from the on-screen overlay, and tune the
-  material blend sharpness live.
+- **RMB drag** to look, **WASD + Q/E** to fly (**Shift** = faster) — or a gamepad's sticks,
+- **LMB** to dig, **Shift + LMB** to build, **1–4** (or the bumpers) to pick the material,
+- drive **every terrain setting live** from the panel: brush, materials and blend, view
+  distance, LOD levels and split factor, voxel size, shading, LOD tint, fades, triplanar,
+  parallax occlusion, meshing backend and collider LOD.
 
-> Camera and terraforming controls use the legacy Input Manager. If your project is set to
-> the new Input System only, open **Project Settings ▸ Player ▸ Active Input Handling** and
-> choose **Both**.
+> The sample needs the **Input System** package, with **Project Settings ▸ Player ▸ Active
+> Input Handling** set to *Input System Package* or *Both*. (The package itself has no such
+> requirement — only the sample does.)
+
+> **Importing copies the sample.** Package Manager snapshots `Samples~/` into
+> `Assets/Samples/Transvoxel/<version>/`, and later package updates never touch that copy —
+> so after updating the package, press **Import** again to pick up changes to the demo
+> (it will ask before overwriting). Close the demo scene first: the re-import replaces the
+> scene file too. Edits you make inside `Assets/Samples/` are yours, and are overwritten by
+> a re-import.
+
+Using the terrain in your own scene needs none of this; see below.
 
 ## Using it in your own scene
 
@@ -83,7 +92,9 @@ Notable knobs (Concept.txt #4, #6):
   draw-distance edge.
 - **materialPalette / materialBlendSharpness** — the terrain's material set and how sharply
   neighbouring voxel materials cut into each other (see *Voxel materials* below). The
-  sharpness is a live shader global — drag it during Play, nothing rebuilds.
+  sharpness is a live shader global — drag it during Play, nothing rebuilds. The palette
+  asset itself carries the **triplanar** and **parallax occlusion** switches (see
+  *Triplanar and parallax occlusion*); both apply live too.
 - **meshApplyBudgetMs** — the main-thread time slice per frame for uploading finished
   meshes. Bursts of hundreds of chunks (teleport, high-speed flight) spread over frames
   instead of spiking one.
@@ -149,73 +160,81 @@ Bayer-dither clip — the same technique as Unity LOD Group cross-fading:
   Y = kept opacity. Lift the middle/left to keep near and mid LODs solid (less grain) while
   the far edge still dissolves. The default straight line is the plain linear ramp.
 
-Fading needs shader support. The bundled **`Transvoxel/Lit Dithered`** shader (URP and
-Built-in pipeline subshaders; the default runtime material uses it automatically outside
-HDRP) implements it. To make your **own** material fade, add this to its shader — or
-reproduce it with a Custom Function node in Shader Graph:
+Fading needs shader support. The bundled **`Transvoxel/Lit Dithered`** shader (URP; the
+default runtime material uses it automatically) implements it. The whole implementation
+lives in one reusable module —
+[`Runtime/Resources/TransvoxelDither.hlsl`](Runtime/Resources/TransvoxelDither.hlsl) —
+which the shader includes, and which your own URP shaders and graphs can include too. Whatever you
+build with it: the fade inputs are **global uniforms driven by the terrain** — never
+redeclare them as material properties, Properties-block entries or Blackboard properties
+(the SRP Batcher would lock a per-material copy at its inspector value). Two mesh facts
+the module relies on: the terrain bakes `(fadeStartTime, ±fadeDuration)` into **UV1**
+(`TEXCOORD1` — what `Mesh.uv2` stores; the sign marks a cross-fade ghost), and meshes
+without that channel read `(0,0)` and render solid, so a fade-aware material is safe on
+any mesh. `TransvoxelShaderGlobals` boots the master fade to its neutral 1 at
+editor/player startup, so fade-aware materials are visible before any terrain runs.
+
+### Shader Graph (URP)
+
+Any graph becomes fade-aware with one Custom Function node — build it once, save the
+group as a Sub Graph, reuse it everywhere:
+
+1. Add a **Custom Function** node: Type **File**, Source **`TransvoxelDither.hlsl`**
+   (from this package), Name **`TransvoxelDitherFade`**.
+2. Give it inputs `FadeData` (Vector2), `PositionWS` (Vector3), `ScreenPos` (Vector4)
+   and one output `Alpha` (Float), then wire:
+   - **UV** node, channel **UV1** → `FadeData`
+   - **Position** node, Space **World** → `PositionWS`
+   - **Screen Position** node, Mode **Raw** → `ScreenPos`
+3. Wire `Alpha` → the Master Stack's **Alpha**, enable **Alpha Clipping** in Graph
+   Settings, leave the threshold at **0.5** (the node outputs a binary 0/1 — the ghost
+   logic is a threshold *window*, so the cutout is decided inside the function).
+4. On the Blackboard add a **Float** property, reference name **`_TransvoxelFadeAware`**,
+   default **1**, exposed — the marker `TransvoxelTerrain` looks for.
+
+Alpha clipping makes Shader Graph apply the same cutout to the shadow and depth passes
+automatically, so shadows dissolve with the surface — exactly like the bundled shader.
+(HDRP is untested, like the rest of the package; its Position node would need Absolute
+World space.)
+
+### Hand-written shaders
 
 ```hlsl
-// Properties: [HideInInspector] _TransvoxelFadeAware("Fade Aware", Float) = 1
-// (a marker only — declaring it is what tags the shader as fade-aware)
-//
-// IMPORTANT: every fade uniform below must live in GLOBAL scope — never inside the
-// UnityPerMaterial cbuffer and never as a serialized property. The SRP Batcher sources
-// per-material cbuffer values from the material and ignores Shader.SetGlobalFloat for
-// them, which would lock the fade at the inspector value for batched draws.
-float4 _TransvoxelViewerPos;   // set by TransvoxelTerrain every frame
-float  _TransvoxelViewDistance;
-float  _TransvoxelEdgeFadeBand;
-float  _TransvoxelFade;        // global master fade (terrain sets 1 every frame)
-TEXTURE2D(_TransvoxelEdgeFadeCurve); // edgeFadeCurve LUT: raw edge fade -> kept opacity
-SAMPLER(sampler_TransvoxelEdgeFadeCurve); // (Built-in: sampler2D _TransvoxelEdgeFadeCurve;)
-
-// VERTEX stage — the terrain bakes (fadeStartTime, ±fadeDuration) into UV2 (TEXCOORD1);
-// the sign marks a cross-fade ghost, 0 = solid. Time base is Unity's built-in _Time.y.
-// Pass the result to the fragment stage as a varying:
-float TransvoxelVertexFade(float2 fadeData)
+Properties
 {
-    float duration = abs(fadeData.y);
-    if (duration <= 0) return 1;
-    float t = saturate((_Time.y - fadeData.x) / duration);
-    return fadeData.y < 0 ? -(1 - t) : t; // negative = cross-fade ghost
+    // Marker only — declaring it is what tags the material as fade-aware.
+    [HideInInspector] _TransvoxelFadeAware("Fade Aware", Float) = 1
 }
 
-// FRAGMENT stage (positionCS = SV_POSITION, positionWS = world position):
-float fade = vertexFade * _TransvoxelFade;
-float edge = 1.0;
-if (_TransvoxelEdgeFadeBand > 0)
-{
-    float rawEdge = saturate((_TransvoxelViewDistance
-                              - distance(positionWS, _TransvoxelViewerPos.xyz))
-                             / _TransvoxelEdgeFadeBand);
-    // Reshape through the edgeFadeCurve LUT (Built-in: tex2D). A missing texture would
-    // read 0 — if you skip the curve, use `edge = rawEdge;` instead.
-    edge = SAMPLE_TEXTURE2D_LOD(_TransvoxelEdgeFadeCurve,
-                                sampler_TransvoxelEdgeFadeCurve, float2(rawEdge, 0.5), 0).r;
-}
-if (fade < 1 || edge < 1)
-{
-    const float dither[16] = { 0.5/16, 8.5/16, 2.5/16, 10.5/16, 12.5/16, 4.5/16, 14.5/16, 6.5/16,
-                               3.5/16, 11.5/16, 1.5/16, 9.5/16, 15.5/16, 7.5/16, 13.5/16, 5.5/16 };
-    uint2 p = uint2(positionCS.xy) & 3;
-    float threshold = dither[p.y * 4 + p.x];
-    if (fade < 0) // ghost: draw exactly what the successor doesn't draw yet
-        clip(min(threshold - (1 + fade), edge - threshold));
-    else
-        clip(min(fade, edge) - threshold);
-}
+// Include AFTER URP's Core.hlsl.
+#include "Packages/com.reromanlee.transvoxel/Runtime/Resources/TransvoxelDither.hlsl"
+
+// VERTEX — read the fade channel and pass it down as a varying:
+//   Attributes: float2 fadeData : TEXCOORD1;
+output.fade = TransvoxelVertexFade(input.fadeData);
+
+// FRAGMENT — first statement, before any shading work:
+TransvoxelDitherClip(input.positionCS, input.positionWS, input.fade);
 ```
 
-The terrain checks at startup whether its material declares `_TransvoxelFade`. If it does
-not, all fading (including cross-fade ghosts and the edge dissolve) is cleanly disabled —
-chunks switch instantly, with a console warning telling you how to enable it. So a custom
-material without the snippet keeps working; it just cannot fade.
+Add the same two calls to **every pass that draws the mesh** (forward, ShadowCaster,
+DepthOnly — copy the pattern from `TransvoxelLitDithered.shader`), otherwise shadows and
+depth keep rendering the un-faded surface. A fragment stage without an `SV_POSITION` input
+can call `TransvoxelDitherClipScreenPos(screenPos, positionWS, fade)` instead, which derives
+the pixel coordinate from a `ComputeScreenPos`-style raw screen position.
+
+The terrain checks at startup whether its material declares the marker (or
+`_TransvoxelFade`, for shaders that followed the older snippet). If neither exists, all
+fading (including cross-fade ghosts and the edge dissolve) is cleanly disabled — chunks
+switch instantly, with a console warning telling you how to enable it. So a custom
+material without the module keeps working; it just cannot fade.
 
 ## Voxel materials
 
 Every voxel can be made of a different material. Create a palette via **Assets ▸ Create ▸
-Transvoxel ▸ Material Palette**, add layers (albedo texture, tint, smoothness, per-layer UV
-scale — each with a rotatable preview sphere in the Inspector), assign it to
+Transvoxel ▸ Material Palette**, add layers (albedo/color texture, tint, smoothness,
+normal + ambient-occlusion + height maps with per-layer strengths, per-layer UV scale —
+each with a rotatable preview sphere in the Inspector), assign it to
 `TransvoxelSettings.materialPalette`, and build with it:
 
 ```csharp
@@ -231,11 +250,21 @@ terrain.Terraform(worldPoint, radius: 5f, strength: 0.9f, build: true, materialI
   creates anyway — an unpainted world costs zero bytes, and the GPU backend folds both
   layers into the one resident brick pool (ids packed 4-per-uint).
 - **One material, any number of textures.** Layers are texture/parameter sets — not
-  `Material` assets, whose arbitrary shaders could not run on one blended pixel. All layer
-  albedos bake into a single `Texture2DArray` indexed per pixel (a plain GPU copy when the
-  layers share size/format/mips; mixed inputs are resized and stored uncompressed), so the
-  whole landscape still renders with **one material and full SRP batching**, whatever the
-  palette size.
+  `Material` assets, whose arbitrary shaders could not run on one blended pixel. Each map
+  kind (albedo, normal, occlusion, height) bakes into a single `Texture2DArray` indexed per
+  pixel (a plain GPU copy when the layers share size/format/mips; mixed inputs are resized
+  and stored uncompressed), so the whole landscape still renders with **one material and
+  full SRP batching**, whatever the palette size.
+- **Detail maps are pay-for-what-you-use.** A palette without any normal/occlusion/height
+  map renders on the exact albedo-only shader variant it always did — the terrain switches
+  to the full variant (`TRANSVOXEL_PALETTE_MAPS`) only when the palette actually contains
+  such a map; layers with empty slots read baked neutral fallbacks. Normal maps need no
+  mesh tangents: the URP path rebuilds the tangent frame per pixel from screen-space
+  derivatives, so it follows the world-XZ UVs on any slope. Occlusion attenuates
+  ambient/indirect light only. Height maps do two jobs: they steer the blend weights so the
+  higher material (rock, cobbles) cuts through the lower one (sand) at boundaries — the
+  palette's *Height Blend* slider scales that from plain crossfade to a hard cut, live —
+  and they are the field the parallax ray march reads (see *Triplanar and parallax* below).
 - **Transitions blend per pixel — and the width is live-tunable.** Each vertex takes the id
   of the solid voxel it hugs; each triangle carries its (up to three) ids plus one-hot corner
   weights in the mesh color channel (`MaterialBlendEncoder`, 4 bytes per vertex — vertices
@@ -249,12 +278,111 @@ terrain.Terraform(worldPoint, radius: 5f, strength: 0.9f, build: true, materialI
   Hybrid backends produce identical ids (the `TRANSVOXEL_MATERIALS` kernel variant adds one
   float per soup vertex, welded and encoded exactly like the CPU path).
 
-Like fading, this needs shader support (`_TransvoxelPaletteAware` marker; palette inputs are
-global uniforms + the `TRANSVOXEL_PALETTE` keyword). The bundled `Transvoxel/Lit Dithered`
-shader implements it in both pipelines; with a palette assigned but a non-palette-aware
-material, voxel materials are cleanly disabled with a console warning. Palette *content*
-edits (textures, tints, sharpness) re-bind live without rebuilding chunks; assigning or
-swapping the palette asset re-meshes the world once so every vertex carries blend data.
+**One palette per scene.** The palette bindings — texture arrays, per-layer uniforms, blend
+sharpness, the triplanar and parallax switches — are *global* shader state, for the same
+reason the fade inputs are: batched render paths bypass per-renderer state, and the SRP
+Batcher would lock per-material values. Two `TransvoxelTerrain` instances therefore share
+whichever palette was bound last, and the terrain warns once if it catches two with
+different palettes. One terrain per scene is the supported setup.
+
+Like fading, this needs shader support: the `_TransvoxelPaletteAware` marker property is
+what tags a material as palette-aware, and the palette inputs are global uniforms. The
+blend itself lives in the reusable module
+[`Runtime/Resources/TransvoxelPalette.hlsl`](Runtime/Resources/TransvoxelPalette.hlsl)
+(URP only). The terrain binds
+**every** map array whenever a palette is active — kinds the palette doesn't use hold tiny
+neutral fallbacks — so module users sample unconditionally; only the bundled shader plays
+the `TRANSVOXEL_PALETTE` / `TRANSVOXEL_PALETTE_MAPS` keyword game to keep map-free
+palettes on the cheaper path (custom shaders wanting the same should list both in one
+`multi_compile` set). With a palette assigned but a non-palette-aware material, voxel
+materials are cleanly disabled with a console warning. Palette *content* edits (textures,
+tints, sharpness) re-bind live without rebuilding chunks — including flipping between the
+albedo-only and detail-map variants; assigning or swapping the palette asset re-meshes the
+world once so every vertex carries blend data.
+
+### Shader Graph (URP)
+
+A graph needs three things: the marker, the corner weights interpolated across the
+triangle, and one sampling node. (This composes freely with the dithering node from
+*Dithered fading* — most graphs want both.)
+
+1. Blackboard: **Float** property, reference name **`_TransvoxelPaletteAware`**, default
+   **1**, exposed.
+2. **Vertex stage** — the one-hot corner weights must rasterize into barycentric weights,
+   so they have to be computed per vertex: add a **Custom Interpolator** block (Vector2)
+   to the Vertex context and feed it a **Custom Function** node — Type **File**, Source
+   **`TransvoxelPalette.hlsl`**, Name **`TransvoxelBlendCorner`**, input `VertexColor`
+   (Vector4) ← **Vertex Color** node, output `CornerWeights` (Vector2).
+3. **Fragment stage** — a Custom Function node from the same file:
+   - **`TransvoxelPaletteAlbedo`** for albedo/tint palettes. Inputs: `UV` (Vector2 ← UV
+     node on **UV0**), `VertexColor` (← Vertex Color node), `CornerWeights` (← **Custom
+     Interpolator** node). Outputs: `Albedo` → Base Color, `Smoothness` → Smoothness.
+   - **`TransvoxelPaletteMaps`** to add the normal/occlusion/height maps. Extra inputs:
+     `PositionWS` (← Position node, World), `NormalWS` (← Normal Vector node, World);
+     extra outputs: `Occlusion` → Ambient Occlusion, and `Normal` → the Normal block
+     **after setting Graph Settings ▸ Fragment Normal Space to World** (the module
+     outputs a world-space normal — terrain meshes have no tangents).
+
+Pick the function to match your palette: `TransvoxelPaletteMaps` always pays the full
+12-sample path, there is no automatic variant switching inside a graph.
+
+## Triplanar and parallax occlusion
+
+Two upgrades on the palette asset, both **off by default** and both keyword-gated, so a
+palette that uses neither compiles to — and costs — exactly what it did without them.
+
+### Triplanar
+
+UV0 is a world-space XZ planar map. That is fine for rolling ground and wrong for anything
+approaching vertical: on a cliff face the U coordinate barely changes while V does, so the
+texture smears into vertical streaks. It is the oldest visual limitation in this package,
+and it lands hardest on the shapes a voxel engine exists for — cliffs, overhangs, cave
+walls.
+
+Tick **Triplanar** on the palette and every layer is sampled on all three world planes and
+blended by the surface normal, so each orientation gets an undistorted mapping. Normals use
+a whiteout blend and come out in world space, which suits meshes that carry no tangents.
+**Triplanar Sharpness** sets how narrow the band is where two planes mix: 1 is broad and
+slightly soft on 45° slopes, higher values tighten it toward a hard switch at the diagonals.
+
+Cost is roughly 3× the texture fetches. UVs stay a pure function of world position — never
+mirrored by the normal's sign — which is what keeps them continuous across chunk borders and
+LOD seams.
+
+### Parallax occlusion
+
+Height maps steer material boundaries (above), but that is a *blend* effect: on a single
+material it is mathematically an identity and does nothing at all. **Parallax Occlusion**
+is the other thing a height map is for.
+
+With it on, the view ray is marched through the blended heightfield per pixel and the UV is
+displaced to where the ray actually meets the surface. Brick, cobbles and rock strata read
+as volume with self-occlusion, at zero geometric cost — nothing is tessellated or displaced,
+which matters when the GPU is already generating the mesh.
+
+- **Height Scale** (per layer) is the apparent depth in UV units, so rock can be deeper than
+  sand. Keep it well under the size of one feature in the texture: a value wider than the
+  gaps in the pattern steps right over them and smears instead of deepening.
+- **Parallax Min/Max Steps** — the march adapts between them by viewing angle. Head-on needs
+  few steps; grazing rays travel much further through the field and need many.
+- **Parallax Distance** fades the effect out to nothing by that range, so distant and
+  low-LOD chunks pay nothing for depth too small to see.
+
+Parallax only switches on when some layer actually carries a height map, and only the
+dominant triplanar plane is marched — marching three heightfields would triple the cost of
+the most expensive part of the shader for no visible gain.
+
+Two honest limitations. Silhouettes and shadows still follow the mesh, because no geometry
+moved; that is inherent to the technique. And parallax is **most** useful with triplanar on,
+since a displaced UV on an already-smeared cliff mapping only amplifies the smear.
+
+### Shader Graph
+
+`TransvoxelPalette.hlsl` exposes the whole thing as **`TransvoxelPaletteProjected`**, wired
+exactly like `TransvoxelPaletteMaps` (`UV`, `VertexColor`, `CornerWeights`, `PositionWS`,
+`NormalWS` in; `Albedo`, `Normal`, `Occlusion`, `Smoothness` out, Fragment Normal Space set
+to **World**). A graph has no keywords, so it reads the palette's triplanar and parallax
+switches as globals and branches on them at runtime — same inputs, same look, one node.
 
 ## How the seamless LOD works (the interesting part)
 
@@ -300,7 +428,7 @@ sprint or teleport; the worst case is unbuilt terrain filling in near-first, nev
 - **Batching-proof fades.** Fade parameters are baked into each mesh (a UV2 channel of
   start time + ghost flag) and animated by the shader from global time — no per-renderer
   state, no MaterialPropertyBlocks, no per-chunk materials. This survives every render
-  path (SRP Batcher, URP GPU Resident Drawer, Built-in) and costs zero per-frame CPU.
+  path (SRP Batcher, URP GPU Resident Drawer included) and costs zero per-frame CPU.
   Only the debug LOD tint uses a property block.
 - Collider bakes run off the main thread (`Physics.BakeMesh`), attached when ready.
 
@@ -341,14 +469,40 @@ for single chunks, same-LOD borders, every LOD-transition face, and after a tran
 change (the stale-cache regression); plus, for voxel materials: watertightness of encoded
 (split) meshes, blend-attribute structure, and material-id agreement at every shared vertex
 across chunk borders, LOD seams and both meshers; and the resource-stat memory estimators
-against known structure sizes. Requires the `com.unity.test-framework` package.
+against known structure sizes. They also guard the things that are easy to break silently:
+that the bundled shader compiles, that it still exposes the LOD-tint and marker properties,
+that chunk meshes always carry the fade vertex channel, that the palette's texture-array
+bake survives formats a Texture2DArray cannot sample, and that cached transition-face sheets
+are reused rather than re-sampled.
+
+**PlayMode tests** live in `Tests/Runtime/` and assert on *rendered pixels*, because this
+package's most expensive bugs were all invisible in code and obvious on screen: that LOD
+colorization actually changes the image with a palette assigned, that `chunkFadeInSeconds = 0`
+renders the same solid surface as fading enabled, that triplanar removes vertical streaking on
+a vertical face (measured as the collapse of vertical variation, not eyeballed), and that
+parallax visibly changes the surface. They skip themselves without a graphics device.
+
+Tests inside a package are only discovered when the consuming project opts in — add this to
+your project's `Packages/manifest.json`:
+
+```json
+"testables": [ "com.reromanlee.transvoxel" ]
+```
+
+The *Interactive Demo* sample carries its own tests too, which run once you import it.
+Requires the `com.unity.test-framework` package.
 
 ## Requirements
 
 - Unity **6000.0+** (developed and verified on **6000.5**). Uses `EntityId` (the Unity 6.2+
   replacement for instance IDs) in the collider-baking path.
-- No external packages. A default lit material is created at runtime if none is assigned; a
-  triplanar shader is recommended for cliffs and multi-texture terrain (Concept.txt #7).
+- **URP** (`com.unity.render-pipelines.universal`), a package dependency. The bundled
+  `Transvoxel/Lit Dithered` shader and everything built on it — stipple fades, voxel
+  materials, triplanar, parallax — are URP-only.
+  The mesher itself is pipeline-agnostic: on Built-in or HDRP the terrain still builds,
+  LODs, collides and terraforms, but falls back to that pipeline's default lit material and
+  says so once in the console.
+- The **Input System** package, for the *Interactive Demo* sample only.
 
 ## Reference
 

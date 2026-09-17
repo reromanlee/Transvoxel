@@ -1,0 +1,116 @@
+/* Styling for the demo overlay. Kept separate from the layout so the panel can be
+   restyled without touching DemoUI.uxml or the controller. */
+
+.root {
+    flex-grow: 1;
+}
+
+/* The panel itself is the only thing that takes pointer input; the rest of the screen
+   stays free for the fly camera and the terraforming brush. */
+.panel {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    width: 310px;
+    max-height: 92%;
+    padding: 8px 10px 10px 10px;
+    background-color: rgba(18, 20, 24, 0.86);
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: rgba(255, 255, 255, 0.10);
+}
+
+.header {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+}
+
+.title {
+    -unity-font-style: bold;
+    font-size: 15px;
+    color: rgb(238, 240, 244);
+}
+
+.collapse {
+    width: 24px;
+    height: 20px;
+    margin: 0;
+    padding: 0;
+    font-size: 14px;
+    background-color: rgba(255, 255, 255, 0.07);
+    border-width: 0;
+    border-radius: 4px;
+    color: rgb(210, 214, 220);
+}
+
+.collapse:hover {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+.body {
+    flex-grow: 1;
+}
+
+.section {
+    margin-bottom: 2px;
+}
+
+.section > Toggle > VisualElement > Label {
+    -unity-font-style: bold;
+    color: rgb(190, 205, 225);
+}
+
+/* One monospace-ish readout line. */
+.stat {
+    font-size: 11px;
+    color: rgb(202, 208, 216);
+    margin-left: 14px;
+    margin-bottom: 1px;
+    white-space: normal;
+}
+
+.sub {
+    font-size: 11px;
+    color: rgb(160, 168, 180);
+    margin-left: 14px;
+    margin-top: 4px;
+}
+
+.note {
+    font-size: 10px;
+    color: rgb(140, 148, 160);
+    margin-left: 14px;
+    margin-right: 4px;
+    margin-bottom: 4px;
+    white-space: normal;
+}
+
+.row {
+    margin-left: 14px;
+    margin-right: 4px;
+    margin-bottom: 2px;
+    font-size: 11px;
+}
+
+.row > Label {
+    min-width: 66px;
+    font-size: 11px;
+    color: rgb(190, 196, 206);
+}
+
+.picker {
+    margin-left: 14px;
+    margin-bottom: 4px;
+}
+
+.picker Label {
+    font-size: 11px;
+    color: rgb(205, 210, 220);
+}
+
+/* Shown instead of the controls when a required feature is unavailable. */
+.warn {
+    color: rgb(240, 196, 120);
+}

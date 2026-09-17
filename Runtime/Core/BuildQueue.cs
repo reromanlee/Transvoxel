@@ -143,9 +143,11 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>
-        /// Distance from the viewer to the chunk's box, in voxels (0 inside). A tiny LOD
-        /// penalty breaks ties in favour of fine chunks: at equal distance the ground under
-        /// the player (colliders live there) beats a far-reaching coarse shell.
+        /// Distance from the viewer to the chunk's box, in voxels (0 inside), plus the LOD
+        /// level as a penalty so that at equal distance the ground under the player
+        /// (colliders live there) beats a far-reaching coarse shell. The penalty is one
+        /// voxel per level — small next to the distances that separate LOD rings, but not
+        /// negligible: it deliberately outranks sub-voxel distance differences.
         /// </summary>
         float ComputePriority(ChunkBuildJob job)
         {

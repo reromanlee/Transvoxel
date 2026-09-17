@@ -13,10 +13,12 @@ namespace reromanlee.Transvoxel
     ///
     /// Because one pixel can show a mix of two materials, layers are texture/parameter sets
     /// blended by the terrain's own shader — not arbitrary <see cref="Material"/> assets,
-    /// which could carry shaders that cannot run on the same blended pixel. All layer
-    /// albedos are baked into one <see cref="Texture2DArray"/>, so the whole landscape still
-    /// renders with a single material and SRP batching stays intact no matter how many
-    /// materials it shows.
+    /// which could carry shaders that cannot run on the same blended pixel. Each map kind
+    /// (albedo, normal, occlusion, height) is baked into one <see cref="Texture2DArray"/>,
+    /// so the whole landscape still renders with a single material and SRP batching stays
+    /// intact no matter how many materials it shows. The detail maps are opt-in by content:
+    /// a palette without any normal/occlusion/height map renders on the exact albedo-only
+    /// shader variant (and cost) it always had — see <see cref="HasDetailMaps"/>.
     ///
     /// Reordering layers re-labels every already-painted voxel (ids stay, meanings move) —
     /// the custom editor warns about this.
@@ -35,8 +37,8 @@ namespace reromanlee.Transvoxel
         {
             public string name = "Material";
 
-            [Tooltip("Albedo texture of this material. Empty uses plain white, so the tint " +
-                     "alone defines the color.")]
+            [Tooltip("Albedo (color) texture of this material. Empty uses plain white, so " +
+                     "the tint alone defines the color.")]
             public Texture2D albedo;
 
             [Tooltip("Multiplied into the albedo.")]
@@ -44,10 +46,76 @@ namespace reromanlee.Transvoxel
 
             [Range(0f, 1f)] public float smoothness = 0.1f;
 
+            [Tooltip("Tangent-space normal map (texture type 'Normal map'). Empty = flat.")]
+            public Texture2D normal;
+
+            [Tooltip("Strength of the normal map: 0 flattens it, above 1 exaggerates it.")]
+            [Range(0f, 2f)] public float normalStrength = 1f;
+
+            [Tooltip("Ambient occlusion map (white = fully lit). Attenuates ambient/indirect " +
+                     "light only, like Unity's standard materials. Empty = no occlusion.")]
+            public Texture2D occlusion;
+
+            [Tooltip("How much of the occlusion map is applied.")]
+            [Range(0f, 1f)] public float occlusionStrength = 1f;
+
+            [Tooltip("Height map, used for two things. It steers material transitions — at " +
+                     "a boundary the higher surface (rock, cobbles) pushes through the lower " +
+                     "one (sand, dirt) instead of a plain crossfade, scaled by the palette's " +
+                     "Height Blend. And with Parallax Occlusion on, the view ray is marched " +
+                     "through it per pixel so the surface reads as real depth. Neither moves " +
+                     "geometry. Empty reads as uniform mid height.")]
+            public Texture2D height;
+
+            [Tooltip("How deep this layer's height map appears under parallax occlusion " +
+                     "mapping, in UV units — 0 is flat, 0.05 reads as coarse stone, above " +
+                     "0.1 starts to swim at grazing angles. Only used when the palette's " +
+                     "Parallax Occlusion is on and this layer has a height map.")]
+            [Range(0f, 0.25f)] public float heightScale = 0.05f;
+
             [Tooltip("Texture repeats of this layer relative to the terrain's UV scale. " +
                      "2 tiles this material twice as densely as the others.")]
             [Min(0.01f)] public float uvScaleMultiplier = 1f;
         }
+
+        [Tooltip("How strongly the layers' height maps steer material transitions: 0 = plain " +
+                 "crossfade, 1 = the higher material cuts hard through the lower one. Only " +
+                 "relative height differences matter — layers without a height map read as " +
+                 "uniform mid height, so they keep the plain crossfade against each other. " +
+                 "Live-tunable — no rebuild.")]
+        [Range(0f, 1f)] public float heightBlend = 0.5f;
+
+        [Header("Surface projection")]
+        [Tooltip("Sample every layer on all three world planes and blend by the surface " +
+                 "normal, instead of the world-XZ planar map. Fixes the stretched, smeared " +
+                 "texturing on cliffs, overhangs and cave walls — the shapes a voxel terrain " +
+                 "exists for. Costs about 3x the texture fetches, so it is opt-in.")]
+        public bool triplanar;
+
+        [Tooltip("How narrow the blend band between the three planes is. 1 blends broadly " +
+                 "(soft, slightly washed out on 45° slopes), higher values tighten it toward " +
+                 "a hard switch at the diagonals.")]
+        [Range(1f, 16f)] public float triplanarSharpness = 4f;
+
+        [Header("Parallax occlusion mapping")]
+        [Tooltip("March the view ray through the layers' height maps per pixel, so surfaces " +
+                 "read as real depth with self-occlusion instead of a flat picture of depth. " +
+                 "Adds no geometry (nothing is tessellated or displaced), but it is the most " +
+                 "expensive option here. Needs at least one layer with a height map; " +
+                 "silhouettes and shadows still follow the mesh.")]
+        public bool parallaxOcclusion;
+
+        [Tooltip("Ray-march steps when looking straight at a surface. Few are needed there.")]
+        [Range(2, 64)] public int parallaxMinSteps = 6;
+
+        [Tooltip("Ray-march steps at grazing angles, where the ray travels furthest through " +
+                 "the heightfield and too few steps show stair-stepping.")]
+        [Range(2, 64)] public int parallaxMaxSteps = 24;
+
+        [Tooltip("Distance in meters over which parallax fades out to nothing. Distant and " +
+                 "low-LOD chunks then pay nothing for an effect too small to see. 0 = never " +
+                 "fade (not recommended).")]
+        [Min(0f)] public float parallaxDistance = 60f;
 
         [SerializeField]
         List<Layer> layers = new List<Layer>
@@ -58,6 +126,47 @@ namespace reromanlee.Transvoxel
         public IReadOnlyList<Layer> Layers => layers;
 
         public int LayerCount => Mathf.Min(layers.Count, MaxLayers);
+
+        /// <summary>
+        /// True when any layer carries a normal/occlusion/height map. The terrain picks the
+        /// shader variant with this: map-free palettes keep rendering on the exact
+        /// albedo-only path (and cost) they had before detail maps existed.
+        /// </summary>
+        public bool HasDetailMaps
+        {
+            get
+            {
+                int count = LayerCount;
+                for (int i = 0; i < count; i++)
+                {
+                    Layer layer = layers[i];
+                    if (layer.normal != null || layer.occlusion != null || layer.height != null)
+                        return true;
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// True when some layer carries a height map. Parallax has nothing to march without
+        /// one, so the terrain leaves the keyword off and the palette costs nothing extra.
+        /// </summary>
+        public bool HasHeightMaps
+        {
+            get
+            {
+                int count = LayerCount;
+                for (int i = 0; i < count; i++)
+                {
+                    if (layers[i].height != null)
+                        return true;
+                }
+                return false;
+            }
+        }
+
+        /// <summary>Whether the terrain should switch the parallax shader variant on.</summary>
+        public bool ParallaxActive => parallaxOcclusion && HasHeightMaps;
 
         /// <summary>
         /// Appends a layer from code (runtime-built palettes, tools); its material id is
@@ -75,7 +184,7 @@ namespace reromanlee.Transvoxel
 
         /// <summary>
         /// Raised whenever the palette changes so a running terrain can rebake the texture
-        /// array and refresh the shader uniforms live — no chunk is ever rebuilt for it.
+        /// arrays and refresh the shader uniforms live — no chunk is ever rebuilt for it.
         /// Fired by <see cref="OnValidate"/> on Inspector edits; call
         /// <see cref="NotifyChanged"/> after changing layers from code.
         /// </summary>
@@ -83,7 +192,7 @@ namespace reromanlee.Transvoxel
 
         public void NotifyChanged()
         {
-            bakedAlbedoDirty = true;
+            albedoDirty = normalDirty = occlusionDirty = heightDirty = true;
             Changed?.Invoke();
         }
 
@@ -95,7 +204,7 @@ namespace reromanlee.Transvoxel
         /// Writes the per-layer shader parameters into caller-provided arrays of
         /// <see cref="MaxLayers"/> entries (uniform arrays must always be uploaded at full
         /// declared size — see the terrain). colors = (tint.rgb, smoothness),
-        /// scales = (uvScaleMultiplier, 0, 0, 0).
+        /// scales = (uvScaleMultiplier, normalStrength, occlusionStrength, heightScale).
         /// </summary>
         public void FillLayerUniforms(Vector4[] colors, Vector4[] scales)
         {
@@ -105,58 +214,134 @@ namespace reromanlee.Transvoxel
                 Layer layer = i < count ? layers[i] : null;
                 Color tint = layer?.tint ?? Color.white;
                 colors[i] = new Vector4(tint.r, tint.g, tint.b, layer?.smoothness ?? 0f);
-                scales[i] = new Vector4(layer?.uvScaleMultiplier ?? 1f, 0f, 0f, 0f);
+                scales[i] = new Vector4(layer?.uvScaleMultiplier ?? 1f,
+                    layer?.normalStrength ?? 1f, layer?.occlusionStrength ?? 1f,
+                    layer?.heightScale ?? 0f);
             }
         }
 
-        // ------------------------------------------------------------------ albedo array
+        // ------------------------------------------------------------------ baked map arrays
 
-        Texture2DArray bakedAlbedo;
-        bool bakedAlbedoDirty = true;
+        Texture2DArray bakedAlbedo, bakedNormal, bakedOcclusion, bakedHeight;
+        bool albedoDirty = true, normalDirty = true, occlusionDirty = true, heightDirty = true;
+
+        // 4x4 flat normal (0.5, 0.5, 1, alpha 1). Not Texture2D.normalTexture: that one's
+        // 0.5 alpha breaks the shader's RG/AG unpack (x = r·a), which must read x = 0.5 for
+        // both uncompressed fallbacks (a = 1) and compressed maps (r = 1 or a = 1).
+        static Texture2D flatNormal;
+
+        static Texture2D FlatNormalFallback
+        {
+            get
+            {
+                if (flatNormal != null)
+                    return flatNormal;
+                flatNormal = new Texture2D(4, 4, TextureFormat.RGBA32, mipChain: false, linear: true)
+                {
+                    name = "Transvoxel Flat Normal",
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+                var pixels = new Color32[16];
+                for (int i = 0; i < pixels.Length; i++)
+                    pixels[i] = new Color32(128, 128, 255, 255);
+                flatNormal.SetPixels32(pixels);
+                flatNormal.Apply(updateMipmaps: false);
+                return flatNormal;
+            }
+        }
 
         /// <summary>
         /// The layer albedos baked into one texture array (layer index = material id),
-        /// rebaked lazily after any palette change. When every albedo shares size, format
+        /// rebaked lazily after any palette change. When every source shares size, format
         /// and mip count the bake is a plain GPU copy that keeps compressed formats; mixed
         /// inputs are resized onto the largest layer and stored uncompressed instead.
-        /// Returns null for an empty palette.
+        /// Returns null for an empty palette. Empty slots read plain white.
         /// </summary>
         public Texture2DArray GetAlbedoArray()
-        {
-            if (!bakedAlbedoDirty && bakedAlbedo != null)
-                return bakedAlbedo;
+            => GetArray(ref bakedAlbedo, ref albedoDirty, l => l.albedo,
+                Texture2D.whiteTexture, linear: false, "Albedo");
 
-            DestroyBakedAlbedo();
+        /// <summary>
+        /// The layer normal maps as one texture array (same bake rules as
+        /// <see cref="GetAlbedoArray"/>). Baked linear — normal data never goes through
+        /// sRGB. Empty slots read a flat normal.
+        /// </summary>
+        public Texture2DArray GetNormalArray()
+            => GetArray(ref bakedNormal, ref normalDirty, l => l.normal,
+                FlatNormalFallback, linear: true, "Normal");
+
+        /// <summary>
+        /// The layer occlusion maps as one texture array (same bake rules as
+        /// <see cref="GetAlbedoArray"/>; the shader reads the R channel). Baked linear —
+        /// import grayscale masks with sRGB off. Empty slots read white (unoccluded).
+        /// </summary>
+        public Texture2DArray GetOcclusionArray()
+            => GetArray(ref bakedOcclusion, ref occlusionDirty, l => l.occlusion,
+                Texture2D.whiteTexture, linear: true, "Occlusion");
+
+        /// <summary>
+        /// The layer height maps as one texture array (same bake rules as
+        /// <see cref="GetAlbedoArray"/>; the shader reads the R channel). Baked linear —
+        /// import grayscale masks with sRGB off. Empty slots read uniform mid height, the
+        /// identity for the height-steered blend.
+        /// </summary>
+        public Texture2DArray GetHeightArray()
+            => GetArray(ref bakedHeight, ref heightDirty, l => l.height,
+                Texture2D.linearGrayTexture, linear: true, "Height");
+
+        Texture2DArray GetArray(ref Texture2DArray baked, ref bool dirty,
+            Func<Layer, Texture2D> map, Texture2D fallback, bool linear, string label)
+        {
+            if (!dirty && baked != null)
+                return baked;
+
+            DestroyBaked(ref baked);
             if (LayerCount > 0)
-                bakedAlbedo = BakeAlbedoArray();
-            bakedAlbedoDirty = false;
-            return bakedAlbedo;
+                baked = BakeArray(map, fallback, linear, label);
+            dirty = false;
+            return baked;
         }
 
-        void OnDisable() => DestroyBakedAlbedo();
-
-        void DestroyBakedAlbedo()
+        void OnDisable()
         {
-            if (bakedAlbedo == null)
+            DestroyBaked(ref bakedAlbedo);
+            DestroyBaked(ref bakedNormal);
+            DestroyBaked(ref bakedOcclusion);
+            DestroyBaked(ref bakedHeight);
+        }
+
+        static void DestroyBaked(ref Texture2DArray baked)
+        {
+            if (baked == null)
                 return;
             if (Application.isPlaying)
-                Destroy(bakedAlbedo);
+                Destroy(baked);
             else
-                DestroyImmediate(bakedAlbedo);
-            bakedAlbedo = null;
+                DestroyImmediate(baked);
+            baked = null;
         }
 
-        Texture2DArray BakeAlbedoArray()
+        Texture2DArray BakeArray(Func<Layer, Texture2D> map, Texture2D fallback, bool linear,
+            string label)
         {
             int count = LayerCount;
             var sources = new Texture2D[count];
             for (int i = 0; i < count; i++)
-                sources[i] = layers[i].albedo != null ? layers[i].albedo : Texture2D.whiteTexture;
+            {
+                Texture2D source = map(layers[i]);
+                sources[i] = source != null ? source : fallback;
+            }
 
             Texture2DArray array = CanCopyDirectly(sources)
                 ? BakeByCopy(sources)
-                : BakeByBlit(sources);
-            array.name = $"{name} Albedo Array";
+                : BakeByBlit(sources, linear);
+            if (array == null)
+            {
+                Debug.LogError($"[Transvoxel] Could not bake the '{name}' palette's {label} " +
+                               "texture array on this platform; those maps will not render.");
+                return null;
+            }
+            array.name = $"{name} {label} Array";
             array.hideFlags = HideFlags.HideAndDontSave;
             array.wrapMode = TextureWrapMode.Repeat;
             array.filterMode = FilterMode.Trilinear;
@@ -167,6 +352,15 @@ namespace reromanlee.Transvoxel
         static bool CanCopyDirectly(Texture2D[] sources)
         {
             Texture2D first = sources[0];
+
+            // Not every format a Texture2D can hold can be SAMPLED from a Texture2DArray.
+            // RGB24 (any PNG without an alpha channel, imported uncompressed) is the common
+            // one: creating the array succeeds but leaves a broken native object, and the
+            // first property access throws. The blit path stores plain RGBA32, which is
+            // supported everywhere, so fall through to it instead of crashing.
+            if (!SystemInfo.IsFormatSupported(first.graphicsFormat, GraphicsFormatUsage.Sample))
+                return false;
+
             foreach (Texture2D source in sources)
             {
                 // Crunched formats are CPU-side containers Graphics.CopyTexture cannot
@@ -202,9 +396,10 @@ namespace reromanlee.Transvoxel
         /// Mixed sizes/formats: every source is resized onto the largest layer through a
         /// temporary render target and stored as uncompressed RGBA32. Costs more video
         /// memory than the direct copy — give all layers the same import settings to get
-        /// the fast path.
+        /// the fast path. Color data goes through sRGB, map data (normal/occlusion/height)
+        /// stays linear so the raw values survive.
         /// </summary>
-        static Texture2DArray BakeByBlit(Texture2D[] sources)
+        static Texture2DArray BakeByBlit(Texture2D[] sources, bool linear)
         {
             int width = 4, height = 4;
             foreach (Texture2D source in sources)
@@ -214,10 +409,12 @@ namespace reromanlee.Transvoxel
             }
 
             var array = new Texture2DArray(width, height, sources.Length, TextureFormat.RGBA32,
-                mipChain: true, linear: false);
-            var scratch = new Texture2D(width, height, TextureFormat.RGBA32, mipChain: true, linear: false);
+                mipChain: true, linear: linear);
+            var scratch = new Texture2D(width, height, TextureFormat.RGBA32, mipChain: true,
+                linear: linear);
             RenderTexture target = RenderTexture.GetTemporary(width, height, 0,
-                RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                RenderTextureFormat.ARGB32,
+                linear ? RenderTextureReadWrite.Linear : RenderTextureReadWrite.sRGB);
             RenderTexture previous = RenderTexture.active;
 
             for (int i = 0; i < sources.Length; i++)

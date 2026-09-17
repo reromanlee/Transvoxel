@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ui:UXML xmlns:ui="UnityEngine.UIElements" editor-extension-mode="False">
+    <!-- Relative, so it survives Package Manager copying the sample into a versioned
+         folder under Assets/Samples/. -->
+    <Style src="DemoUI.uss" />
+
+    <!-- Layout only. Everything is looked up by name in TransvoxelDemoController, so the
+         panel can be restyled or rearranged without touching a line of C#. -->
+    <ui:VisualElement name="root" picking-mode="Ignore" class="root">
+        <ui:VisualElement name="panel" class="panel">
+
+            <ui:VisualElement class="header">
+                <ui:Label text="Transvoxel" class="title" />
+                <ui:Button name="collapse" text="–" class="collapse" />
+            </ui:VisualElement>
+
+            <ui:ScrollView name="body" class="body">
+
+                <ui:Foldout text="Stats" name="fold-stats" value="true" class="section">
+                    <ui:Label name="stat-frame" class="stat" />
+                    <ui:Label name="stat-chunks" class="stat" />
+                    <ui:Label name="stat-cpu" class="stat" />
+                    <ui:Label name="stat-memory" class="stat" />
+                </ui:Foldout>
+
+                <ui:Foldout text="Sculpt" name="fold-sculpt" value="true" class="section">
+                    <ui:Slider name="brush-radius" label="Radius" low-value="1" high-value="24"
+                               value="5" show-input-field="true" class="row" />
+                    <ui:Slider name="brush-strength" label="Strength" low-value="0.1" high-value="2"
+                               value="0.9" show-input-field="true" class="row" />
+                    <ui:Label text="Build material" class="sub" />
+                    <ui:RadioButtonGroup name="material-picker" class="picker" />
+                    <ui:Slider name="blend-sharpness" label="Blend" low-value="1" high-value="16"
+                               value="4" show-input-field="true" class="row" />
+                </ui:Foldout>
+
+                <ui:Foldout text="World" name="fold-world" value="false" class="section">
+                    <ui:Label name="world-note" class="note"
+                              text="These rebuild the whole world live — that is the point." />
+                    <ui:Slider name="view-distance" label="View dist" low-value="64" high-value="1200"
+                               value="500" show-input-field="true" class="row" />
+                    <ui:SliderInt name="lod-levels" label="LOD levels" low-value="1" high-value="8"
+                                  value="4" show-input-field="true" class="row" />
+                    <ui:Slider name="lod-split" label="LOD split" low-value="1" high-value="4"
+                               value="1.4" show-input-field="true" class="row" />
+                    <ui:Slider name="voxel-size" label="Voxel size" low-value="0.25" high-value="4"
+                               value="1" show-input-field="true" class="row" />
+                </ui:Foldout>
+
+                <ui:Foldout text="Appearance" name="fold-appearance" value="false" class="section">
+                    <ui:Toggle name="smooth-shading" label="Smooth shading" class="row" />
+                    <ui:Toggle name="colorize-lods" label="Colorize LODs" class="row" />
+                    <ui:Slider name="fade-seconds" label="Chunk fade" low-value="0" high-value="2"
+                               value="0.4" show-input-field="true" class="row" />
+                    <ui:Slider name="edge-fade" label="Edge fade" low-value="0" high-value="1"
+                               value="0.1" show-input-field="true" class="row" />
+                    <ui:Toggle name="triplanar" label="Triplanar" class="row" />
+                    <ui:Toggle name="parallax" label="Parallax occlusion" class="row" />
+                    <ui:Label name="parallax-note" class="note" />
+                </ui:Foldout>
+
+                <ui:Foldout text="Performance" name="fold-performance" value="false" class="section">
+                    <ui:Label text="Meshing backend" class="sub" />
+                    <ui:RadioButtonGroup name="backend-picker" choices="CPU,GPU,Hybrid" class="picker" />
+                    <ui:SliderInt name="collider-lod" label="Collider LOD" low-value="-1" high-value="8"
+                                  value="0" show-input-field="true" class="row" />
+                </ui:Foldout>
+
+                <ui:Foldout text="Controls" name="fold-controls" value="false" class="section">
+                    <ui:Label name="controls-text" class="note" />
+                </ui:Foldout>
+
+            </ui:ScrollView>
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

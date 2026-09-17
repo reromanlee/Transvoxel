@@ -10,6 +10,12 @@ namespace reromanlee.Transvoxel.Density
     /// </summary>
     public sealed class LayeredDensitySource : IDensitySource
     {
+        /// <summary>
+        /// Density delta below which a brush write is dropped as a no-op. Small enough that
+        /// repeated weak strokes still accumulate, large enough to catch exact saturation.
+        /// </summary>
+        const float NoOpDensityChange = 1e-4f;
+
         public IDensitySource BaseSource { get; }
         public VoxelEditLayer Edits { get; }
 
@@ -70,9 +76,21 @@ namespace reromanlee.Transvoxel.Density
                         ? current + strength * influence
                         : current - strength * influence;
                     target = Mathf.Clamp01(target);
-                    set(vx, vy, vz, target);
+
+                    // Painting is decided before the write is filtered: a build stroke over
+                    // ground that is already fully solid still repaints it, which is the
+                    // documented behaviour.
                     if (painted != null && target > isoLevel)
                         painted.Add(new Vector3Int(vx, vy, vz));
+
+                    // Skip writes that change nothing measurable. Without this, every voxel
+                    // the brush touches is pinned into the sparse edit layer forever — most
+                    // of them at the clamp (digging air that is already 0, building ground
+                    // already at 1) or at the rim where influence fades to zero. Those cost
+                    // a 16 KB brick each and answer with the procedural value anyway.
+                    if (Mathf.Abs(target - current) < NoOpDensityChange)
+                        continue;
+                    set(vx, vy, vz, target);
                 }
             });
 

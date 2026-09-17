@@ -43,6 +43,21 @@ namespace reromanlee.Transvoxel.Editor.Tests
             public float SampleVoxel(int x, int y, int z) => Mathf.Clamp01(0.5f - y / 8f);
         }
 
+        /// <summary>Counts how many voxels a consumer actually asks for.</summary>
+        sealed class CountingDensity : IDensitySource
+        {
+            readonly IDensitySource inner;
+            public int Samples;
+
+            public CountingDensity(IDensitySource source) => inner = source;
+
+            public float SampleVoxel(int x, int y, int z)
+            {
+                Samples++;
+                return inner.SampleVoxel(x, y, z);
+            }
+        }
+
         // ------------------------------------------------------------------ mesh collection
 
         /// <summary>
@@ -858,6 +873,314 @@ namespace reromanlee.Transvoxel.Editor.Tests
             MeshBuffers pooledSnapshot = MeshBuffers.Rent();
             Assert.GreaterOrEqual(pooledSnapshot.EstimateBytes(), 0);
             MeshBuffers.Return(pooledSnapshot);
+        }
+
+        // ------------------------------------------------------------------ material palette
+
+        [Test]
+        public void PaletteUniforms_PackTintSmoothnessAndMapStrengths()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            try
+            {
+                TransvoxelMaterialPalette.Layer layer = palette.Layers[0];
+                layer.tint = new Color(0.1f, 0.2f, 0.3f);
+                layer.smoothness = 0.7f;
+                layer.uvScaleMultiplier = 2f;
+                layer.normalStrength = 0.5f;
+                layer.occlusionStrength = 0.25f;
+                layer.heightScale = 0.08f;
+
+                var colors = new Vector4[TransvoxelMaterialPalette.MaxLayers];
+                var scales = new Vector4[TransvoxelMaterialPalette.MaxLayers];
+                palette.FillLayerUniforms(colors, scales);
+
+                Assert.AreEqual(new Vector4(0.1f, 0.2f, 0.3f, 0.7f), colors[0]);
+                // w carries the parallax height amplitude.
+                Assert.AreEqual(new Vector4(2f, 0.5f, 0.25f, 0.08f), scales[0]);
+                // Slots past the layer count are never indexed (the shader clamps ids to
+                // the layer count) but must still hold harmless neutral values.
+                Assert.AreEqual(new Vector4(1f, 1f, 1f, 0f), scales[1]);
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+            }
+        }
+
+        [Test]
+        public void PaletteDetailMaps_DetectedOnAnyLayer()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            try
+            {
+                Assert.IsFalse(palette.HasDetailMaps, "map-free palette reports detail maps");
+
+                int id = palette.AddLayer(new TransvoxelMaterialPalette.Layer
+                {
+                    name = "Rock",
+                    height = Texture2D.linearGrayTexture,
+                });
+                Assert.AreEqual(1, id);
+                Assert.IsTrue(palette.HasDetailMaps, "height map on layer 1 not detected");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+            }
+        }
+
+        [Test]
+        public void PaletteMapArrays_BakeFallbacksAndMixedSizes()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            var normalMap = new Texture2D(8, 8, TextureFormat.RGBA32, mipChain: true, linear: true);
+            try
+            {
+                palette.AddLayer(new TransvoxelMaterialPalette.Layer
+                {
+                    name = "Rock",
+                    normal = normalMap,
+                });
+
+                // Every map kind bakes one slice per layer; empty slots hold the neutral
+                // fallback (white albedo/occlusion, mid-gray height).
+                Assert.AreEqual(2, palette.GetAlbedoArray().depth);
+                Assert.AreEqual(2, palette.GetOcclusionArray().depth);
+                Assert.AreEqual(2, palette.GetHeightArray().depth);
+
+                // The 8x8 normal map mixes with the 4x4 flat-normal fallback slice, so the
+                // bake takes the blit path and resizes onto the largest source.
+                Texture2DArray normals = palette.GetNormalArray();
+                Assert.AreEqual(2, normals.depth);
+                Assert.AreEqual(8, normals.width);
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+                UnityEngine.Object.DestroyImmediate(normalMap);
+            }
+        }
+
+        /// <summary>
+        /// A PNG without an alpha channel imports as RGB24, which a Texture2DArray cannot be
+        /// sampled from on D3D11. Creating the array appears to succeed but leaves a broken
+        /// native object, so the next property access threw and took the whole terrain down
+        /// with it during OnEnable. The bake must notice and fall back instead.
+        /// </summary>
+        [Test]
+        public void PaletteBake_SurvivesFormatsThatCannotBeSampledAsArrays()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            var rgb24 = new Texture2D(16, 16, TextureFormat.RGB24, mipChain: true);
+            try
+            {
+                rgb24.SetPixel(0, 0, Color.red);
+                rgb24.Apply();
+                palette.Layers[0].albedo = rgb24;
+
+                Texture2DArray array = null;
+                Assert.DoesNotThrow(() => array = palette.GetAlbedoArray(),
+                    "baking an RGB24 source must not throw");
+                Assert.IsNotNull(array, "the bake produced no array at all");
+                Assert.AreEqual(1, array.depth);
+                Assert.IsNotNull(array.name, "the array object is broken");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+                UnityEngine.Object.DestroyImmediate(rgb24);
+            }
+        }
+
+        // ------------------------------------------------------------------ chunk views
+
+        static MeshBuffers OneTriangleBuffers(bool withMaterials)
+        {
+            MeshBuffers buffers = MeshBuffers.Rent();
+            buffers.Vertices.Add(Vector3.zero);
+            buffers.Vertices.Add(Vector3.right);
+            buffers.Vertices.Add(Vector3.up);
+            for (int i = 0; i < 3; i++)
+            {
+                buffers.Normals.Add(Vector3.forward);
+                buffers.Uvs.Add(Vector2.zero);
+                if (withMaterials)
+                    buffers.MaterialBlend.Add(new Color32(0, 0, 0, 0));
+            }
+            buffers.Indices.Add(0);
+            buffers.Indices.Add(1);
+            buffers.Indices.Add(2);
+            return buffers;
+        }
+
+        /// <summary>
+        /// The shader declares float2 fadeData : TEXCOORD1 in every variant and pass. A mesh
+        /// without that channel leaves the attribute unbound, so the fragment shader reads
+        /// undefined data and dither-clips the surface into holes at random. The channel must
+        /// therefore exist even when fading is switched off entirely (duration 0 = solid).
+        /// </summary>
+        [TestCase(0f, TestName = "ChunkMesh_CarriesFadeChannel_FadingOff")]
+        [TestCase(0.4f, TestName = "ChunkMesh_CarriesFadeChannel_FadingOn")]
+        public void ChunkMesh_AlwaysCarriesTheFadeChannel(float fadeSeconds)
+        {
+            var root = new GameObject("Test Terrain Root");
+            MeshBuffers buffers = OneTriangleBuffers(withMaterials: false);
+            try
+            {
+                var chunk = new TerrainChunk(new NodeKey(0, Vector3Int.zero), root.transform,
+                    null, 1f, 16);
+                chunk.Apply(buffers, fadeSeconds);
+
+                Mesh mesh = root.GetComponentInChildren<MeshFilter>().sharedMesh;
+                Assert.IsNotNull(mesh, "no mesh was applied");
+                Assert.AreEqual(3, mesh.vertexCount);
+                Assert.IsTrue(
+                    mesh.HasVertexAttribute(UnityEngine.Rendering.VertexAttribute.TexCoord1),
+                    $"chunk mesh built with fadeSeconds={fadeSeconds} has no TEXCOORD1 channel; " +
+                    "the shader would read an unbound vertex attribute");
+
+                var fadeData = new List<Vector2>();
+                mesh.GetUVs(1, fadeData);
+                Assert.AreEqual(3, fadeData.Count);
+                Assert.AreEqual(fadeSeconds, fadeData[0].y, 1e-6f,
+                    "the fade duration must be baked into the channel as-is");
+            }
+            finally
+            {
+                MeshBuffers.Return(buffers);
+                UnityEngine.Object.DestroyImmediate(root);
+            }
+        }
+
+        /// <summary>
+        /// A cached grid holds the main volume, but the per-face transition sheets are
+        /// sampled lazily per mask. They must be published back into the cached grid, or a
+        /// chunk with transition faces re-samples a (2·cells+1)² sheet per face on every
+        /// single rebuild — comparable to re-sampling the whole chunk.
+        /// </summary>
+        [Test]
+        public void SampleCache_ReusesFaceSheetsAcrossBuilds()
+        {
+            const int cells = 16;
+            const float iso = 0.5f;
+            var counting = new CountingDensity(new SphereDensity
+            {
+                Center = new Vector3(16, 16, 16),
+                Radius = 10f,
+            });
+            var cache = new SampleCache(64);
+            var key = new NodeKey(1, Vector3Int.zero);
+            byte mask = (byte)CubeFace.PosX.Bit();
+
+            cache.GetOrSample(counting, key, cells, iso, 0); // warm the main grid
+            counting.Samples = 0;
+
+            cache.GetOrSample(counting, key, cells, iso, mask);
+            int firstSheet = counting.Samples;
+            Assert.Greater(firstSheet, 0, "the +X face sheet was never sampled");
+
+            counting.Samples = 0;
+            ChunkSamples again = cache.GetOrSample(counting, key, cells, iso, mask);
+            Assert.AreEqual(0, counting.Samples,
+                "the face sheet was re-sampled instead of being reused from the cached grid");
+            Assert.IsNotNull(again.FaceSheets[(int)CubeFace.PosX], "the reused view lost its sheet");
+            Assert.AreEqual(mask, again.TransitionMask, "the view must carry the requested mask");
+        }
+
+        /// <summary>
+        /// The brush must not pin voxels into the sparse edit layer for changes that do
+        /// nothing — digging air that is already empty is the common case, and each stored
+        /// brick costs 16 KB forever.
+        /// </summary>
+        [Test]
+        public void SphereBrush_DoesNotStoreNoOpWrites()
+        {
+            var layers = new LayeredDensitySource(new FlatGround(), new VoxelEditLayer());
+
+            // Well above the ground plane, where FlatGround is already 0: digging cannot
+            // lower it, so nothing should be recorded.
+            layers.ApplySphereBrush(new Vector3(0f, 200f, 0f), 6f, 0.9f, build: false);
+            Assert.AreEqual(0, layers.Edits.BrickCount,
+                "digging empty air allocated edit bricks for writes that changed nothing");
+
+            // A stroke that does change the field still records normally.
+            layers.ApplySphereBrush(new Vector3(0f, 0f, 0f), 6f, 0.9f, build: false);
+            Assert.Greater(layers.Edits.BrickCount, 0, "a real dig recorded nothing");
+        }
+
+        /// <summary>
+        /// Build strokes repaint ground that is already fully solid, so the material stamp
+        /// must not be skipped along with the no-op density write.
+        /// </summary>
+        [Test]
+        public void SphereBrush_RepaintsAlreadySolidGround()
+        {
+            var materials = new VoxelMaterialLayer();
+            var solid = new LayeredDensitySource(new AlwaysSolid(), new VoxelEditLayer());
+
+            solid.ApplySphereBrush(Vector3.zero, 4f, 0.9f, build: true, isoLevel: 0.5f,
+                materials: materials, materialId: 3);
+
+            Assert.AreEqual(3, materials.SampleMaterial(0, 0, 0),
+                "solid ground inside a build brush was not repainted");
+        }
+
+        sealed class AlwaysSolid : IDensitySource
+        {
+            public float SampleVoxel(int x, int y, int z) => 1f;
+        }
+
+        /// <summary>
+        /// Catches HLSL that does not compile. The shared modules are included by the
+        /// bundled shader and by user Shader Graphs, so a syntax or type error there breaks
+        /// every terrain in every project — and C# compiling tells you nothing about it.
+        /// </summary>
+        [Test]
+        public void BundledShader_CompilesWithoutErrors()
+        {
+            Shader shader = Shader.Find("Transvoxel/Lit Dithered");
+            Assert.IsNotNull(shader, "the bundled shader is missing from Resources");
+
+            // The concrete message type has moved between Unity versions; var keeps this
+            // test working across them.
+            var messages = UnityEditor.ShaderUtil.GetShaderMessages(shader);
+            var report = new List<string>();
+            foreach (var message in messages)
+                report.Add($"{message.file}({message.line}): {message.message}");
+
+            Assert.IsFalse(UnityEditor.ShaderUtil.ShaderHasError(shader),
+                "Transvoxel/Lit Dithered failed to compile. "
+                + string.Join(System.Environment.NewLine, report));
+        }
+
+        /// <summary>
+        /// The LOD debug tint is delivered as a per-LOD shared MATERIAL carrying
+        /// _TransvoxelLodTint, which the shader multiplies into the final albedo of every
+        /// variant. The palette variants build albedo purely from the palette and never read
+        /// _BaseColor, so a tint routed through _BaseColor (as a MaterialPropertyBlock once
+        /// did) is silently discarded and LOD colouring appears to do nothing.
+        /// </summary>
+        [Test]
+        public void BundledShader_ExposesTheLodTintProperty()
+        {
+            Shader shader = Shader.Find("Transvoxel/Lit Dithered");
+            Assert.IsNotNull(shader, "the bundled shader is missing from Resources");
+
+            var material = new Material(shader);
+            try
+            {
+                Assert.IsTrue(material.HasProperty("_TransvoxelLodTint"),
+                    "_TransvoxelLodTint is gone; the LOD debug tint cannot reach the palette variants");
+                Assert.AreEqual(Color.white, material.GetColor("_TransvoxelLodTint"),
+                    "the tint must default to white so it is a no-op until switched on");
+                Assert.IsTrue(material.HasProperty("_TransvoxelFadeAware"), "fade marker missing");
+                Assert.IsTrue(material.HasProperty("_TransvoxelPaletteAware"), "palette marker missing");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(material);
+            }
         }
     }
 }
