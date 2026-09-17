@@ -49,6 +49,13 @@ maps, and the overlay. You can:
 > Input Handling** set to *Input System Package* or *Both*. (The package itself has no such
 > requirement — only the sample does.)
 
+> **Importing copies the sample.** Package Manager snapshots `Samples~/` into
+> `Assets/Samples/Transvoxel/<version>/`, and later package updates never touch that copy —
+> so after updating the package, press **Import** again to pick up changes to the demo
+> (it will ask before overwriting). Close the demo scene first: the re-import replaces the
+> scene file too. Edits you make inside `Assets/Samples/` are yours, and are overwritten by
+> a re-import.
+
 Using the terrain in your own scene needs none of this; see below.
 
 ## Using it in your own scene
