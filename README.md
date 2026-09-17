@@ -1,5 +1,7 @@
 # Transvoxel
 
+<img src=".github/transvoxel-cover.jpg" alt="Preview of Transvoxel demo" width="100%">
+
 A clean, modular implementation of Eric Lengyel's **Transvoxel** algorithm — seamless
 level-of-detail (LOD) triangulation of a voxel density field — driven by an octree and
 built for large, editable, real-time landscapes.
