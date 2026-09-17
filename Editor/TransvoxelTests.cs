@@ -944,5 +944,94 @@ namespace reromanlee.Transvoxel.Editor.Tests
                 UnityEngine.Object.DestroyImmediate(normalMap);
             }
         }
+
+        // ------------------------------------------------------------------ chunk views
+
+        static MeshBuffers OneTriangleBuffers(bool withMaterials)
+        {
+            MeshBuffers buffers = MeshBuffers.Rent();
+            buffers.Vertices.Add(Vector3.zero);
+            buffers.Vertices.Add(Vector3.right);
+            buffers.Vertices.Add(Vector3.up);
+            for (int i = 0; i < 3; i++)
+            {
+                buffers.Normals.Add(Vector3.forward);
+                buffers.Uvs.Add(Vector2.zero);
+                if (withMaterials)
+                    buffers.MaterialBlend.Add(new Color32(0, 0, 0, 0));
+            }
+            buffers.Indices.Add(0);
+            buffers.Indices.Add(1);
+            buffers.Indices.Add(2);
+            return buffers;
+        }
+
+        /// <summary>
+        /// The shader declares float2 fadeData : TEXCOORD1 in every variant and pass. A mesh
+        /// without that channel leaves the attribute unbound, so the fragment shader reads
+        /// undefined data and dither-clips the surface into holes at random. The channel must
+        /// therefore exist even when fading is switched off entirely (duration 0 = solid).
+        /// </summary>
+        [TestCase(0f, TestName = "ChunkMesh_CarriesFadeChannel_FadingOff")]
+        [TestCase(0.4f, TestName = "ChunkMesh_CarriesFadeChannel_FadingOn")]
+        public void ChunkMesh_AlwaysCarriesTheFadeChannel(float fadeSeconds)
+        {
+            var root = new GameObject("Test Terrain Root");
+            MeshBuffers buffers = OneTriangleBuffers(withMaterials: false);
+            try
+            {
+                var chunk = new TerrainChunk(new NodeKey(0, Vector3Int.zero), root.transform,
+                    null, 1f, 16);
+                chunk.Apply(buffers, fadeSeconds);
+
+                Mesh mesh = root.GetComponentInChildren<MeshFilter>().sharedMesh;
+                Assert.IsNotNull(mesh, "no mesh was applied");
+                Assert.AreEqual(3, mesh.vertexCount);
+                Assert.IsTrue(
+                    mesh.HasVertexAttribute(UnityEngine.Rendering.VertexAttribute.TexCoord1),
+                    $"chunk mesh built with fadeSeconds={fadeSeconds} has no TEXCOORD1 channel; " +
+                    "the shader would read an unbound vertex attribute");
+
+                var fadeData = new List<Vector2>();
+                mesh.GetUVs(1, fadeData);
+                Assert.AreEqual(3, fadeData.Count);
+                Assert.AreEqual(fadeSeconds, fadeData[0].y, 1e-6f,
+                    "the fade duration must be baked into the channel as-is");
+            }
+            finally
+            {
+                MeshBuffers.Return(buffers);
+                UnityEngine.Object.DestroyImmediate(root);
+            }
+        }
+
+        /// <summary>
+        /// The LOD debug tint is delivered as a per-LOD shared MATERIAL carrying
+        /// _TransvoxelLodTint, which the shader multiplies into the final albedo of every
+        /// variant. The palette variants build albedo purely from the palette and never read
+        /// _BaseColor, so a tint routed through _BaseColor (as a MaterialPropertyBlock once
+        /// did) is silently discarded and LOD colouring appears to do nothing.
+        /// </summary>
+        [Test]
+        public void BundledShader_ExposesTheLodTintProperty()
+        {
+            Shader shader = Shader.Find("Transvoxel/Lit Dithered");
+            Assert.IsNotNull(shader, "the bundled shader is missing from Resources");
+
+            var material = new Material(shader);
+            try
+            {
+                Assert.IsTrue(material.HasProperty("_TransvoxelLodTint"),
+                    "_TransvoxelLodTint is gone; the LOD debug tint cannot reach the palette variants");
+                Assert.AreEqual(Color.white, material.GetColor("_TransvoxelLodTint"),
+                    "the tint must default to white so it is a no-op until switched on");
+                Assert.IsTrue(material.HasProperty("_TransvoxelFadeAware"), "fade marker missing");
+                Assert.IsTrue(material.HasProperty("_TransvoxelPaletteAware"), "palette marker missing");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(material);
+            }
+        }
     }
 }

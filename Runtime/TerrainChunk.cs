@@ -16,28 +16,19 @@ namespace reromanlee.Transvoxel
     /// </summary>
     public sealed class TerrainChunk
     {
-        static readonly Color[] LodTints =
-        {
-            new Color(1f, 1f, 1f),        // LOD0 white
-            new Color(0.6f, 1f, 0.6f),    // LOD1 green
-            new Color(0.6f, 0.8f, 1f),    // LOD2 blue
-            new Color(1f, 1f, 0.5f),      // LOD3 yellow
-            new Color(1f, 0.7f, 0.4f),    // LOD4 orange
-            new Color(1f, 0.5f, 0.5f),    // LOD5 red
-            new Color(1f, 0.6f, 1f),      // LOD6 magenta
-            new Color(0.7f, 0.7f, 0.7f),  // LOD7+ grey
-        };
-
-        static readonly int BaseColorId = Shader.PropertyToID("_BaseColor"); // URP/HDRP Lit
-        static readonly int ColorId = Shader.PropertyToID("_Color");         // Built-in Standard
-
         // Fade parameters ride in the mesh itself as a UV2 channel of (fadeStartTime,
         // signedFadeDuration): renderer state (MaterialPropertyBlocks) and per-chunk
         // material values are bypassed by some render paths (e.g. URP's GPU Resident
         // Drawer), but vertex data reaches the shader on every path. The shader animates
         // the fade from Unity's built-in _Time — no custom uniform in the time path at
         // all — so nothing per-chunk is touched per frame. The duration's sign marks a
-        // cross-fade ghost; zero (or a missing channel) renders solid.
+        // cross-fade ghost; zero renders solid.
+        //
+        // The channel is written on EVERY apply, including when fading is switched off
+        // (duration 0). It must exist unconditionally: the shader declares the TEXCOORD1
+        // input in every variant, and a mesh that lacks the channel leaves that vertex
+        // attribute unbound — the fragment shader then reads whatever happens to be
+        // there and clips the surface into holes at random.
         static readonly List<Vector2> FadeDataScratch = new List<Vector2>(8192); // main thread only
 
         public NodeKey Key { get; private set; }
@@ -60,10 +51,8 @@ namespace reromanlee.Transvoxel
         readonly GameObject gameObject;
         readonly MeshFilter meshFilter;
         readonly MeshRenderer meshRenderer;
-        readonly MaterialPropertyBlock propertyBlock = new MaterialPropertyBlock();
         MeshCollider meshCollider;
         Mesh mesh;
-        bool tintVisible;
 
         public TerrainChunk(NodeKey key, Transform parent, Material material, float voxelSize, int chunkCells)
         {
@@ -80,7 +69,6 @@ namespace reromanlee.Transvoxel
             Key = key;
             TransitionMask = 0;
             SpawnTime = Time.time;
-            tintVisible = false;
 #if UNITY_EDITOR
             // Handy in the hierarchy, but a per-activation string allocation in builds.
             gameObject.name = $"Chunk {key}";
@@ -88,7 +76,6 @@ namespace reromanlee.Transvoxel
             var min = key.MinVoxel(chunkCells);
             gameObject.transform.localPosition = new Vector3(min.x, min.y, min.z) * voxelSize;
             meshRenderer.sharedMaterial = material;
-            PushPropertyBlock();
             gameObject.SetActive(true);
         }
 
@@ -110,7 +97,7 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>Uploads freshly built buffers into this chunk's mesh (main thread only).</summary>
-        public void Apply(MeshBuffers buffers, bool colorizeLod, float fadeSeconds)
+        public void Apply(MeshBuffers buffers, float fadeSeconds)
         {
             EnsureMesh();
             mesh.Clear();
@@ -119,8 +106,7 @@ namespace reromanlee.Transvoxel
             MeshBytes = 0;
             if (!buffers.IsEmpty)
             {
-                int vertexStride = 12 + 12 + 8                          // position, normal, uv0
-                                   + (fadeSeconds > 0f ? 8 : 0)         // fade data (uv2)
+                int vertexStride = 12 + 12 + 8 + 8                      // position, normal, uv0, fade uv2
                                    + (buffers.MaterialBlend.Count > 0 ? 4 : 0); // blend color
                 int indexStride = buffers.Vertices.Count > ushort.MaxValue ? 4 : 2;
                 MeshBytes = (long)VertexCount * vertexStride + (long)IndexCount * indexStride;
@@ -134,13 +120,11 @@ namespace reromanlee.Transvoxel
                 // like the fade UV2 it is mesh data, so it reaches every render path.
                 if (buffers.MaterialBlend.Count > 0)
                     mesh.SetColors(buffers.MaterialBlend);
-                if (fadeSeconds > 0f)
-                    WriteFadeData(fadeSeconds);
+                WriteFadeData(fadeSeconds); // always — see the note on the fade channel above
                 mesh.SetTriangles(buffers.Indices, 0, calculateBounds: true);
             }
 
             meshRenderer.enabled = !buffers.IsEmpty;
-            SetLodTintVisible(colorizeLod);
         }
 
         /// <summary>
@@ -187,10 +171,17 @@ namespace reromanlee.Transvoxel
 
         public EntityId MeshEntityId => mesh != null ? mesh.GetEntityId() : EntityId.None;
 
-        public void SetLodTintVisible(bool visible)
+        /// <summary>
+        /// Swaps the material this view renders with. The terrain uses it for the LOD debug
+        /// tint, which is a per-LOD SHARED material rather than a per-renderer override:
+        /// renderer state is bypassed by batched render paths, and a MaterialPropertyBlock
+        /// would additionally drop every tinted chunk out of the SRP Batcher — a frame-rate
+        /// cliff exactly when the debug view is switched on.
+        /// </summary>
+        public void SetMaterial(Material material)
         {
-            tintVisible = visible;
-            PushPropertyBlock();
+            if (meshRenderer != null)
+                meshRenderer.sharedMaterial = material;
         }
 
         /// <summary>
@@ -201,26 +192,6 @@ namespace reromanlee.Transvoxel
         public void RestartFadeIn()
         {
             SpawnTime = Time.time;
-        }
-
-        /// <summary>
-        /// The debug LOD tint stays on a MaterialPropertyBlock (it may not show on render
-        /// paths that skip per-renderer blocks, but it is a debug feature). A renderer with
-        /// a block is excluded from the SRP Batcher, so the block only exists while tinted.
-        /// </summary>
-        void PushPropertyBlock()
-        {
-            if (!tintVisible)
-            {
-                meshRenderer.SetPropertyBlock(null);
-                return;
-            }
-
-            propertyBlock.Clear();
-            var tint = LodTints[Mathf.Min(Key.Lod, LodTints.Length - 1)];
-            propertyBlock.SetColor(BaseColorId, tint);
-            propertyBlock.SetColor(ColorId, tint);
-            meshRenderer.SetPropertyBlock(propertyBlock);
         }
 
         public void Destroy()

@@ -36,6 +36,11 @@ Shader "Transvoxel/Lit Dithered"
         _BaseColor("Color", Color) = (0.42, 0.55, 0.3, 1)
         _BaseMap("Albedo", 2D) = "white" {}
         _Smoothness("Smoothness", Range(0, 1)) = 0.1
+        // Debug LOD tint, multiplied into the FINAL albedo of every variant. White = off.
+        // The terrain drives it through per-LOD shared material variants rather than a
+        // MaterialPropertyBlock, so tinted chunks keep SRP batching and the tint survives
+        // batched render paths. It is a real per-material property for exactly that reason.
+        [HideInInspector] _TransvoxelLodTint("LOD Tint (debug)", Color) = (1, 1, 1, 1)
         // Markers only: TransvoxelTerrain detects fade/palette-aware materials via
         // HasProperty. The actual inputs (_TransvoxelFade, the palette arrays) are GLOBAL
         // uniforms — deliberately not serialized properties, so the SRP Batcher can never
@@ -79,6 +84,7 @@ Shader "Transvoxel/Lit Dithered"
         float4 _BaseMap_ST;
         half4 _BaseColor;
         half _Smoothness;
+        half4 _TransvoxelLodTint;
         CBUFFER_END
 
         // The palette blend (globals, layer sampling, the detail-map surface and the
@@ -168,6 +174,9 @@ Shader "Transvoxel/Lit Dithered"
 #else
                 half3 albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv).rgb * _BaseColor.rgb;
 #endif
+                // Debug LOD tint last, so it applies to the palette variants too — they
+                // build albedo entirely from the palette and never read _BaseColor.
+                albedo *= _TransvoxelLodTint.rgb;
 
                 float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS);
                 Light mainLight = GetMainLight(shadowCoord);
@@ -297,6 +306,7 @@ Shader "Transvoxel/Lit Dithered"
         sampler2D _BaseMap;
         fixed4 _BaseColor;
         half _Smoothness;
+        fixed4 _TransvoxelLodTint;
 
         // The shared fade/dither module (see the URP subshader note: fade inputs are
         // never material properties). Without an SRP core include it declares classic
@@ -435,6 +445,7 @@ Shader "Transvoxel/Lit Dithered"
             o.Albedo = albedo.rgb;
             o.Smoothness = _Smoothness;
 #endif
+            o.Albedo *= _TransvoxelLodTint.rgb; // debug LOD tint, all variants
             o.Alpha = 1;
         }
         ENDCG

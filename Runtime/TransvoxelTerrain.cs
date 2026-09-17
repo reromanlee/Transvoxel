@@ -95,6 +95,23 @@ namespace reromanlee.Transvoxel
 
         const int MaxPooledChunkViews = 512;
 
+        /// <summary>Debug tint per LOD level; the last entry covers every deeper level.</summary>
+        static readonly Color[] LodTints =
+        {
+            new Color(1f, 1f, 1f),        // LOD0 white
+            new Color(0.6f, 1f, 0.6f),    // LOD1 green
+            new Color(0.6f, 0.8f, 1f),    // LOD2 blue
+            new Color(1f, 1f, 0.5f),      // LOD3 yellow
+            new Color(1f, 0.7f, 0.4f),    // LOD4 orange
+            new Color(1f, 0.5f, 0.5f),    // LOD5 red
+            new Color(1f, 0.6f, 1f),      // LOD6 magenta
+            new Color(0.7f, 0.7f, 0.7f),  // LOD7+ grey
+        };
+
+        static readonly int LodTintId = Shader.PropertyToID("_TransvoxelLodTint");
+        static readonly int BaseColorId = Shader.PropertyToID("_BaseColor"); // URP/HDRP Lit
+        static readonly int ColorId = Shader.PropertyToID("_Color");         // Built-in Standard
+
         // ---- pipeline (rebuilt on any settings change) ----
         IDensitySource density;
         TerrainOctree octree;
@@ -207,6 +224,19 @@ namespace reromanlee.Transvoxel
         TransvoxelMaterialPalette subscribedPalette;
         bool paletteDirty;
 
+        // The palette keywords are GLOBAL shader state shared by every terrain in the
+        // scene, so the last terrain to switch its palette off must not turn voxel
+        // materials off for the others. Refcounted across instances; see the README's
+        // note that one palette and one fade configuration drive the whole scene.
+        static int paletteKeywordUsers;
+        static bool warnedAboutMultipleTerrains;
+        bool holdsPaletteKeywords;
+
+        // Lazily built per-LOD copies of the runtime material, used only while
+        // colorizeLods is on. Shared materials (not per-renderer overrides), so tinted
+        // chunks keep SRP batching and the tint survives batched render paths.
+        Material[] lodTintMaterials;
+
         // The edgeFadeCurve is baked into a small LUT texture (curve.Evaluate can't run per
         // pixel) and pushed as a global so it reaches every render path, like the other fade
         // inputs. Rebaked on pipeline (re)build and on a fade-only settings edit.
@@ -242,9 +272,9 @@ namespace reromanlee.Transvoxel
             if (subscribedPalette != null)
                 subscribedPalette.Changed -= OnPaletteChanged;
             subscribedPalette = null;
-            Shader.DisableKeyword(PaletteKeyword);
-            Shader.DisableKeyword(PaletteMapsKeyword);
+            SetPaletteKeywordsHeld(false);
             ClearScene();
+            DestroyLodTintMaterials();
             while (chunkViewPool.Count > 0)
                 chunkViewPool.Pop().Destroy();
             if (edgeFadeLut != null)
@@ -304,9 +334,12 @@ namespace reromanlee.Transvoxel
                 settings.viewDistance, settings.lodSplitFactor);
             cache = new SampleCache(settings.densityCacheChunks);
             buildQueue = new BuildQueue(settings.chunkCells);
+            Material previousMaterial = runtimeMaterial;
             runtimeMaterial = settings.material != null
                 ? settings.material
                 : generatedMaterial ??= CreateDefaultMaterial();
+            if (!ReferenceEquals(previousMaterial, runtimeMaterial))
+                DestroyLodTintMaterials(); // the tint copies are derived from it
 
             // Fading is implemented in the shader; a material without _TransvoxelFade can't
             // show it, so disable the whole fade/ghost machinery instead of producing
@@ -429,14 +462,35 @@ namespace reromanlee.Transvoxel
                                  "shader/graph palette-aware with TransvoxelPalette.hlsl — see " +
                                  "the README's Voxel materials section.", this);
 
+            SetPaletteKeywordsHeld(paletteActive);
             if (paletteActive)
-            {
                 PushPaletteBindings();
-            }
-            else
+        }
+
+        /// <summary>
+        /// Claims or releases this terrain's share of the global palette keywords. They are
+        /// only switched off once no terrain needs them — otherwise disabling one terrain
+        /// would strip voxel materials from every other terrain still rendering.
+        /// </summary>
+        void SetPaletteKeywordsHeld(bool held)
+        {
+            if (held == holdsPaletteKeywords)
+                return;
+            holdsPaletteKeywords = held;
+            paletteKeywordUsers = Mathf.Max(0, paletteKeywordUsers + (held ? 1 : -1));
+            if (paletteKeywordUsers == 0)
             {
                 Shader.DisableKeyword(PaletteKeyword);
                 Shader.DisableKeyword(PaletteMapsKeyword);
+            }
+            else if (paletteKeywordUsers > 1 && !warnedAboutMultipleTerrains)
+            {
+                warnedAboutMultipleTerrains = true;
+                Debug.LogWarning("[Transvoxel] More than one TransvoxelTerrain with a material " +
+                                 "palette is active. The palette, fade and blend inputs are GLOBAL " +
+                                 "shader state, so every terrain renders with whichever palette was " +
+                                 "bound last. One terrain per scene is the supported setup — see the " +
+                                 "README's Voxel materials section.", this);
             }
         }
 
@@ -663,11 +717,11 @@ namespace reromanlee.Transvoxel
             if (settingsDirty)
             {
                 settingsDirty = false;
-                // A fade-only edit (edge fade fraction/curve) leaves the structural key intact:
-                // just rebake the LUT and let UpdateChunkFades push the band, keeping every live
-                // chunk on screen so the curve can be tuned without a full rebuild + re-fade.
+                // An edit that only touches live tunables (fade timings/curve, the LOD debug
+                // tint) leaves the structural key intact: refresh those in place and keep
+                // every live chunk on screen instead of re-sampling and re-meshing the world.
                 if (appliedStructuralKey != null && ComputeStructuralKey() == appliedStructuralKey)
-                    BakeEdgeFadeCurve();
+                    RefreshLiveTunables();
                 else
                     ApplySettings();
             }
@@ -730,6 +784,19 @@ namespace reromanlee.Transvoxel
         }
 
         /// <summary>
+        /// Applies a settings edit that changed nothing structural: the fade timings, the
+        /// edge-fade curve and the LOD debug tint, all without touching a single chunk's
+        /// geometry.
+        /// </summary>
+        void RefreshLiveTunables()
+        {
+            effectiveFadeSeconds = fadeAwareMaterial ? settings.chunkFadeInSeconds : 0f;
+            BakeEdgeFadeCurve();
+            RefreshLodTint();
+            appliedStructuralKey = ComputeStructuralKey();
+        }
+
+        /// <summary>
         /// Bakes <see cref="TransvoxelSettings.edgeFadeCurve"/> into a 1D LUT texture and
         /// publishes it as the <c>_TransvoxelEdgeFadeCurve</c> global. The shader samples it by
         /// the raw edge fade (0 at the draw distance, 1 at the viewer) to reshape the dither
@@ -763,10 +830,14 @@ namespace reromanlee.Transvoxel
         /// <summary>
         /// A fingerprint of every setting that requires rebuilding the octree/density/meshing
         /// pipeline. <see cref="TransvoxelSettings.edgeFadeFraction"/>,
-        /// <see cref="TransvoxelSettings.edgeFadeCurve"/> and
-        /// <see cref="TransvoxelSettings.materialBlendSharpness"/> are deliberately excluded —
-        /// they only feed shader globals and the fade LUT, so editing them refreshes those in
-        /// place instead of tearing down the whole scene. The material palette counts only by
+        /// <see cref="TransvoxelSettings.edgeFadeCurve"/>,
+        /// <see cref="TransvoxelSettings.materialBlendSharpness"/>,
+        /// <see cref="TransvoxelSettings.colorizeLods"/> and
+        /// <see cref="TransvoxelSettings.chunkFadeInSeconds"/> are deliberately excluded —
+        /// they only feed shader globals, the fade LUT and which material a renderer points
+        /// at, so editing them refreshes those in place instead of tearing down the whole
+        /// scene. (Chunks already on screen keep the fade duration baked into their mesh at
+        /// apply time; the new value applies to everything built from then on.) The material palette counts only by
         /// identity: swapping the asset re-meshes (vertices carry blend data), while edits
         /// inside it just re-bind textures and uniforms. Keep this in sync when adding
         /// settings that affect geometry.
@@ -777,7 +848,6 @@ namespace reromanlee.Transvoxel
                 settings.voxelSize, settings.chunkCells, settings.maxLodLevels, settings.viewDistance,
                 settings.lodSplitFactor, settings.isoLevel, settings.smoothShading,
                 settings.material != null ? settings.material.GetEntityId().ToString() : "0", settings.uvScale,
-                settings.colorizeLods, settings.chunkFadeInSeconds,
                 settings.materialPalette != null ? settings.materialPalette.GetEntityId().ToString() : "0",
                 JsonUtility.ToJson(settings.noise),
                 (int)settings.meshingBackend,
@@ -1132,7 +1202,6 @@ namespace reromanlee.Transvoxel
                     {
                         var ghost = RentChunkView(result.Key);
                         ghost.AttachGhostMesh(oldMesh);
-                        ghost.SetLodTintVisible(settings.colorizeLods);
                         AddDyingChunk(ghost);
                     }
                 }
@@ -1141,7 +1210,7 @@ namespace reromanlee.Transvoxel
 
             chunk.TransitionMask = result.Mask;
             bool empty = result.IsEmpty;
-            chunk.Apply(result.Buffers, settings.colorizeLods, effectiveFadeSeconds);
+            chunk.Apply(result.Buffers, effectiveFadeSeconds);
             result.ReleasePayload();
 
             bool wantCollider = settings.colliderMaxLod >= 0
@@ -1391,10 +1460,11 @@ namespace reromanlee.Transvoxel
             if (chunkViewPool.Count > 0)
             {
                 var pooled = chunkViewPool.Pop();
-                pooled.Activate(key, runtimeMaterial, settings.voxelSize, settings.chunkCells);
+                pooled.Activate(key, MaterialForLod(key.Lod), settings.voxelSize, settings.chunkCells);
                 return pooled;
             }
-            return new TerrainChunk(key, transform, runtimeMaterial, settings.voxelSize, settings.chunkCells);
+            return new TerrainChunk(key, transform, MaterialForLod(key.Lod), settings.voxelSize,
+                settings.chunkCells);
         }
 
         void DestroyChunkView(TerrainChunk chunk)
@@ -1609,11 +1679,71 @@ namespace reromanlee.Transvoxel
                 ScheduleBuild(entry.Key, entry.Value.TransitionMask);
         }
 
-        /// <summary>Re-applies the LOD debug tint to all live chunks.</summary>
+        /// <summary>
+        /// Re-applies the LOD debug tint to every chunk on screen (live and cross-fading).
+        /// Cheap: it only swaps which shared material each renderer points at, so toggling
+        /// the tint never rebuilds geometry.
+        /// </summary>
         public void RefreshLodTint()
         {
             foreach (var chunk in live.Values)
-                chunk.SetLodTintVisible(settings.colorizeLods);
+                chunk.SetMaterial(MaterialForLod(chunk.Key.Lod));
+            foreach (var entry in dying)
+                entry.View.SetMaterial(MaterialForLod(entry.View.Key.Lod));
+            // Released only after every renderer points somewhere else.
+            if (!settings.colorizeLods)
+                DestroyLodTintMaterials();
+        }
+
+        /// <summary>
+        /// The material a chunk at this LOD renders with: the plain runtime material, or —
+        /// while colorizeLods is on — a tinted copy of it, created on first use.
+        ///
+        /// A shared material per LOD rather than a MaterialPropertyBlock: a block excludes
+        /// its renderer from the SRP Batcher (so switching the debug view on would cost
+        /// frame rate), and batched paths such as URP's GPU Resident Drawer bypass
+        /// per-renderer state entirely, which is why the tint used to be invisible.
+        /// </summary>
+        Material MaterialForLod(int lod)
+        {
+            if (runtimeMaterial == null || !settings.colorizeLods)
+                return runtimeMaterial;
+
+            lodTintMaterials ??= new Material[LodTints.Length];
+            int index = Mathf.Clamp(lod, 0, LodTints.Length - 1);
+            Material variant = lodTintMaterials[index];
+            if (variant != null)
+                return variant;
+
+            variant = new Material(runtimeMaterial)
+            {
+                name = $"{runtimeMaterial.name} (LOD{index} tint)",
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+            Color tint = LodTints[index];
+            // The package shader multiplies _TransvoxelLodTint into the final albedo of
+            // every variant (including the palette ones, which never read _BaseColor).
+            // Other shaders get the tint through their own base colour instead.
+            if (variant.HasProperty(LodTintId))
+                variant.SetColor(LodTintId, tint);
+            else if (variant.HasProperty(BaseColorId))
+                variant.SetColor(BaseColorId, tint);
+            else if (variant.HasProperty(ColorId))
+                variant.SetColor(ColorId, tint);
+            lodTintMaterials[index] = variant;
+            return variant;
+        }
+
+        void DestroyLodTintMaterials()
+        {
+            if (lodTintMaterials == null)
+                return;
+            for (int i = 0; i < lodTintMaterials.Length; i++)
+            {
+                if (lodTintMaterials[i] != null)
+                    Destroy(lodTintMaterials[i]);
+                lodTintMaterials[i] = null;
+            }
         }
 
         /// <summary>
