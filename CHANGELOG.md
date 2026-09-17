@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes the surface. Each one was confirmed to fail against the defect it describes. Add
   `"testables": [ "com.reromanlee.transvoxel" ]` to a project's manifest to run them.
 - Tests in the Interactive Demo sample covering the panel's mouse-only input.
+- **Installation instructions** in the README (#7): Git URL (tracking `main` or pinned to a
+  release tag), release tarball, and a local clone for contributing — with the Git version
+  requirement, what is and is not auto-updated, and where a relative `file:` path resolves.
 
 ### Fixed
 
