@@ -1,5 +1,7 @@
 # Transvoxel
 
+<img src=".github/transvoxel-cover.jpg" alt="Preview of Transvoxel demo" width="100%">
+
 A clean, modular implementation of Eric Lengyel's **Transvoxel** algorithm — seamless
 level-of-detail (LOD) triangulation of a voxel density field — driven by an octree and
 built for large, editable, real-time landscapes.
@@ -14,6 +16,94 @@ built for large, editable, real-time landscapes.
     </td>
   </tr>
 </table>
+
+## Installation
+
+Unity **6000.0+**. URP is a dependency and the Package Manager pulls it in for you.
+
+### From a Git URL
+
+**Window ▸ Package Manager ▸ + ▸ Install package from git URL** and paste:
+
+```
+https://github.com/reromanlee/Transvoxel.git
+```
+
+or add it to `Packages/manifest.json` by hand:
+
+```json
+{
+  "dependencies": {
+    "com.reromanlee.transvoxel": "https://github.com/reromanlee/Transvoxel.git"
+  }
+}
+```
+
+That tracks `main`. For anything you intend to ship, pin a release tag instead. Tags are the
+bare version with **no `v` prefix** — pick one from the
+[releases page](https://github.com/reromanlee/Transvoxel/releases):
+
+```
+https://github.com/reromanlee/Transvoxel.git#2.0.0
+```
+
+Notes worth knowing:
+
+- Unity shells out to Git for this: it needs a Git client **2.14.0 or newer** on your `PATH`
+  (and Git LFS if you fork the repo and store assets with it). "No 'git' executable was
+  found" in the Package Manager means exactly that.
+- A Git-installed package is **read-only** — edit a local clone instead (below).
+- Nothing updates on its own. An unpinned URL gets an **Update** button in the Package
+  Manager that re-resolves to the latest commit on `main`; a pinned `#tag` stays put until
+  you change the tag, which is the point of pinning.
+
+### From a release tarball
+
+Every [release](https://github.com/reromanlee/Transvoxel/releases) attaches
+`com.reromanlee.transvoxel-<version>.tgz` (about 0.8 MB). No Git needed, and the version is
+frozen.
+
+1. Download the `.tgz` from the release.
+2. Put it **inside your project** — a `Packages/` folder next to `manifest.json` works well —
+   so the path stays valid for everyone who clones the repo.
+3. **Window ▸ Package Manager ▸ + ▸ Install package from tarball** and pick the file.
+
+Unity records a `file:` path to the archive, e.g.:
+
+```json
+{
+  "dependencies": {
+    "com.reromanlee.transvoxel": "file:com.reromanlee.transvoxel-2.0.0.tgz"
+  }
+}
+```
+
+A relative `file:` path resolves against the project's `Packages` folder, so the entry above
+finds a tarball sitting directly in `Packages/`. Keep the `.tgz` where it is — Unity reads it
+whenever it resolves packages, so moving or deleting the file breaks the project, and an
+absolute path outside the project works for you and for nobody else who opens it.
+
+### From a local clone (contributing)
+
+Point a `file:` path at a checkout and your edits are live — no reinstall between changes:
+
+```json
+{
+  "dependencies": {
+    "com.reromanlee.transvoxel": "file:../../Transvoxel"
+  }
+}
+```
+
+The path is relative to the project's `Packages` folder. Unity writes `.meta` files into the
+clone, which is what you want when you are working on the package.
+
+### After installing
+
+- The demo is a sample: **Window ▸ Package Manager ▸ Transvoxel ▸ Samples ▸ Import**. See
+  *Quick start* below.
+- To run the package's own tests, opt in from your project's `Packages/manifest.json`:
+  `"testables": [ "com.reromanlee.transvoxel" ]` (see *Tests*).
 
 ## Separation of concerns
 
