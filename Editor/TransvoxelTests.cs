@@ -962,6 +962,37 @@ namespace reromanlee.Transvoxel.Editor.Tests
             }
         }
 
+        /// <summary>
+        /// A PNG without an alpha channel imports as RGB24, which a Texture2DArray cannot be
+        /// sampled from on D3D11. Creating the array appears to succeed but leaves a broken
+        /// native object, so the next property access threw and took the whole terrain down
+        /// with it during OnEnable. The bake must notice and fall back instead.
+        /// </summary>
+        [Test]
+        public void PaletteBake_SurvivesFormatsThatCannotBeSampledAsArrays()
+        {
+            var palette = ScriptableObject.CreateInstance<TransvoxelMaterialPalette>();
+            var rgb24 = new Texture2D(16, 16, TextureFormat.RGB24, mipChain: true);
+            try
+            {
+                rgb24.SetPixel(0, 0, Color.red);
+                rgb24.Apply();
+                palette.Layers[0].albedo = rgb24;
+
+                Texture2DArray array = null;
+                Assert.DoesNotThrow(() => array = palette.GetAlbedoArray(),
+                    "baking an RGB24 source must not throw");
+                Assert.IsNotNull(array, "the bake produced no array at all");
+                Assert.AreEqual(1, array.depth);
+                Assert.IsNotNull(array.name, "the array object is broken");
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(palette);
+                UnityEngine.Object.DestroyImmediate(rgb24);
+            }
+        }
+
         // ------------------------------------------------------------------ chunk views
 
         static MeshBuffers OneTriangleBuffers(bool withMaterials)

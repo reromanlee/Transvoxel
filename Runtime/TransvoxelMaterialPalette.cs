@@ -335,6 +335,12 @@ namespace reromanlee.Transvoxel
             Texture2DArray array = CanCopyDirectly(sources)
                 ? BakeByCopy(sources)
                 : BakeByBlit(sources, linear);
+            if (array == null)
+            {
+                Debug.LogError($"[Transvoxel] Could not bake the '{name}' palette's {label} " +
+                               "texture array on this platform; those maps will not render.");
+                return null;
+            }
             array.name = $"{name} {label} Array";
             array.hideFlags = HideFlags.HideAndDontSave;
             array.wrapMode = TextureWrapMode.Repeat;
@@ -346,6 +352,15 @@ namespace reromanlee.Transvoxel
         static bool CanCopyDirectly(Texture2D[] sources)
         {
             Texture2D first = sources[0];
+
+            // Not every format a Texture2D can hold can be SAMPLED from a Texture2DArray.
+            // RGB24 (any PNG without an alpha channel, imported uncompressed) is the common
+            // one: creating the array succeeds but leaves a broken native object, and the
+            // first property access throws. The blit path stores plain RGBA32, which is
+            // supported everywhere, so fall through to it instead of crashing.
+            if (!SystemInfo.IsFormatSupported(first.graphicsFormat, GraphicsFormatUsage.Sample))
+                return false;
+
             foreach (Texture2D source in sources)
             {
                 // Crunched formats are CPU-side containers Graphics.CopyTexture cannot

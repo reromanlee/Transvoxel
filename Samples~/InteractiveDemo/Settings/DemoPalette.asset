@@ -1,0 +1,66 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 77f0b50b121c1ebe7d9789178f88653a, type: 3}
+  m_Name: DemoPalette
+  m_EditorClassIdentifier: reromanlee.Transvoxel::reromanlee.Transvoxel.TransvoxelMaterialPalette
+  heightBlend: 0.6
+  triplanar: 1
+  triplanarSharpness: 4
+  parallaxOcclusion: 1
+  parallaxMinSteps: 6
+  parallaxMaxSteps: 24
+  parallaxDistance: 60
+  layers:
+  - name: Grass
+    albedo: {fileID: 2800000, guid: 755731887e55a0844be55d9d649f1635, type: 3}
+    tint: {r: 1, g: 1, b: 1, a: 1}
+    smoothness: 0.08
+    normal: {fileID: 0}
+    normalStrength: 1
+    occlusion: {fileID: 0}
+    occlusionStrength: 1
+    height: {fileID: 2800000, guid: 31242e5b84ce83545af159a0877d40da, type: 3}
+    heightScale: 0.012
+    uvScaleMultiplier: 1.4
+  - name: Rock
+    albedo: {fileID: 2800000, guid: 52b195dbe3021ed48b54fc8a7bb15b7a, type: 3}
+    tint: {r: 1, g: 1, b: 1, a: 1}
+    smoothness: 0.04
+    normal: {fileID: 0}
+    normalStrength: 1
+    occlusion: {fileID: 0}
+    occlusionStrength: 1
+    height: {fileID: 2800000, guid: 49123461f2aa3e64d9f4cfbf8e4ee7e6, type: 3}
+    heightScale: 0.035
+    uvScaleMultiplier: 0.8
+  - name: Sand
+    albedo: {fileID: 2800000, guid: 0e623e813b903374ca831721cdf061cb, type: 3}
+    tint: {r: 1, g: 1, b: 1, a: 1}
+    smoothness: 0.14
+    normal: {fileID: 0}
+    normalStrength: 1
+    occlusion: {fileID: 0}
+    occlusionStrength: 1
+    height: {fileID: 2800000, guid: 2a53a3c25f3573b4e95b23132f2b2f90, type: 3}
+    heightScale: 0.02
+    uvScaleMultiplier: 1.2
+  - name: Snow
+    albedo: {fileID: 2800000, guid: 59c5ada9e3284174eb36b5676077d83a, type: 3}
+    tint: {r: 1, g: 1, b: 1, a: 1}
+    smoothness: 0.3
+    normal: {fileID: 0}
+    normalStrength: 1
+    occlusion: {fileID: 0}
+    occlusionStrength: 1
+    height: {fileID: 2800000, guid: b1a5da07c39a8764bb106722c697aea3, type: 3}
+    heightScale: 0.01
+    uvScaleMultiplier: 1.1
