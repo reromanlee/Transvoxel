@@ -466,7 +466,24 @@ against known structure sizes. They also guard the things that are easy to break
 that the bundled shader compiles, that it still exposes the LOD-tint and marker properties,
 that chunk meshes always carry the fade vertex channel, that the palette's texture-array
 bake survives formats a Texture2DArray cannot sample, and that cached transition-face sheets
-are reused rather than re-sampled. Requires the `com.unity.test-framework` package.
+are reused rather than re-sampled.
+
+**PlayMode tests** live in `Tests/Runtime/` and assert on *rendered pixels*, because this
+package's most expensive bugs were all invisible in code and obvious on screen: that LOD
+colorization actually changes the image with a palette assigned, that `chunkFadeInSeconds = 0`
+renders the same solid surface as fading enabled, that triplanar removes vertical streaking on
+a vertical face (measured as the collapse of vertical variation, not eyeballed), and that
+parallax visibly changes the surface. They skip themselves without a graphics device.
+
+Tests inside a package are only discovered when the consuming project opts in — add this to
+your project's `Packages/manifest.json`:
+
+```json
+"testables": [ "com.reromanlee.transvoxel" ]
+```
+
+The *Interactive Demo* sample carries its own tests too, which run once you import it.
+Requires the `com.unity.test-framework` package.
 
 ## Requirements
 

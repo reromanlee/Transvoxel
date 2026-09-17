@@ -1,0 +1,22 @@
+{
+    "name": "reromanlee.Transvoxel.Tests",
+    "rootNamespace": "reromanlee.Transvoxel.Tests",
+    "references": [
+        "reromanlee.Transvoxel",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

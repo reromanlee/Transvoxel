@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TransvoxelMaterialPalette.HasHeightMaps` and `ParallaxActive`.
 - Tests covering shader compilation, the LOD-tint and marker shader properties, the fade
   vertex channel, palette array baking against unsupported formats, and face-sheet reuse.
+- **PlayMode render tests** in `Tests/Runtime/`, asserting on rendered pixels: LOD colorization
+  changes the image with a palette assigned, fading disabled renders the same solid surface as
+  fading enabled, triplanar removes vertical streaking on a vertical face, and parallax visibly
+  changes the surface. Each one was confirmed to fail against the defect it describes. Add
+  `"testables": [ "com.reromanlee.transvoxel" ]` to a project's manifest to run them.
+- Tests in the Interactive Demo sample covering the panel's mouse-only input.
 
 ### Fixed
 
@@ -80,9 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WASD/arrows to Navigate and Space/Enter to Submit — so focus walked through the panel
   (the ScrollView scrolling to follow it, making the panel appear to move on its own),
   sliders under focus changed value, and toggles flipped. The panel now swallows navigation
-  events at its root and is mouse-driven; typing into the sliders' numeric fields still
-  works, and while a field has focus the camera and brush stand down so typing a value does
-  not also fly you forward.
+  events at its root AND makes nothing in it focusable, so navigation has nowhere to land:
+  no values change, no Foldout sections open and close, and no focus ring flickers across
+  the panel as you fly. It is mouse-only; the sliders' numeric fields are read-outs.
 
 ### Changed
 

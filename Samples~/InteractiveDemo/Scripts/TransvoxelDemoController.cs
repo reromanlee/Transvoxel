@@ -134,7 +134,7 @@ namespace reromanlee.Transvoxel.Samples
             body = root.Q<VisualElement>("body");
             collapse = root.Q<Button>("collapse");
 
-            SuppressKeyboardShortcuts(root);
+            MakeMouseOnly(root);
 
             if (collapse != null)
             {
@@ -149,15 +149,15 @@ namespace reromanlee.Transvoxel.Samples
             if (controlsText != null)
             {
                 controlsText.text =
-                    "Right mouse drag — look\n" +
-                    "W A S D — fly, Q / E — down / up, Shift — faster\n" +
-                    "Left mouse — dig, Shift + left mouse — build\n" +
-                    "Gamepad: sticks fly and look, triggers sculpt, bumpers pick material
-" +
-                    "
-The panel is mouse-driven on purpose: it ignores keyboard and gamepad " +
-                    "navigation so flying the camera cannot nudge its controls. Click a " +
-                    "slider's number to type an exact value.";
+                    "Right mouse drag - look\n" +
+                    "W A S D - fly, Q / E - down / up, Shift - faster\n" +
+                    "Left mouse - dig, Shift + left mouse - build\n" +
+                    "1-4 - pick the build material\n" +
+                    "Gamepad: sticks fly and look, triggers sculpt, bumpers pick material\n" +
+                    "\n" +
+                    "The panel is mouse-only on purpose: it ignores the keyboard and " +
+                    "gamepad entirely, so flying the camera cannot nudge its controls. " +
+                    "Drag the sliders to change values.";
             }
 
             TransvoxelSettings settings = Settings;
@@ -226,52 +226,63 @@ The panel is mouse-driven on purpose: it ignores keyboard and gamepad " +
         }
 
         /// <summary>
-        /// Stops the panel from reacting to the keyboard and gamepad on its own.
+        /// Makes the panel respond to the mouse and nothing else.
         ///
         /// A runtime UI Toolkit panel has built-in NAVIGATION: the Input System's default UI
         /// map binds WASD and the arrow keys to Navigate and Space/Enter to Submit. While you
         /// are flying the camera that silently walks focus through the panel (the ScrollView
         /// scrolling to follow, so the panel appears to move on its own), changes whichever
-        /// Slider happens to hold focus, and flips Toggles on Submit.
+        /// Slider holds focus, and opens and closes Foldouts.
         ///
-        /// Swallowing the navigation events at the root — before they ever reach a control —
-        /// leaves the panel mouse-driven, while typing into the sliders' numeric fields still
-        /// works because text entry arrives as KeyDownEvent on a focused text field, which is
-        /// explicitly let through.
+        /// Two layers, because either alone leaves a gap:
+        ///
+        ///  1. Nothing in the panel is focusable. Navigation only travels between focusable
+        ///     elements, so with none there is nowhere for it to go — no value changes, and
+        ///     no focus ring flickering across the panel as you fly, which is the visible
+        ///     half of the problem. Pointer events need no focus, so the mouse is unaffected.
+        ///  2. Navigation and key events are swallowed at the root regardless, which covers
+        ///     any control that reacts to a keystroke aimed straight at it.
+        ///
+        /// The sliders' numeric fields become read-outs: with no keyboard focus there is
+        /// nothing to type into them. Drag the slider instead.
+        ///
+        /// Static and standalone so it can be applied to any panel — and tested without a
+        /// scene. Call it again after adding controls at runtime (see RefreshMaterialPicker).
         /// </summary>
-        void SuppressKeyboardShortcuts(VisualElement root)
+        public static void MakeMouseOnly(VisualElement root)
         {
+            if (root == null)
+                return;
+
+            DenyFocus(root);
+
             root.RegisterCallback<NavigationMoveEvent>(Swallow, TrickleDown.TrickleDown);
             root.RegisterCallback<NavigationSubmitEvent>(Swallow, TrickleDown.TrickleDown);
             root.RegisterCallback<NavigationCancelEvent>(Swallow, TrickleDown.TrickleDown);
+            root.RegisterCallback<KeyDownEvent>(Swallow, TrickleDown.TrickleDown);
+            root.RegisterCallback<KeyUpEvent>(Swallow, TrickleDown.TrickleDown);
+        }
 
-            // Belt and braces for any control that reads raw keys rather than navigation.
-            root.RegisterCallback<KeyDownEvent>(e =>
-            {
-                if (IsTypingInUI())
-                    return;
-                Swallow(e);
-            }, TrickleDown.TrickleDown);
+        /// <summary>
+        /// Clears focusability across the whole visual hierarchy, internals included — a
+        /// Slider's dragger and a Foldout's toggle are children Unity creates itself, and
+        /// they are exactly what navigation would otherwise land on.
+        /// </summary>
+        static void DenyFocus(VisualElement element)
+        {
+            element.focusable = false;
+            if (element is TextField field)
+                field.isReadOnly = true; // a read-out now; do not imply otherwise
+
+            int count = element.hierarchy.childCount;
+            for (int i = 0; i < count; i++)
+                DenyFocus(element.hierarchy[i]);
         }
 
         static void Swallow(EventBase e)
         {
             e.StopImmediatePropagation();
             e.PreventDefault();
-        }
-
-        /// <summary>
-        /// True while a text field inside the panel holds keyboard focus — the one case where
-        /// keystrokes belong to the UI, so the camera and the brush must keep their hands off
-        /// them or typing "120" into a field would also fly you forward.
-        /// </summary>
-        public bool IsTypingInUI()
-        {
-            VisualElement root = document != null ? document.rootVisualElement : null;
-            var focused = root?.panel?.focusController?.focusedElement as VisualElement;
-            if (focused == null)
-                return false;
-            return focused is TextField || focused.GetFirstAncestorOfType<TextField>() != null;
         }
 
         /// <summary>Wires one widget to an initial value and a setter, ignoring echo changes.</summary>
@@ -330,6 +341,9 @@ The panel is mouse-driven on purpose: it ignores keyboard and gamepad " +
             buildMaterial = Mathf.Clamp(buildMaterial, 0, names.Length - 1);
             materialPicker.SetValueWithoutNotify(buildMaterial);
             materialPicker.RegisterValueChangedCallback(e => buildMaterial = e.newValue);
+            // Setting choices creates the radio buttons, so they missed the pass in BuildUI
+            // and would still be focusable — the one gap navigation could otherwise use.
+            DenyFocus(materialPicker);
         }
 
         void RefreshParallaxNote()
@@ -358,16 +372,8 @@ The panel is mouse-driven on purpose: it ignores keyboard and gamepad " +
         {
             fps = Mathf.Lerp(fps, 1f / Mathf.Max(Time.unscaledDeltaTime, 1e-5f), 0.05f);
 
-            // Typing a value into one of the numeric fields must not also fly the camera or
-            // cycle the build material.
-            bool typing = IsTypingInUI();
-            if (flyCamera != null)
-                flyCamera.InputSuppressed = typing;
-            if (!typing)
-            {
-                HandleMaterialCycling();
-                HandleSculpting();
-            }
+            HandleMaterialCycling();
+            HandleSculpting();
             RefreshStats();
         }
 
