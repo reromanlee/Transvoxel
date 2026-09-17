@@ -150,7 +150,21 @@ namespace reromanlee.Transvoxel.Meshing
                 {
                     if ((mask & (1 << f)) == 0)
                         continue;
-                    view.FaceSheets[f] = FaceSheets[f] ?? SampleFaceSheet(source, view, (CubeFace)f);
+                    float[] sheet = FaceSheets[f];
+                    if (sheet == null)
+                    {
+                        sheet = SampleFaceSheet(source, view, (CubeFace)f);
+                        // Publish it back into the grid we are a view of, so the next build
+                        // of this chunk at any mask reuses it instead of re-sampling a
+                        // (2·cells+1)² sheet — which, for a chunk with several transition
+                        // faces, costs about as much as the whole main grid.
+                        //
+                        // Safe without a lock: a sheet is immutable once computed and is a
+                        // pure function of (key, face), so two workers racing here produce
+                        // identical arrays and the reference store picks one of them.
+                        FaceSheets[f] = sheet;
+                    }
+                    view.FaceSheets[f] = sheet;
                 }
             }
 

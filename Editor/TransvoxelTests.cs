@@ -43,6 +43,21 @@ namespace reromanlee.Transvoxel.Editor.Tests
             public float SampleVoxel(int x, int y, int z) => Mathf.Clamp01(0.5f - y / 8f);
         }
 
+        /// <summary>Counts how many voxels a consumer actually asks for.</summary>
+        sealed class CountingDensity : IDensitySource
+        {
+            readonly IDensitySource inner;
+            public int Samples;
+
+            public CountingDensity(IDensitySource source) => inner = source;
+
+            public float SampleVoxel(int x, int y, int z)
+            {
+                Samples++;
+                return inner.SampleVoxel(x, y, z);
+            }
+        }
+
         // ------------------------------------------------------------------ mesh collection
 
         /// <summary>
@@ -1003,6 +1018,84 @@ namespace reromanlee.Transvoxel.Editor.Tests
                 MeshBuffers.Return(buffers);
                 UnityEngine.Object.DestroyImmediate(root);
             }
+        }
+
+        /// <summary>
+        /// A cached grid holds the main volume, but the per-face transition sheets are
+        /// sampled lazily per mask. They must be published back into the cached grid, or a
+        /// chunk with transition faces re-samples a (2·cells+1)² sheet per face on every
+        /// single rebuild — comparable to re-sampling the whole chunk.
+        /// </summary>
+        [Test]
+        public void SampleCache_ReusesFaceSheetsAcrossBuilds()
+        {
+            const int cells = 16;
+            const float iso = 0.5f;
+            var counting = new CountingDensity(new SphereDensity
+            {
+                Center = new Vector3(16, 16, 16),
+                Radius = 10f,
+            });
+            var cache = new SampleCache(64);
+            var key = new NodeKey(1, Vector3Int.zero);
+            byte mask = (byte)CubeFace.PosX.Bit();
+
+            cache.GetOrSample(counting, key, cells, iso, 0); // warm the main grid
+            counting.Samples = 0;
+
+            cache.GetOrSample(counting, key, cells, iso, mask);
+            int firstSheet = counting.Samples;
+            Assert.Greater(firstSheet, 0, "the +X face sheet was never sampled");
+
+            counting.Samples = 0;
+            ChunkSamples again = cache.GetOrSample(counting, key, cells, iso, mask);
+            Assert.AreEqual(0, counting.Samples,
+                "the face sheet was re-sampled instead of being reused from the cached grid");
+            Assert.IsNotNull(again.FaceSheets[(int)CubeFace.PosX], "the reused view lost its sheet");
+            Assert.AreEqual(mask, again.TransitionMask, "the view must carry the requested mask");
+        }
+
+        /// <summary>
+        /// The brush must not pin voxels into the sparse edit layer for changes that do
+        /// nothing — digging air that is already empty is the common case, and each stored
+        /// brick costs 16 KB forever.
+        /// </summary>
+        [Test]
+        public void SphereBrush_DoesNotStoreNoOpWrites()
+        {
+            var layers = new LayeredDensitySource(new FlatGround(), new VoxelEditLayer());
+
+            // Well above the ground plane, where FlatGround is already 0: digging cannot
+            // lower it, so nothing should be recorded.
+            layers.ApplySphereBrush(new Vector3(0f, 200f, 0f), 6f, 0.9f, build: false);
+            Assert.AreEqual(0, layers.Edits.BrickCount,
+                "digging empty air allocated edit bricks for writes that changed nothing");
+
+            // A stroke that does change the field still records normally.
+            layers.ApplySphereBrush(new Vector3(0f, 0f, 0f), 6f, 0.9f, build: false);
+            Assert.Greater(layers.Edits.BrickCount, 0, "a real dig recorded nothing");
+        }
+
+        /// <summary>
+        /// Build strokes repaint ground that is already fully solid, so the material stamp
+        /// must not be skipped along with the no-op density write.
+        /// </summary>
+        [Test]
+        public void SphereBrush_RepaintsAlreadySolidGround()
+        {
+            var materials = new VoxelMaterialLayer();
+            var solid = new LayeredDensitySource(new AlwaysSolid(), new VoxelEditLayer());
+
+            solid.ApplySphereBrush(Vector3.zero, 4f, 0.9f, build: true, isoLevel: 0.5f,
+                materials: materials, materialId: 3);
+
+            Assert.AreEqual(3, materials.SampleMaterial(0, 0, 0),
+                "solid ground inside a build brush was not repainted");
+        }
+
+        sealed class AlwaysSolid : IDensitySource
+        {
+            public float SampleVoxel(int x, int y, int z) => 1f;
         }
 
         /// <summary>
