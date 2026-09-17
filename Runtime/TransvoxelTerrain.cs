@@ -200,6 +200,8 @@ namespace reromanlee.Transvoxel
         // shader cost.
         const string PaletteKeyword = "TRANSVOXEL_PALETTE";
         const string PaletteMapsKeyword = "TRANSVOXEL_PALETTE_MAPS";
+        const string TriplanarKeyword = "TRANSVOXEL_TRIPLANAR";
+        const string ParallaxKeyword = "TRANSVOXEL_PARALLAX";
         static readonly int PaletteAwareMarkerId = Shader.PropertyToID("_TransvoxelPaletteAware");
         static readonly int AlbedoArrayId = Shader.PropertyToID("_TransvoxelAlbedoArray");
         static readonly int NormalArrayId = Shader.PropertyToID("_TransvoxelNormalArray");
@@ -210,6 +212,13 @@ namespace reromanlee.Transvoxel
         static readonly int LayerScalesId = Shader.PropertyToID("_TransvoxelLayerScales");
         static readonly int BlendSharpnessId = Shader.PropertyToID("_TransvoxelBlendSharpness");
         static readonly int PaletteLayerCountId = Shader.PropertyToID("_TransvoxelPaletteLayerCount");
+        static readonly int UvScaleId = Shader.PropertyToID("_TransvoxelUvScale");
+        static readonly int TriplanarEnabledId = Shader.PropertyToID("_TransvoxelTriplanarEnabled");
+        static readonly int TriplanarSharpnessId = Shader.PropertyToID("_TransvoxelTriplanarSharpness");
+        static readonly int ParallaxEnabledId = Shader.PropertyToID("_TransvoxelParallaxEnabled");
+        static readonly int ParallaxMinStepsId = Shader.PropertyToID("_TransvoxelParallaxMinSteps");
+        static readonly int ParallaxMaxStepsId = Shader.PropertyToID("_TransvoxelParallaxMaxSteps");
+        static readonly int ParallaxDistanceId = Shader.PropertyToID("_TransvoxelParallaxDistance");
 
         // Uniform arrays must always be uploaded at the full declared size: Unity fixes a
         // shader array's length the first time it is set. Main thread only.
@@ -230,6 +239,7 @@ namespace reromanlee.Transvoxel
         // note that one palette and one fade configuration drive the whole scene.
         static int paletteKeywordUsers;
         static bool warnedAboutMultipleTerrains;
+        static TransvoxelMaterialPalette boundPalette;
         bool holdsPaletteKeywords;
 
         // Lazily built per-LOD copies of the runtime material, used only while
@@ -472,6 +482,14 @@ namespace reromanlee.Transvoxel
         /// only switched off once no terrain needs them — otherwise disabling one terrain
         /// would strip voxel materials from every other terrain still rendering.
         /// </summary>
+        static void SetKeyword(string keyword, bool enabled)
+        {
+            if (enabled)
+                Shader.EnableKeyword(keyword);
+            else
+                Shader.DisableKeyword(keyword);
+        }
+
         void SetPaletteKeywordsHeld(bool held)
         {
             if (held == holdsPaletteKeywords)
@@ -482,16 +500,13 @@ namespace reromanlee.Transvoxel
             {
                 Shader.DisableKeyword(PaletteKeyword);
                 Shader.DisableKeyword(PaletteMapsKeyword);
+                Shader.DisableKeyword(TriplanarKeyword);
+                Shader.DisableKeyword(ParallaxKeyword);
+                Shader.SetGlobalFloat(TriplanarEnabledId, 0f);
+                Shader.SetGlobalFloat(ParallaxEnabledId, 0f);
+                boundPalette = null;
             }
-            else if (paletteKeywordUsers > 1 && !warnedAboutMultipleTerrains)
-            {
-                warnedAboutMultipleTerrains = true;
-                Debug.LogWarning("[Transvoxel] More than one TransvoxelTerrain with a material " +
-                                 "palette is active. The palette, fade and blend inputs are GLOBAL " +
-                                 "shader state, so every terrain renders with whichever palette was " +
-                                 "bound last. One terrain per scene is the supported setup — see the " +
-                                 "README's Voxel materials section.", this);
-            }
+
         }
 
         void OnPaletteChanged() => paletteDirty = true;
@@ -508,6 +523,31 @@ namespace reromanlee.Transvoxel
             Shader.EnableKeyword(detailMaps ? PaletteMapsKeyword : PaletteKeyword);
             Shader.DisableKeyword(detailMaps ? PaletteKeyword : PaletteMapsKeyword);
 
+            // Triplanar and parallax are opt-in per palette, and parallax additionally needs
+            // something to march: a palette with the box ticked but no height map anywhere
+            // stays on the cheaper variant instead of paying for a ray march through a
+            // constant field. Both re-evaluate on every push, so ticking a box (or dropping
+            // the first height map in) upgrades the variant live — no chunk is rebuilt, the
+            // mesh data is identical either way.
+            bool triplanar = palette.triplanar;
+            bool parallax = detailMaps && palette.ParallaxActive;
+            SetKeyword(TriplanarKeyword, triplanar);
+            SetKeyword(ParallaxKeyword, parallax);
+
+            // The same switches as dynamic globals, for Shader Graphs — they have no keyword
+            // machinery and branch on these instead.
+            Shader.SetGlobalFloat(TriplanarEnabledId, triplanar ? 1f : 0f);
+            Shader.SetGlobalFloat(ParallaxEnabledId, parallax ? 1f : 0f);
+            Shader.SetGlobalFloat(TriplanarSharpnessId, palette.triplanarSharpness);
+            Shader.SetGlobalFloat(ParallaxMinStepsId, Mathf.Min(palette.parallaxMinSteps,
+                palette.parallaxMaxSteps));
+            Shader.SetGlobalFloat(ParallaxMaxStepsId, Mathf.Max(palette.parallaxMinSteps,
+                palette.parallaxMaxSteps));
+            Shader.SetGlobalFloat(ParallaxDistanceId, palette.parallaxDistance);
+            // Triplanar derives its own UVs from world position, so it needs the scale the
+            // mesher baked into UV0 to match the planar mapping's density.
+            Shader.SetGlobalFloat(UvScaleId, settings.uvScale);
+
             // Every array is bound whenever a palette is active — the keyword only decides
             // which of them the BUNDLED shader samples. Custom shaders and Shader Graphs
             // using TransvoxelPalette.hlsl sample unconditionally (they have no keyword
@@ -522,6 +562,23 @@ namespace reromanlee.Transvoxel
             Shader.SetGlobalVectorArray(LayerColorsId, LayerColorScratch);
             Shader.SetGlobalVectorArray(LayerScalesId, LayerScaleScratch);
             Shader.SetGlobalFloat(PaletteLayerCountId, palette.LayerCount);
+
+            // Two terrains sharing the scene is only a problem when they want DIFFERENT
+            // palettes: the bindings are global, so the second one to push wins and both
+            // render with it. Counting active terrains would also fire while one is being
+            // torn down and replaced, which is harmless and common.
+            if (boundPalette != null && !ReferenceEquals(boundPalette, palette)
+                && !warnedAboutMultipleTerrains)
+            {
+                warnedAboutMultipleTerrains = true;
+                Debug.LogWarning("[Transvoxel] Two TransvoxelTerrains are active with different " +
+                                 $"material palettes ('{boundPalette.name}' and '{palette.name}'). " +
+                                 "The palette, fade and blend inputs are GLOBAL shader state, so " +
+                                 "both terrains render with whichever was bound last. One palette " +
+                                 "per scene is the supported setup — see the README's Voxel " +
+                                 "materials section.", this);
+            }
+            boundPalette = palette;
         }
 
         void StartCpuWorkers()

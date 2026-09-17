@@ -190,6 +190,352 @@ float3 TransvoxelPerturbNormal(float3 normalWS, half3 normalTS, float3 positionW
                    + normalTS.z * normalWS);
 }
 
+// ------------------------------------------------------- triplanar & parallax occlusion
+//
+// Two opt-in upgrades driven by the palette asset. Both are OFF unless the palette turns
+// them on, and the bundled shader compiles them out entirely via keywords; a Shader Graph
+// has no keywords, so it branches on the *Enabled globals instead (same inputs either way).
+//
+//   * TRIPLANAR fixes this package's oldest texturing limitation. UV0 is a world-space XZ
+//     planar map, so anything approaching vertical — cliffs, overhangs, cave walls, the
+//     very features a voxel engine exists for — shows smeared vertical streaks. Triplanar
+//     samples each layer on all three world planes and blends by the surface normal, so
+//     every orientation gets an undistorted mapping. Costs 3x the texture fetches.
+//
+//   * PARALLAX OCCLUSION MAPPING gives the height maps real depth. Per pixel the view ray
+//     is marched through the blended heightfield and the UV is displaced to where the ray
+//     actually meets the surface, so bricks, cobbles and rock strata read as volume rather
+//     than as a flat picture of volume — with self-occlusion, and without adding a single
+//     triangle to meshes the GPU is already busy generating.
+//
+// EVERY texture read here uses explicit gradients. The ray march is a dynamic loop, so
+// neighbouring pixels can exit on different iterations; implicit derivatives taken inside
+// it are meaningless and pick wildly wrong mip levels, which shows up as smearing and
+// streaking exactly where the effect is strongest. Derivatives are therefore taken ONCE,
+// up front, from the undisplaced surface, and threaded through every sample — including
+// the final surface reads at the displaced UV, whose own derivatives are discontinuous.
+//
+// Relationship to the height blending above: both read the same height array and they
+// compose. Height *steering* decides WHICH material wins a boundary; parallax decides
+// where the surface of the winner appears. Neither displaces geometry — silhouettes and
+// shadows still follow the mesh, which is the standard limitation of the technique.
+
+float _TransvoxelUvScale;              // terrain uvScale: UV0 = terrain-local XZ metres * this
+float _TransvoxelTriplanarEnabled;     // 0/1, for shaders without keywords (graphs)
+float _TransvoxelTriplanarSharpness;   // higher = narrower blend band between planes
+float _TransvoxelParallaxEnabled;      // 0/1, as above
+float _TransvoxelParallaxMinSteps;     // steps used head-on
+float _TransvoxelParallaxMaxSteps;     // steps used at grazing angles
+float _TransvoxelParallaxDistance;     // metres; the effect fades out to nothing by here
+
+// One plane's UV and its screen-space derivatives, captured before any displacement.
+struct TransvoxelPlaneUV
+{
+    float2 uv;
+    float2 dx;
+    float2 dy;
+};
+
+// The three world-plane projections of a point, plus how much each one counts.
+struct TransvoxelPlanes
+{
+    TransvoxelPlaneUV x;   // looking along world X: (z, y)
+    TransvoxelPlaneUV y;   // looking along world Y: (x, z) — matches UV0 on flat ground
+    TransvoxelPlaneUV z;   // looking along world Z: (x, y)
+    float3 blend;          // normal-driven weights, sum 1
+    int dominant;          // 0/1/2: the plane facing the surface most directly
+};
+
+// UVs are a pure function of world position (never mirrored by the normal's sign), which
+// is what keeps them continuous across chunk borders and LOD seams. `uv` is UV0, used as
+// the world-Y plane when triplanar is off so that path stays bit-identical to the mapping
+// the mesher baked in. Both derivative sets are taken unconditionally: in a Shader Graph
+// the triplanar switch is a runtime branch, and ddx/ddy inside divergent control flow is
+// undefined.
+TransvoxelPlanes TransvoxelBuildPlanes(float2 uv, float3 positionWS, float3 normalWS,
+    bool triplanar)
+{
+    float3 p = positionWS * _TransvoxelUvScale;
+    float3 dpx = ddx(p);
+    float3 dpy = ddy(p);
+    float2 uvDx = ddx(uv);
+    float2 uvDy = ddy(uv);
+
+    TransvoxelPlanes planes;
+    planes.x.uv = p.zy;  planes.x.dx = dpx.zy;  planes.x.dy = dpy.zy;
+    planes.y.uv = p.xz;  planes.y.dx = dpx.xz;  planes.y.dy = dpy.xz;
+    planes.z.uv = p.xy;  planes.z.dx = dpx.xy;  planes.z.dy = dpy.xy;
+
+    if (!triplanar)
+    {
+        planes.y.uv = uv;
+        planes.y.dx = uvDx;
+        planes.y.dy = uvDy;
+        planes.blend = float3(0.0, 1.0, 0.0);
+        planes.dominant = 1;
+        return planes;
+    }
+
+    float3 a = abs(normalWS);
+    float3 w = pow(max(a, 1e-4), max(_TransvoxelTriplanarSharpness, 1.0));
+    planes.blend = w / max(w.x + w.y + w.z, 1e-5);
+    planes.dominant = (a.x > a.y && a.x > a.z) ? 0 : (a.z > a.y ? 2 : 1);
+    return planes;
+}
+
+TransvoxelPlaneUV TransvoxelGetPlane(TransvoxelPlanes planes, int plane)
+{
+    // if/else rather than ?: — HLSL will not select between struct values with a ternary.
+    if (plane == 0)
+        return planes.x;
+    if (plane == 1)
+        return planes.y;
+    return planes.z;
+}
+
+// View direction expressed in the tangent frame of one axis-aligned plane, matching the UV
+// conventions above: X -> (T,B,N) = (+Z,+Y,+X), Y -> (+X,+Z,+Y), Z -> (+X,+Y,+Z). The N
+// component keeps its sign, so a downward-facing surface marches the ray the other way and
+// the parallax still leans correctly.
+float3 TransvoxelViewTangent(int plane, float3 viewDirWS)
+{
+    if (plane == 0) return float3(viewDirWS.z, viewDirWS.y, viewDirWS.x);
+    if (plane == 1) return float3(viewDirWS.x, viewDirWS.z, viewDirWS.y);
+    return float3(viewDirWS.x, viewDirWS.y, viewDirWS.z);
+}
+
+// ---- gradient-explicit layer reads -------------------------------------------------
+
+half3 TransvoxelAlbedoAt(TransvoxelPlaneUV plane, int id)
+{
+    float s = _TransvoxelLayerScales[id].x;
+    return SAMPLE_TEXTURE2D_ARRAY_GRAD(_TransvoxelAlbedoArray, sampler_TransvoxelAlbedoArray,
+        plane.uv * s, id, plane.dx * s, plane.dy * s).rgb;
+}
+
+half TransvoxelOcclusionAt(TransvoxelPlaneUV plane, int id)
+{
+    float s = _TransvoxelLayerScales[id].x;
+    return SAMPLE_TEXTURE2D_ARRAY_GRAD(_TransvoxelOcclusionArray, sampler_TransvoxelAlbedoArray,
+        plane.uv * s, id, plane.dx * s, plane.dy * s).r;
+}
+
+half3 TransvoxelNormalAt(TransvoxelPlaneUV plane, int id)
+{
+    float4 scales = _TransvoxelLayerScales[id];
+    float s = scales.x;
+    return UnpackNormalScale(SAMPLE_TEXTURE2D_ARRAY_GRAD(_TransvoxelNormalArray,
+        sampler_TransvoxelAlbedoArray, plane.uv * s, id, plane.dx * s, plane.dy * s), scales.y);
+}
+
+float TransvoxelHeightAt(TransvoxelPlaneUV plane, int id)
+{
+    float s = _TransvoxelLayerScales[id].x;
+    return SAMPLE_TEXTURE2D_ARRAY_GRAD(_TransvoxelHeightArray, sampler_TransvoxelAlbedoArray,
+        plane.uv * s, id, plane.dx * s, plane.dy * s).r;
+}
+
+// Height of the triangle's three palette layers, blended with the material weights. This is
+// what the ray march evaluates per step, so it stays deliberately cheap — and gradient
+// explicit, because it runs inside a divergent loop.
+float TransvoxelBlendedHeight(TransvoxelPlaneUV plane, int3 ids, float3 w)
+{
+    return w.x * TransvoxelHeightAt(plane, ids.x)
+         + w.y * TransvoxelHeightAt(plane, ids.y)
+         + w.z * TransvoxelHeightAt(plane, ids.z);
+}
+
+// Blended parallax amplitude of the triangle's layers (per-layer, so rock can be deeper
+// than sand), faded out with distance so far chunks never pay for a ray march.
+float TransvoxelParallaxAmplitude(int3 ids, float3 w, float3 positionWS)
+{
+    float amplitude = w.x * _TransvoxelLayerScales[ids.x].w
+                    + w.y * _TransvoxelLayerScales[ids.y].w
+                    + w.z * _TransvoxelLayerScales[ids.z].w;
+    if (_TransvoxelParallaxDistance > 0.0)
+    {
+        float d = distance(positionWS, _WorldSpaceCameraPos.xyz);
+        amplitude *= saturate(1.0 - d / _TransvoxelParallaxDistance);
+    }
+    return amplitude;
+}
+
+// Marches the blended heightfield along the view ray and returns the displaced plane UV
+// (derivatives preserved from the undisplaced surface). Step count adapts to the viewing
+// angle: head-on needs few steps, grazing needs many because the ray travels further.
+TransvoxelPlaneUV TransvoxelParallaxMarch(TransvoxelPlaneUV plane, float3 viewTS,
+    int3 ids, float3 w, float amplitude)
+{
+    // Near-grazing rays would need an unbounded number of steps and swim badly; the effect
+    // is imperceptible there anyway.
+    if (amplitude <= 1e-5 || abs(viewTS.z) < 0.15)
+        return plane;
+
+    float steps = lerp(_TransvoxelParallaxMaxSteps, _TransvoxelParallaxMinSteps, abs(viewTS.z));
+    steps = clamp(steps, 2.0, 128.0);
+    float layerDepth = 1.0 / steps;
+    float2 deltaUV = (viewTS.xy / viewTS.z) * amplitude * layerDepth;
+
+    TransvoxelPlaneUV current = plane;
+    float currentDepth = 0.0;
+    float height = TransvoxelBlendedHeight(current, ids, w);
+    float prevHeight = height;
+    float prevDepth = 0.0;
+
+    [loop]
+    for (int i = 0; i < (int)steps; i++)
+    {
+        if (currentDepth >= 1.0 - height)
+            break;
+        prevHeight = height;
+        prevDepth = currentDepth;
+        current.uv -= deltaUV;
+        currentDepth += layerDepth;
+        height = TransvoxelBlendedHeight(current, ids, w);
+    }
+
+    // Linear refinement between the last step outside the surface and the first inside it,
+    // which removes the stair-stepping a fixed step count would otherwise show.
+    float after = (1.0 - height) - currentDepth;      // <= 0
+    float before = (1.0 - prevHeight) - prevDepth;    // >= 0
+    float weight = saturate(after / min(after - before, -1e-6));
+    current.uv = lerp(current.uv, current.uv + deltaUV, weight);
+    return current;
+}
+
+// Surface of the projected paths, with the normal already resolved to world space: the
+// triplanar blend produces one directly, and the planar path rebuilds a tangent frame from
+// screen-space derivatives (terrain meshes carry no tangents).
+struct TransvoxelProjectedSurface
+{
+    half3 albedo;
+    half3 normalWS;
+    half occlusion;
+    half smoothness;
+};
+
+// The full surface blend with triplanar projection and/or parallax applied. `triplanar`
+// and `parallax` are compile-time constants in the bundled shader (keywords) and dynamic
+// globals in a Shader Graph.
+TransvoxelProjectedSurface TransvoxelPaletteBlendProjected(float2 uv, float3 positionWS,
+    float3 normalWS, float3 idsRaw, float2 w01, bool triplanar, bool parallax)
+{
+    int3 ids;
+    float3 w;
+    TransvoxelPaletteSetup(idsRaw, w01, ids, w);
+
+    TransvoxelPlanes planes = TransvoxelBuildPlanes(uv, positionWS, normalWS, triplanar);
+    int plane = planes.dominant;
+
+    if (parallax)
+    {
+        float amplitude = TransvoxelParallaxAmplitude(ids, w, positionWS);
+        float3 viewDirWS = normalize(_WorldSpaceCameraPos.xyz - positionWS);
+        float3 viewTS = TransvoxelViewTangent(plane, viewDirWS);
+        TransvoxelPlaneUV marched = TransvoxelParallaxMarch(TransvoxelGetPlane(planes, plane),
+                                                            viewTS, ids, w, amplitude);
+
+        // Only the dominant plane is marched: at any sensible triplanar sharpness it owns
+        // almost all of the blend wherever parallax is actually visible, and marching three
+        // heightfields would triple the cost of the most expensive part of the shader.
+        if (plane == 0) planes.x = marched;
+        else if (plane == 1) planes.y = marched;
+        else planes.z = marched;
+    }
+
+    // Height-steered material weights, evaluated at the (possibly displaced) UV so the
+    // material boundary follows the parallax rather than sliding against it.
+    TransvoxelPlaneUV steer = TransvoxelGetPlane(planes, plane);
+    float3 heights = float3(TransvoxelHeightAt(steer, ids.x),
+                            TransvoxelHeightAt(steer, ids.y),
+                            TransvoxelHeightAt(steer, ids.z));
+    w *= exp2(heights * (_TransvoxelHeightBlend * 8.0));
+    w /= max(w.x + w.y + w.z, 1e-5);
+
+    TransvoxelProjectedSurface result;
+    result.albedo = 0;
+    result.occlusion = 0;
+    result.smoothness = 0;
+    half3 normalAccum = 0;
+
+    int3 idArray = ids;
+    float3 wArray = w;
+    [unroll]
+    for (int k = 0; k < 3; k++)
+    {
+        int id = k == 0 ? idArray.x : (k == 1 ? idArray.y : idArray.z);
+        float weight = k == 0 ? wArray.x : (k == 1 ? wArray.y : wArray.z);
+        float4 layerColor = _TransvoxelLayerColors[id];
+        float occlusionStrength = _TransvoxelLayerScales[id].z;
+
+        half3 albedo;
+        half occlusion;
+        half3 normal;
+        if (triplanar)
+        {
+            albedo = TransvoxelAlbedoAt(planes.x, id) * planes.blend.x
+                   + TransvoxelAlbedoAt(planes.y, id) * planes.blend.y
+                   + TransvoxelAlbedoAt(planes.z, id) * planes.blend.z;
+            occlusion = TransvoxelOcclusionAt(planes.x, id) * planes.blend.x
+                      + TransvoxelOcclusionAt(planes.y, id) * planes.blend.y
+                      + TransvoxelOcclusionAt(planes.z, id) * planes.blend.z;
+
+            // Whiteout blend: fold the geometric normal into each plane's tangent-space
+            // normal, then swizzle each one onto its world axes. The result is a WORLD
+            // normal, so triplanar needs no tangent frame at all — which suits meshes that
+            // carry none.
+            half3 tx = TransvoxelNormalAt(planes.x, id);
+            half3 ty = TransvoxelNormalAt(planes.y, id);
+            half3 tz = TransvoxelNormalAt(planes.z, id);
+            tx = half3(tx.xy + normalWS.zy, abs(tx.z) * normalWS.x);
+            ty = half3(ty.xy + normalWS.xz, abs(ty.z) * normalWS.y);
+            tz = half3(tz.xy + normalWS.xy, abs(tz.z) * normalWS.z);
+            normal = tx.zyx * planes.blend.x + ty.xzy * planes.blend.y + tz.xyz * planes.blend.z;
+        }
+        else
+        {
+            albedo = TransvoxelAlbedoAt(planes.y, id);
+            occlusion = TransvoxelOcclusionAt(planes.y, id);
+            normal = TransvoxelNormalAt(planes.y, id); // tangent space, resolved below
+        }
+
+        result.albedo += weight * albedo * layerColor.rgb;
+        result.occlusion += weight * (1.0 + occlusionStrength * (occlusion - 1.0));
+        result.smoothness += weight * layerColor.a;
+        normalAccum += weight * normal;
+    }
+
+    result.normalWS = triplanar
+        ? normalize(normalAccum)
+        : TransvoxelPerturbNormal(normalWS, normalAccum, positionWS, planes.y.uv);
+    return result;
+}
+
+// Albedo-only triplanar blend, for palettes without detail maps. Parallax needs a
+// heightfield, so it never applies on this path.
+half4 TransvoxelPaletteBlendTriplanar(float2 uv, float3 positionWS, float3 normalWS,
+    float3 idsRaw, float2 w01)
+{
+    int3 ids;
+    float3 w;
+    TransvoxelPaletteSetup(idsRaw, w01, ids, w);
+    TransvoxelPlanes planes = TransvoxelBuildPlanes(uv, positionWS, normalWS, true);
+
+    half4 result = 0;
+    [unroll]
+    for (int k = 0; k < 3; k++)
+    {
+        int id = k == 0 ? ids.x : (k == 1 ? ids.y : ids.z);
+        float weight = k == 0 ? w.x : (k == 1 ? w.y : w.z);
+        half3 albedo = TransvoxelAlbedoAt(planes.x, id) * planes.blend.x
+                     + TransvoxelAlbedoAt(planes.y, id) * planes.blend.y
+                     + TransvoxelAlbedoAt(planes.z, id) * planes.blend.z;
+        float4 layerColor = _TransvoxelLayerColors[id];
+        result += weight * half4(albedo * layerColor.rgb, layerColor.a);
+    }
+    return result;
+}
+
 // ------------------------------------------------------------- Shader Graph entry points
 
 // VERTEX stage: expand this vertex's corner index (vertex color alpha) into the one-hot
@@ -250,6 +596,42 @@ void TransvoxelPaletteMaps_half(half2 UV, half4 VertexColor, half2 CornerWeights
     float occlusion;
     float smoothness;
     TransvoxelPaletteMaps_float(UV, VertexColor, CornerWeights, PositionWS, NormalWS,
+        albedo, normal, occlusion, smoothness);
+    Albedo = (half3)albedo;
+    Normal = (half3)normal;
+    Occlusion = (half)occlusion;
+    Smoothness = (half)smoothness;
+}
+
+// FRAGMENT stage, the works: the palette's own triplanar and parallax settings, honoured
+// dynamically (a graph has no keyword machinery, so this branches on the globals the
+// terrain pushes). Same wiring as TransvoxelPaletteMaps, and Normal is WORLD space again —
+// set Graph Settings > Fragment Normal Space to World.
+//
+// Triplanar replaces UV0 entirely, so the UV input only matters while triplanar is off;
+// wire it anyway so the palette can be switched between the two without re-wiring.
+void TransvoxelPaletteProjected_float(float2 UV, float4 VertexColor, float2 CornerWeights,
+    float3 PositionWS, float3 NormalWS,
+    out float3 Albedo, out float3 Normal, out float Occlusion, out float Smoothness)
+{
+    TransvoxelProjectedSurface s = TransvoxelPaletteBlendProjected(
+        UV, PositionWS, normalize(NormalWS), VertexColor.rgb * 255.0, CornerWeights,
+        _TransvoxelTriplanarEnabled > 0.5, _TransvoxelParallaxEnabled > 0.5);
+    Albedo = s.albedo;
+    Normal = s.normalWS;
+    Occlusion = s.occlusion;
+    Smoothness = s.smoothness;
+}
+
+void TransvoxelPaletteProjected_half(half2 UV, half4 VertexColor, half2 CornerWeights,
+    half3 PositionWS, half3 NormalWS,
+    out half3 Albedo, out half3 Normal, out half Occlusion, out half Smoothness)
+{
+    float3 albedo;
+    float3 normal;
+    float occlusion;
+    float smoothness;
+    TransvoxelPaletteProjected_float(UV, VertexColor, CornerWeights, PositionWS, NormalWS,
         albedo, normal, occlusion, smoothness);
     Albedo = (half3)albedo;
     Normal = (half3)normal;

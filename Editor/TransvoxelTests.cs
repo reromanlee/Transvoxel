@@ -889,13 +889,15 @@ namespace reromanlee.Transvoxel.Editor.Tests
                 layer.uvScaleMultiplier = 2f;
                 layer.normalStrength = 0.5f;
                 layer.occlusionStrength = 0.25f;
+                layer.heightScale = 0.08f;
 
                 var colors = new Vector4[TransvoxelMaterialPalette.MaxLayers];
                 var scales = new Vector4[TransvoxelMaterialPalette.MaxLayers];
                 palette.FillLayerUniforms(colors, scales);
 
                 Assert.AreEqual(new Vector4(0.1f, 0.2f, 0.3f, 0.7f), colors[0]);
-                Assert.AreEqual(new Vector4(2f, 0.5f, 0.25f, 0f), scales[0]);
+                // w carries the parallax height amplitude.
+                Assert.AreEqual(new Vector4(2f, 0.5f, 0.25f, 0.08f), scales[0]);
                 // Slots past the layer count are never indexed (the shader clamps ids to
                 // the layer count) but must still hold harmless neutral values.
                 Assert.AreEqual(new Vector4(1f, 1f, 1f, 0f), scales[1]);
@@ -1096,6 +1098,29 @@ namespace reromanlee.Transvoxel.Editor.Tests
         sealed class AlwaysSolid : IDensitySource
         {
             public float SampleVoxel(int x, int y, int z) => 1f;
+        }
+
+        /// <summary>
+        /// Catches HLSL that does not compile. The shared modules are included by the
+        /// bundled shader and by user Shader Graphs, so a syntax or type error there breaks
+        /// every terrain in every project — and C# compiling tells you nothing about it.
+        /// </summary>
+        [Test]
+        public void BundledShader_CompilesWithoutErrors()
+        {
+            Shader shader = Shader.Find("Transvoxel/Lit Dithered");
+            Assert.IsNotNull(shader, "the bundled shader is missing from Resources");
+
+            // The concrete message type has moved between Unity versions; var keeps this
+            // test working across them.
+            var messages = UnityEditor.ShaderUtil.GetShaderMessages(shader);
+            var report = new List<string>();
+            foreach (var message in messages)
+                report.Add($"{message.file}({message.line}): {message.message}");
+
+            Assert.IsFalse(UnityEditor.ShaderUtil.ShaderHasError(shader),
+                "Transvoxel/Lit Dithered failed to compile. "
+                + string.Join(System.Environment.NewLine, report));
         }
 
         /// <summary>

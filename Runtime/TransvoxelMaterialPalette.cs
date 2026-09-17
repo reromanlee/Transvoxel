@@ -59,11 +59,19 @@ namespace reromanlee.Transvoxel
             [Tooltip("How much of the occlusion map is applied.")]
             [Range(0f, 1f)] public float occlusionStrength = 1f;
 
-            [Tooltip("Height map steering material transitions: at a boundary the higher " +
-                     "surface (rock, cobbles) pushes through the lower one (sand, dirt) " +
-                     "instead of a plain crossfade — see the palette's Height Blend slider. " +
-                     "Not a displacement/parallax input. Empty reads as uniform mid height.")]
+            [Tooltip("Height map, used for two things. It steers material transitions — at " +
+                     "a boundary the higher surface (rock, cobbles) pushes through the lower " +
+                     "one (sand, dirt) instead of a plain crossfade, scaled by the palette's " +
+                     "Height Blend. And with Parallax Occlusion on, the view ray is marched " +
+                     "through it per pixel so the surface reads as real depth. Neither moves " +
+                     "geometry. Empty reads as uniform mid height.")]
             public Texture2D height;
+
+            [Tooltip("How deep this layer's height map appears under parallax occlusion " +
+                     "mapping, in UV units — 0 is flat, 0.05 reads as coarse stone, above " +
+                     "0.1 starts to swim at grazing angles. Only used when the palette's " +
+                     "Parallax Occlusion is on and this layer has a height map.")]
+            [Range(0f, 0.25f)] public float heightScale = 0.05f;
 
             [Tooltip("Texture repeats of this layer relative to the terrain's UV scale. " +
                      "2 tiles this material twice as densely as the others.")]
@@ -76,6 +84,38 @@ namespace reromanlee.Transvoxel
                  "uniform mid height, so they keep the plain crossfade against each other. " +
                  "Live-tunable — no rebuild.")]
         [Range(0f, 1f)] public float heightBlend = 0.5f;
+
+        [Header("Surface projection")]
+        [Tooltip("Sample every layer on all three world planes and blend by the surface " +
+                 "normal, instead of the world-XZ planar map. Fixes the stretched, smeared " +
+                 "texturing on cliffs, overhangs and cave walls — the shapes a voxel terrain " +
+                 "exists for. Costs about 3x the texture fetches, so it is opt-in.")]
+        public bool triplanar;
+
+        [Tooltip("How narrow the blend band between the three planes is. 1 blends broadly " +
+                 "(soft, slightly washed out on 45° slopes), higher values tighten it toward " +
+                 "a hard switch at the diagonals.")]
+        [Range(1f, 16f)] public float triplanarSharpness = 4f;
+
+        [Header("Parallax occlusion mapping")]
+        [Tooltip("March the view ray through the layers' height maps per pixel, so surfaces " +
+                 "read as real depth with self-occlusion instead of a flat picture of depth. " +
+                 "Adds no geometry (nothing is tessellated or displaced), but it is the most " +
+                 "expensive option here. Needs at least one layer with a height map; " +
+                 "silhouettes and shadows still follow the mesh.")]
+        public bool parallaxOcclusion;
+
+        [Tooltip("Ray-march steps when looking straight at a surface. Few are needed there.")]
+        [Range(2, 64)] public int parallaxMinSteps = 6;
+
+        [Tooltip("Ray-march steps at grazing angles, where the ray travels furthest through " +
+                 "the heightfield and too few steps show stair-stepping.")]
+        [Range(2, 64)] public int parallaxMaxSteps = 24;
+
+        [Tooltip("Distance in meters over which parallax fades out to nothing. Distant and " +
+                 "low-LOD chunks then pay nothing for an effect too small to see. 0 = never " +
+                 "fade (not recommended).")]
+        [Min(0f)] public float parallaxDistance = 60f;
 
         [SerializeField]
         List<Layer> layers = new List<Layer>
@@ -106,6 +146,27 @@ namespace reromanlee.Transvoxel
                 return false;
             }
         }
+
+        /// <summary>
+        /// True when some layer carries a height map. Parallax has nothing to march without
+        /// one, so the terrain leaves the keyword off and the palette costs nothing extra.
+        /// </summary>
+        public bool HasHeightMaps
+        {
+            get
+            {
+                int count = LayerCount;
+                for (int i = 0; i < count; i++)
+                {
+                    if (layers[i].height != null)
+                        return true;
+                }
+                return false;
+            }
+        }
+
+        /// <summary>Whether the terrain should switch the parallax shader variant on.</summary>
+        public bool ParallaxActive => parallaxOcclusion && HasHeightMaps;
 
         /// <summary>
         /// Appends a layer from code (runtime-built palettes, tools); its material id is
@@ -143,7 +204,7 @@ namespace reromanlee.Transvoxel
         /// Writes the per-layer shader parameters into caller-provided arrays of
         /// <see cref="MaxLayers"/> entries (uniform arrays must always be uploaded at full
         /// declared size — see the terrain). colors = (tint.rgb, smoothness),
-        /// scales = (uvScaleMultiplier, normalStrength, occlusionStrength, 0).
+        /// scales = (uvScaleMultiplier, normalStrength, occlusionStrength, heightScale).
         /// </summary>
         public void FillLayerUniforms(Vector4[] colors, Vector4[] scales)
         {
@@ -154,7 +215,8 @@ namespace reromanlee.Transvoxel
                 Color tint = layer?.tint ?? Color.white;
                 colors[i] = new Vector4(tint.r, tint.g, tint.b, layer?.smoothness ?? 0f);
                 scales[i] = new Vector4(layer?.uvScaleMultiplier ?? 1f,
-                    layer?.normalStrength ?? 1f, layer?.occlusionStrength ?? 1f, 0f);
+                    layer?.normalStrength ?? 1f, layer?.occlusionStrength ?? 1f,
+                    layer?.heightScale ?? 0f);
             }
         }
 

@@ -23,7 +23,7 @@ namespace reromanlee.Transvoxel.Editor
         static readonly string[] LayerFieldPaths =
         {
             "name", "albedo", "tint", "smoothness", "normal", "normalStrength",
-            "occlusion", "occlusionStrength", "height", "uvScaleMultiplier",
+            "occlusion", "occlusionStrength", "height", "heightScale", "uvScaleMultiplier",
         };
 
         [SerializeField] TransvoxelMaterialPalette palette; // survives domain reloads

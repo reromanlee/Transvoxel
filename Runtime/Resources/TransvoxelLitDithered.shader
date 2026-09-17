@@ -78,6 +78,19 @@ Shader "Transvoxel/Lit Dithered"
             #define TRANSVOXEL_ANY_PALETTE 1
         #endif
 
+        // Keywords as bool literals, so the shared projection function can take them as
+        // ordinary arguments and the compiler still folds away the unused branch.
+        #if defined(TRANSVOXEL_TRIPLANAR)
+            #define TRANSVOXEL_TRIPLANAR_ON true
+        #else
+            #define TRANSVOXEL_TRIPLANAR_ON false
+        #endif
+        #if defined(TRANSVOXEL_PARALLAX)
+            #define TRANSVOXEL_PARALLAX_ON true
+        #else
+            #define TRANSVOXEL_PARALLAX_ON false
+        #endif
+
         TEXTURE2D(_BaseMap);
         SAMPLER(sampler_BaseMap);
 
@@ -108,6 +121,10 @@ Shader "Transvoxel/Lit Dithered"
             #pragma multi_compile_fragment _ _SHADOWS_SOFT
             #pragma multi_compile_fog
             #pragma multi_compile _ TRANSVOXEL_PALETTE TRANSVOXEL_PALETTE_MAPS
+            // Both are palette-only and opt-in per palette asset, so a terrain that uses
+            // neither compiles and costs exactly what it did before they existed.
+            #pragma multi_compile _ TRANSVOXEL_TRIPLANAR
+            #pragma multi_compile _ TRANSVOXEL_PARALLAX
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
 
@@ -163,15 +180,26 @@ Shader "Transvoxel/Lit Dithered"
                 float3 normalWS = normalize(input.normalWS);
                 half occlusion = 1.0;
 #if defined(TRANSVOXEL_PALETTE_MAPS)
-                TransvoxelSurface surface = TransvoxelPaletteBlendFull(input.uv, input.materialIds,
-                                                                       input.fadeAndWeights.yz);
+                // The projected path covers plain, triplanar, parallax and both at once —
+                // the keywords fold into compile-time constants, so each variant keeps only
+                // the code it needs, and it resolves the world normal itself.
+                TransvoxelProjectedSurface surface = TransvoxelPaletteBlendProjected(
+                    input.uv, input.positionWS, normalWS, input.materialIds,
+                    input.fadeAndWeights.yz, TRANSVOXEL_TRIPLANAR_ON, TRANSVOXEL_PARALLAX_ON);
                 half3 albedo = surface.albedo;
-                normalWS = TransvoxelPerturbNormal(normalWS, surface.normalTS,
-                                                   input.positionWS, input.uv);
+                normalWS = surface.normalWS;
                 occlusion = surface.occlusion;
 #elif defined(TRANSVOXEL_PALETTE)
+                // Albedo-only palettes have no heightfield to march, so only triplanar
+                // applies here.
+    #if defined(TRANSVOXEL_TRIPLANAR)
+                half3 albedo = TransvoxelPaletteBlendTriplanar(input.uv, input.positionWS,
+                                                               normalWS, input.materialIds,
+                                                               input.fadeAndWeights.yz).rgb;
+    #else
                 half3 albedo = TransvoxelPaletteBlend(input.uv, input.materialIds,
                                                       input.fadeAndWeights.yz).rgb;
+    #endif
 #else
                 half3 albedo = SAMPLE_TEXTURE2D(_BaseMap, sampler_BaseMap, input.uv).rgb * _BaseColor.rgb;
 #endif
