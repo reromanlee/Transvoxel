@@ -26,15 +26,17 @@ Unity **6000.0+**. URP is a dependency and the Package Manager pulls it in for y
 **Window ▸ Package Manager ▸ + ▸ Install package from git URL** and paste:
 
 ```
-https://github.com/reromanlee/Transvoxel.git
+https://github.com/reromanlee/Transvoxel.git?path=/UnityPackage
 ```
 
-or add it to `Packages/manifest.json` by hand:
+The package lives in the repository's `UnityPackage/` folder, so the `?path=` part is
+required — without it the Package Manager finds no `package.json` at the repository root
+and refuses the URL. Or add it to `Packages/manifest.json` by hand:
 
 ```json
 {
   "dependencies": {
-    "com.reromanlee.transvoxel": "https://github.com/reromanlee/Transvoxel.git"
+    "com.reromanlee.transvoxel": "https://github.com/reromanlee/Transvoxel.git?path=/UnityPackage"
   }
 }
 ```
@@ -44,8 +46,12 @@ bare version with **no `v` prefix** — pick one from the
 [releases page](https://github.com/reromanlee/Transvoxel/releases):
 
 ```
-https://github.com/reromanlee/Transvoxel.git#2.0.0
+https://github.com/reromanlee/Transvoxel.git?path=/UnityPackage#<version>
 ```
+
+The `#tag` always goes last, after `?path=`. Tags up to and including **2.0.0** predate the
+`UnityPackage/` folder and keep the package at the repository root, so those are pinned
+without `?path=`: `https://github.com/reromanlee/Transvoxel.git#2.0.0`.
 
 Notes worth knowing:
 
@@ -85,17 +91,19 @@ absolute path outside the project works for you and for nobody else who opens it
 
 ### From a local clone (contributing)
 
-Point a `file:` path at a checkout and your edits are live — no reinstall between changes:
+Point a `file:` path at the checkout's `UnityPackage/` folder and your edits are live — no
+reinstall between changes:
 
 ```json
 {
   "dependencies": {
-    "com.reromanlee.transvoxel": "file:../../Transvoxel"
+    "com.reromanlee.transvoxel": "file:../../Transvoxel/UnityPackage"
   }
 }
 ```
 
-The path is relative to the project's `Packages` folder. Unity writes `.meta` files into the
+The path is relative to the project's `Packages` folder and must end at the folder holding
+`package.json`, not at the repository root. Unity writes `.meta` files into the
 clone, which is what you want when you are working on the package.
 
 ### After installing
@@ -108,7 +116,8 @@ clone, which is what you want when you are working on the package.
 ## Separation of concerns
 
 The pipeline is four independent layers. Each one only knows about the layer below it
-through a tiny interface, so you can replace any of them on its own.
+through a tiny interface, so you can replace any of them on its own. Folders are relative
+to the package root, [`UnityPackage/`](UnityPackage).
 
 | Layer | Folder | Responsibility | Key type |
 |-------|--------|----------------|----------|
@@ -253,7 +262,7 @@ Bayer-dither clip — the same technique as Unity LOD Group cross-fading:
 Fading needs shader support. The bundled **`Transvoxel/Lit Dithered`** shader (URP; the
 default runtime material uses it automatically) implements it. The whole implementation
 lives in one reusable module —
-[`Runtime/Resources/TransvoxelDither.hlsl`](Runtime/Resources/TransvoxelDither.hlsl) —
+[`Runtime/Resources/TransvoxelDither.hlsl`](UnityPackage/Runtime/Resources/TransvoxelDither.hlsl) —
 which the shader includes, and which your own URP shaders and graphs can include too. Whatever you
 build with it: the fade inputs are **global uniforms driven by the terrain** — never
 redeclare them as material properties, Properties-block entries or Blackboard properties
@@ -378,7 +387,7 @@ different palettes. One terrain per scene is the supported setup.
 Like fading, this needs shader support: the `_TransvoxelPaletteAware` marker property is
 what tags a material as palette-aware, and the palette inputs are global uniforms. The
 blend itself lives in the reusable module
-[`Runtime/Resources/TransvoxelPalette.hlsl`](Runtime/Resources/TransvoxelPalette.hlsl)
+[`Runtime/Resources/TransvoxelPalette.hlsl`](UnityPackage/Runtime/Resources/TransvoxelPalette.hlsl)
 (URP only). The terrain binds
 **every** map array whenever a palette is active — kinds the palette doesn't use hold tiny
 neutral fallbacks — so module users sample unconditionally; only the bundled shader plays
@@ -553,8 +562,8 @@ a compact CPU/GPU/RAM/VRAM summary, so the numbers appear in standalone builds t
 
 ## Tests
 
-EditMode tests live in `Editor/` (Window ▸ General ▸ Test Runner ▸ EditMode). They prove the
-core invariant — the union of all chunk meshes is a closed, consistently wound 2-manifold —
+EditMode tests live in `UnityPackage/Editor/` (Window ▸ General ▸ Test Runner ▸ EditMode).
+They prove the core invariant — the union of all chunk meshes is a closed, consistently wound 2-manifold —
 for single chunks, same-LOD borders, every LOD-transition face, and after a transition-mask
 change (the stale-cache regression); plus, for voxel materials: watertightness of encoded
 (split) meshes, blend-attribute structure, and material-id agreement at every shared vertex
@@ -565,8 +574,8 @@ that chunk meshes always carry the fade vertex channel, that the palette's textu
 bake survives formats a Texture2DArray cannot sample, and that cached transition-face sheets
 are reused rather than re-sampled.
 
-**PlayMode tests** live in `Tests/Runtime/` and assert on *rendered pixels*, because this
-package's most expensive bugs were all invisible in code and obvious on screen: that LOD
+**PlayMode tests** live in `UnityPackage/Tests/Runtime/` and assert on *rendered pixels*,
+because this package's most expensive bugs were all invisible in code and obvious on screen: that LOD
 colorization actually changes the image with a palette assigned, that `chunkFadeInSeconds = 0`
 renders the same solid surface as fading enabled, that triplanar removes vertical streaking on
 a vertical face (measured as the collapse of vertical variation, not eyeballed), and that
