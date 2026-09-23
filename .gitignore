@@ -1,0 +1,26 @@
+## OS generated files
+.DS_Store
+Thumbs.db
+
+## Claude Code (local only)
+.claude/
+
+## NuGet Packages
+*.nupkg
+
+## IDE - Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+## IDE - Visual Studio Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+## IDE - Rider
+.idea/
+*.sln.iml

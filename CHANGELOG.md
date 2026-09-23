@@ -4,6 +4,23 @@ All notable changes to this package are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **The package moved into `UnityPackage/`.** The repository root now holds only the README,
+  changelog, license, reference sources and README artwork. Git URL installs need
+  `?path=/UnityPackage` (`https://github.com/reromanlee/Transvoxel.git?path=/UnityPackage`,
+  with any `#tag` after it), and local-clone `file:` paths must point at the `UnityPackage/`
+  folder. Pins to `#2.0.0` and earlier keep working unchanged. Tarball installs are
+  unaffected.
+
+### Changed
+
+- `.npmignore` is gone: `Sources/` and `.github/` sit outside the package folder, so
+  `npm pack` run inside `UnityPackage/` already leaves them out. The package carries its own
+  copy of `LICENSE.md` so the tarball still ships the license text.
+
 ## [2.0.0] - 2026-09-17
 
 ### Breaking
