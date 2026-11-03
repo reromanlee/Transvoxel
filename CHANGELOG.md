@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.npmignore` is gone: `Sources/` and `.github/` sit outside the package folder, so
   `npm pack` run inside `UnityPackage/` already leaves them out. The package carries its own
   copy of `LICENSE.md` so the tarball still ships the license text.
+- **The README is a short overview, with the details in `Documentation/`.** Features,
+  performance, usage, custom shaders, installation and testing each have their own page.
+  Console warnings and tooltips that pointed at README sections now name those pages.
 
 ## [2.0.0] - 2026-09-17
 
