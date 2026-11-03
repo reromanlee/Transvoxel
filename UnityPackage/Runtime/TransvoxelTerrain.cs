@@ -176,7 +176,7 @@ namespace reromanlee.Transvoxel
 
         // Collider bakes run on worker threads; a mesh must not be edited or destroyed
         // while its bake is in flight, so those meshes are parked and cleaned up after.
-        // Meshes are tracked by EntityId (Unity 6.2+ replacement for instance IDs).
+        // Meshes are tracked by EntityId, which replaces instance IDs in Unity 6.3+.
         readonly ConcurrentQueue<(TerrainChunk chunk, EntityId meshId)> bakedColliders =
             new ConcurrentQueue<(TerrainChunk, EntityId)>();
         readonly HashSet<EntityId> bakingMeshIds = new HashSet<EntityId>();
