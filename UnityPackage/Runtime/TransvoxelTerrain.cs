@@ -235,7 +235,7 @@ namespace reromanlee.Transvoxel
 
         // The palette keywords are GLOBAL shader state shared by every terrain in the
         // scene, so the last terrain to switch its palette off must not turn voxel
-        // materials off for the others. Refcounted across instances; see the README's
+        // materials off for the others. Refcounted across instances; see Documentation/FEATURES.md's
         // note that one palette and one fade configuration drive the whole scene.
         static int paletteKeywordUsers;
         static bool warnedAboutMultipleTerrains;
@@ -364,8 +364,8 @@ namespace reromanlee.Transvoxel
                 Debug.LogWarning("[Transvoxel] Chunk fading is enabled in the settings, but the " +
                                  $"terrain material's shader ('{runtimeMaterial.shader.name}') has no " +
                                  "_TransvoxelFade support — fading and cross-fades are disabled. Switch " +
-                                 "the material to 'Transvoxel/Lit Dithered' or add the fade snippet from " +
-                                 "the README to your shader.", this);
+                                 "the material to 'Transvoxel/Lit Dithered' or make your shader fade-aware " +
+                                 "as Documentation/SHADERS.md in the Transvoxel repository describes.", this);
             WarnIfGpuResidentDrawerActive();
             BindMaterialPalette();
 
@@ -470,7 +470,7 @@ namespace reromanlee.Transvoxel
                                  "Switch the material to 'Transvoxel/Lit Dithered' (or leave the " +
                                  "material empty to get it by default), or make your own " +
                                  "shader/graph palette-aware with TransvoxelPalette.hlsl — see " +
-                                 "the README's Voxel materials section.", this);
+                                 "Documentation/SHADERS.md in the Transvoxel repository.", this);
 
             SetPaletteKeywordsHeld(paletteActive);
             if (paletteActive)
@@ -575,8 +575,8 @@ namespace reromanlee.Transvoxel
                                  $"material palettes ('{boundPalette.name}' and '{palette.name}'). " +
                                  "The palette, fade and blend inputs are GLOBAL shader state, so " +
                                  "both terrains render with whichever was bound last. One palette " +
-                                 "per scene is the supported setup — see the README's Voxel " +
-                                 "materials section.", this);
+                                 "per scene is the supported setup — see Documentation/FEATURES.md in " +
+                                 "the Transvoxel repository.", this);
             }
             boundPalette = palette;
         }
