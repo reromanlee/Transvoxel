@@ -2,7 +2,7 @@
 // texture arrays behind Transvoxel/Lit Dithered, packaged so URP shaders and Shader
 // Graphs can render voxel materials too. (URP only — this package depends on URP.)
 //
-// Shader Graph usage (full walkthrough in the README's Voxel materials section):
+// Shader Graph usage (full walkthrough in Documentation/SHADERS.md):
 //
 //   1. Blackboard: Float property, reference name _TransvoxelPaletteAware, default 1 —
 //      the marker TransvoxelTerrain looks for (next to the _TransvoxelFadeAware one).
