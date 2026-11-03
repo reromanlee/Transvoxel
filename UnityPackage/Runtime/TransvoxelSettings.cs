@@ -76,8 +76,8 @@ namespace reromanlee.Transvoxel
                  "(terraform, LOD-ring shift) cross-fades against a ghost of its old surface " +
                  "with complementary patterns — no visual change ever pops. 0 = everything " +
                  "switches instantly. Needs a fade-aware shader: the built-in default " +
-                 "material (Transvoxel/Lit Dithered) supports it; see the README for custom " +
-                 "shaders.")]
+                 "material (Transvoxel/Lit Dithered) supports it; see Documentation/SHADERS.md " +
+                 "for custom shaders.")]
         [Range(0f, 2f)] public float chunkFadeInSeconds = 0.4f;
 
         [Tooltip("Fraction of the view distance over which terrain dithers out toward the " +

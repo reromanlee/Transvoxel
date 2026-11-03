@@ -1,6 +1,6 @@
 // Reusable Transvoxel stipple-fade module — the single implementation behind
 // Transvoxel/Lit Dithered, packaged so ANY shader can opt into the chunk cross-fades and
-// the draw-distance dissolve. Three ways to consume it (full walkthrough in the README):
+// the draw-distance dissolve. Three ways to consume it (full walkthrough in Documentation/SHADERS.md):
 //
 //   * Shader Graph: add a Custom Function node, Type "File", Source = this file,
 //     Name = "TransvoxelDitherFade". Inputs: FadeData (Vector2, wire a UV node set to

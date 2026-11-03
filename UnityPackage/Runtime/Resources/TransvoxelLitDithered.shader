@@ -23,8 +23,7 @@
 //
 // The fade/dither core itself lives in TransvoxelDither.hlsl (same folder) — a reusable
 // module both subshaders include, and the same file a Shader Graph Custom Function node
-// or any custom shader pulls in to become fade-aware (see the README's Dithered fading
-// section).
+// or any custom shader pulls in to become fade-aware (see Documentation/SHADERS.md).
 //
 // URP only. The package depends on URP and this shader's single SubShader declares that
 // requirement, so it simply does not compile elsewhere; the terrain falls back to a plain
