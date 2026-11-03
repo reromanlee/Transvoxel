@@ -2,7 +2,7 @@
   "name": "com.reromanlee.transvoxel",
   "version": "2.0.0",
   "displayName": "Transvoxel",
-  "unity": "6000.0",
+  "unity": "6000.3",
   "dependencies": {
     "com.unity.render-pipelines.universal": "17.0.0"
   },

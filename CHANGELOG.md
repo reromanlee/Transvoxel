@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The README is a short overview, with the details in `Documentation/`.** Features,
   performance, usage, custom shaders, installation and testing each have their own page.
   Console warnings and tooltips that pointed at README sections now name those pages.
+- **EditMode tests moved into their own test assembly** in `Tests/Editor/`, gated by
+  `UNITY_INCLUDE_TESTS` like the PlayMode tests. They no longer compile into every project
+  that installs the package, and the editor assembly no longer references NUnit or the
+  Test Runner. Run them by adding the package to `testables`, as before.
+
+### Fixed
+
+- **The package declared Unity 6000.0 but needs 6000.3 or newer.** The runtime and the
+  palette window use `EntityId` and `GetEntityId()`, which 6000.0 does not have, so the
+  package failed to compile there. `package.json` now requires 6000.3, the LTS that has
+  them, so the Package Manager refuses older editors up front.
 
 ## [2.0.0] - 2026-09-17
 

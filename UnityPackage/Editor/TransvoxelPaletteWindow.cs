@@ -53,7 +53,7 @@ namespace reromanlee.Transvoxel.Editor
             window.Show();
         }
 
-        // The EntityId signature is the Unity 6.2+ form of this callback (the int form
+        // The EntityId signature is the Unity 6.3+ form of this callback (the int form
         // relies on APIs that are obsolete-as-error in 6.5).
         [UnityEditor.Callbacks.OnOpenAsset]
         static bool OnOpenAsset(EntityId entityId, int line)
