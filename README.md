@@ -42,11 +42,10 @@ Detailed about performance - see [PERFORMANCE.md](Documentation/PERFORMANCE.md).
 
 ### Requirements
 
-1. Unity 6.2 or newer.
-2. URP 17 or newer, installed as a dependency.
-3. Unity Test Framework, which new projects include.
-4. Compute shaders for GPU and Hybrid meshing.
-5. Input System, for the demo sample only.
+1. Unity 6.3 LTS or newer.
+2. URP, installed as a dependency.
+3. Compute shaders for GPU and Hybrid meshing.
+4. Input System, for the demo sample only.
 
 ### Limitations
 

@@ -4,7 +4,7 @@ The package ships its tests alongside its code. They check the invariants that a
 
 ### What is covered
 
-**EditMode tests** live in `UnityPackage/Editor/TransvoxelTests.cs`. Their central instrument is watertightness: for a closed density field, the union of all chunk meshes must form a closed, consistently wound 2-manifold, with every directed edge appearing exactly once alongside its reverse. That single property catches wrong tables, broken vertex reuse, mismatched interpolation across chunks, wrong transition-cell layout, bad winding and incorrect secondary-position shifts.
+**EditMode tests** live in `UnityPackage/Tests/Editor/`. Their central instrument is watertightness: for a closed density field, the union of all chunk meshes must form a closed, consistently wound 2-manifold, with every directed edge appearing exactly once alongside its reverse. That single property catches wrong tables, broken vertex reuse, mismatched interpolation across chunks, wrong transition-cell layout, bad winding and incorrect secondary-position shifts.
 
 1. **Seams.** Watertightness of single chunks, same-LOD borders, every LOD transition face, and chunks after a transition-mask change.
 2. **Voxel materials.** Watertightness of meshes split along material boundaries, the structure of the blend attributes, and material ids agreeing at every shared vertex across chunk borders, LOD seams and both meshers.
@@ -35,4 +35,4 @@ Add the package to `testables` in your project's `Packages/manifest.json`:
 }
 ```
 
-Then open **Window ▸ General ▸ Test Runner** and run the **EditMode** and **PlayMode** tests. The tests need the `com.unity.test-framework` package, which new Unity projects include.
+Then open **Window ▸ General ▸ Test Runner** and run the **EditMode** and **PlayMode** tests. Both test assemblies compile only while the package is listed there, so they cost nothing in projects that don't opt in. The `com.unity.test-framework` package they need already comes with URP's dependencies.
